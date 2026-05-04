@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.env
+.env.local
+~/.vibemate/
+
+# editor
+.vscode/
+.idea/
+
+# build artifacts
+*.tsbuildinfo

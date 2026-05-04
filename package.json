@@ -1,0 +1,40 @@
+{
+  "name": "vibemate",
+  "version": "0.1.0",
+  "description": "바이브 코딩 프로젝트 매니저 — Claude Code와 연동되는 로컬 PM 툴",
+  "type": "module",
+  "bin": {
+    "pm": "./dist/server/cli.js",
+    "vibemate": "./dist/server/cli.js"
+  },
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"npm run dev:server\" \"npm run dev:web\"",
+    "dev:server": "tsx watch src/server/cli.ts -- start",
+    "dev:web": "vite",
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:web": "vite build",
+    "start": "node dist/server/cli.js start",
+    "mcp": "node dist/server/cli.js mcp",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "chokidar": "^4.0.1",
+    "commander": "^12.1.0",
+    "hono": "^4.6.12",
+    "nanoid": "^5.0.9",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "concurrently": "^9.1.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.1"
+  }
+}
