@@ -900,11 +900,20 @@ function getFileTree() {
   return DATA.fileTree[state.currentProject!] || [];
 }
 function getAllSessions(): SessionSummaryRow[] {
-  const all: SessionSummaryRow[] = [];
-  getFeatures().forEach((f) => {
-    (f.sessions || []).forEach((s) => all.push({ ...s, feature: f.name, featureId: f.id }));
-  });
-  return all;
+  const projId = state.currentProject;
+  if (!projId) return [];
+  // Use raw API response so unmapped (feature_id=null) sessions also show up —
+  // e.g. those imported via `pm import-history`. The previous walk over
+  // feature.sessions silently dropped them.
+  const raw = (DATA.sessions && DATA.sessions[projId]) || [];
+  return raw.map((s) => ({
+    id: s.id,
+    time: s.time,
+    summary: s.summary,
+    files: s.files || [],
+    feature: s.feature_name ?? undefined,
+    featureId: s.feature_id ?? undefined,
+  }));
 }
 function statsFor(projId: string | null): { inProg: number; todo: number; done: number; sessions: number; decisions: number } {
   if (!projId) return { inProg: 0, todo: 0, done: 0, sessions: 0, decisions: 0 };
@@ -915,8 +924,11 @@ function statsFor(projId: string | null): { inProg: number; todo: number; done: 
     if (t.status === 'todo' || t.status === 'in_progress') todo++;
     if (t.status === 'done') done++;
   }));
-  let sessions = 0;
-  fs.forEach((f) => sessions += (f.sessions || []).length);
+  // "이번 주 세션" — count from raw sessions within last 7 days, including
+  // unmapped (feature_id=null) ones.
+  const raw = (DATA.sessions && DATA.sessions[projId]) || [];
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const sessions = raw.filter((s) => s.started_at >= cutoff).length;
   const decisions = (DATA.decisions[projId] || []).length;
   return { inProg, todo, done, sessions, decisions };
 }
