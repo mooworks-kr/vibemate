@@ -38,6 +38,11 @@
 
     --done: #8a8579;
 
+    /* Foreground for content sitting on a saturated/dark chip (--accent
+       button, project marks, etc.). Stays light in both themes — using
+       --bg here would flip to dark in dark mode and become unreadable. */
+    --on-mark: #fbfaf6;
+
     --shadow-sm: 0 1px 0 rgba(31, 28, 23, 0.04);
     --shadow-md: 0 2px 8px rgba(31, 28, 23, 0.06);
     --shadow-lg: 0 8px 24px rgba(31, 28, 23, 0.08);
@@ -47,6 +52,44 @@
 
     --font-sans: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
     --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+  }
+
+  /* Dark theme — applied via data-theme="dark" on <html>. The inline script
+     in <head> picks the initial value from localStorage > prefers-color-scheme
+     > 'light' before first paint, so there's no FOUC. */
+  :root[data-theme="dark"] {
+    --bg: #1a1814;
+    --bg-sidebar: #211e18;
+    --bg-elevated: #28241d;
+    --bg-hover: #332f27;
+    --bg-soft: #242019;
+
+    --text: #f0ebe0;
+    --text-2: #a8a299;
+    --text-3: #6f6a60;
+
+    --border: #3a352c;
+    --border-strong: #524c40;
+
+    --accent: #5a9a6e;
+    --accent-hover: #6db080;
+    --accent-soft: #2c4034;
+    --accent-soft-hover: #354c3d;
+    --accent-text: #a8d4b6;
+
+    --warn: #d49350;
+    --warn-soft: #3d2e1c;
+    --warn-text: #e6b878;
+
+    --info: #7c8ac4;
+    --info-soft: #262d40;
+    --info-text: #b0bce0;
+
+    --done: #6b6660;
+
+    --shadow-sm: 0 1px 0 rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.55);
   }
 
   * { box-sizing: border-box; }
@@ -91,7 +134,7 @@
     background: var(--accent);
     border-radius: 5px;
     display: flex; align-items: center; justify-content: center;
-    color: var(--bg);
+    color: var(--on-mark);
     font-weight: 700; font-size: 11px;
     font-family: var(--font-mono);
   }
@@ -122,7 +165,7 @@
     display: inline-flex; align-items: center; justify-content: center;
     font-family: var(--font-mono);
     font-size: 10px; font-weight: 700;
-    color: var(--bg);
+    color: var(--on-mark);
     flex-shrink: 0;
   }
   .project-dropdown {
@@ -194,7 +237,7 @@
     display: flex; align-items: center; gap: 6px;
     padding: 6px 12px;
     background: var(--accent);
-    color: var(--bg);
+    color: var(--on-mark);
     border: none;
     border-radius: var(--radius);
     font-weight: 500;
@@ -745,7 +788,7 @@
     border-radius: var(--radius-lg);
     padding: 16px 20px;
     margin-bottom: 24px;
-    border: 1px solid rgba(45, 90, 61, 0.15);
+    border: 1px solid var(--accent-soft-hover);
   }
   .ai-explanation-eyebrow {
     font-size: 11px;
@@ -869,7 +912,182 @@
     padding: 0; margin: -1px; overflow: hidden;
     clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
   }
+
+  /* ===== Search palette (Cmd/Ctrl+K) ===== */
+  .search-palette-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(31, 28, 23, 0.32);
+    z-index: 1100;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 12vh;
+  }
+  .search-palette {
+    width: min(680px, 92vw);
+    max-height: 70vh;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .search-palette-input-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .search-palette-input-row svg { color: var(--text-3); flex-shrink: 0; }
+  .search-palette-input {
+    flex: 1;
+    padding: 6px 4px;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 15px;
+  }
+  .search-palette-input::placeholder { color: var(--text-3); }
+  .search-palette-input-row .kbd-hint {
+    padding: 2px 6px;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--text-3);
+    font-family: var(--font-mono);
+  }
+  .search-palette-results {
+    overflow-y: auto;
+    max-height: 56vh;
+    padding: 6px;
+  }
+  .search-empty {
+    padding: 24px 14px;
+    text-align: center;
+    color: var(--text-3);
+    font-size: 13px;
+  }
+  .search-empty.search-error { color: var(--warn-text); }
+  /* Kind group label between sections (Feature / Decision / File / Session).
+     Non-interactive; keyboard nav steps over these. */
+  .search-group-header {
+    padding: 10px 12px 4px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-3);
+  }
+  .search-group-header:not(:first-child) {
+    border-top: 1px solid var(--border);
+    margin-top: 4px;
+  }
+  .search-result {
+    display: flex;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    align-items: flex-start;
+    cursor: pointer;
+  }
+  .search-result + .search-result { margin-top: 2px; }
+  /* Single source of truth for "active" row — keyboard cursor, not :hover.
+     Mouse hover writes to state.selectedIndex which sets this class, so
+     keyboard and mouse never disagree. */
+  .search-result.selected { background: var(--bg-hover); }
+
+  /* Brief flash on the destination row after the palette navigates (decisions). */
+  @keyframes vibemate-search-flash {
+    0%   { box-shadow: 0 0 0 2px var(--accent); }
+    100% { box-shadow: 0 0 0 2px transparent; }
+  }
+  .search-flash { animation: vibemate-search-flash 1.4s ease-out; }
+  .search-result-kind {
+    flex-shrink: 0;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    margin-top: 1px;
+  }
+  .search-result-kind.kind-feature { background: var(--warn-soft); color: var(--warn-text); }
+  .search-result-kind.kind-decision { background: var(--info-soft); color: var(--info-text); }
+  .search-result-kind.kind-session { background: var(--bg-soft); color: var(--text-2); }
+  .search-result-kind.kind-file    { background: var(--bg-soft); color: var(--text-2); }
+  .search-result-body { min-width: 0; flex: 1; }
+  .search-result-title {
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--text);
+    margin-bottom: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .search-result-snippet {
+    font-size: 12px;
+    color: var(--text-2);
+    line-height: 1.45;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  /* Server-emitted highlight markers — server already HTML-escapes raw user
+     content, so only our own <mark>...</mark> ever reaches the DOM here. */
+  .search-result-snippet mark,
+  .search-result-title mark {
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    padding: 0 2px;
+    border-radius: 2px;
+  }
+
+  /* Theme toggle button. Sun shown in dark mode (= "click to go light"),
+     moon shown in light mode. We keep both icons in the DOM and toggle
+     visibility via CSS so the swap is instant on theme change. */
+  .theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px; height: 32px;
+    margin-left: 8px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-2);
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .theme-toggle:hover { background: var(--bg-hover); color: var(--text); }
+  .theme-toggle .icon-sun  { display: none; }
+  .theme-toggle .icon-moon { display: block; }
+  :root[data-theme="dark"] .theme-toggle .icon-sun  { display: block; }
+  :root[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
 </style>
+
+<!-- FOUC-safe theme bootstrap. Runs before <body> paints, sets data-theme so
+     CSS rules in :root[data-theme="dark"] take effect on first paint.
+     Priority: localStorage > prefers-color-scheme > 'light'. -->
+<script>
+  (function () {
+    try {
+      var saved = localStorage.getItem('vibemate_theme');
+      var theme = saved === 'dark' || saved === 'light' ? saved
+        : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.setAttribute('data-theme', theme);
+    } catch (_) {
+      document.documentElement.setAttribute('data-theme', 'light');
+    }
+  })();
+</script>
 </head>
 <body>
 <div id="app">
@@ -896,6 +1114,16 @@
       <input type="text" placeholder="기능, 파일, 결정 검색…">
       <span class="kbd-hint">⌘K</span>
     </div>
+
+    <button class="theme-toggle" id="themeToggle" aria-label="테마 전환" title="라이트/다크 테마 전환">
+      <svg class="icon-moon" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M14 9.5A6.5 6.5 0 1 1 6.5 2a5.5 5.5 0 0 0 7.5 7.5z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+      </svg>
+      <svg class="icon-sun" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.4"/>
+        <path d="M8 1.5v2M8 12.5v2M14.5 8h-2M3.5 8h-2M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4M12.6 12.6l-1.4-1.4M4.8 4.8L3.4 3.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      </svg>
+    </button>
 
     <button class="start-claude-btn" onclick="alert('실제 데이터 모드에서는 Claude Code 세션을 시작하고 현재 컨텍스트를 자동 주입합니다.')">
       <svg width="13" height="13" viewBox="0 0 13 13"><path d="M6.5 1 L6.5 12 M1 6.5 L12 6.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>

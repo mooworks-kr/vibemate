@@ -191,8 +191,101 @@ program
   });
 
 // ----------------------------------------------------------------
+// pm migrate-claude-md [path] [--dry-run] [--force] [--no-backup]
+// Update an existing CLAUDE.md to the current pm-init template. Marker-aware
+// so user customisations between markers are preserved (see ADR-0003).
+// ----------------------------------------------------------------
+program
+  .command('migrate-claude-md [path]')
+  .description('CLAUDE.md의 Vibemate 섹션을 최신 템플릿으로 업데이트')
+  .option('--dry-run', 'diff만 출력, 파일 변경 없음')
+  .option('--force', 'confirm 건너뛰고 즉시 적용')
+  .option('--no-backup', '.bak 백업 파일을 만들지 않음')
+  .action(async (pathArg: string | undefined, opts: { dryRun?: boolean; force?: boolean; backup?: boolean }) => {
+    const target = pathArg
+      ? path.resolve(pathArg)
+      : path.join(process.cwd(), 'CLAUDE.md');
+
+    // Resolve project ID for the template — needed to fill in the {projectId}
+    // slot. Falls back to the directory name when no project is registered
+    // for this cwd, which is reasonable for `pm migrate-claude-md` invoked
+    // before `pm init`.
+    getDb();
+    const cwd = path.dirname(target);
+    const project = domain.getProjectByRoot(cwd);
+    const projectId = project?.id ?? path.basename(cwd);
+
+    const result = domain.migrateClaudeMd(target, { projectId });
+
+    if (!result.changed) {
+      console.log('변경 사항 없음. 이미 최신 템플릿과 동일합니다.');
+      return;
+    }
+
+    // Heads-up before showing the diff so the user knows what kind of
+    // migration this is. 'legacy' is the riskiest — single marker means
+    // we're guessing the section ends at EOF, so user content past that
+    // marker (if any) gets pulled into the section and replaced.
+    const detectedLabel: Record<typeof result.detected, string> = {
+      none: '신규 (마커 없음 — append 또는 새 파일 생성)',
+      legacy: '레거시 단일 마커 — 마커→EOF를 섹션으로 가정. 백업 권장',
+      paired: '페어 마커 — 안전 교체',
+    };
+    console.log(`감지: ${detectedLabel[result.detected]}\n`);
+    console.log(result.diff);
+
+    if (opts.dryRun) {
+      console.log('\n(--dry-run: 파일은 변경되지 않았습니다.)');
+      return;
+    }
+
+    if (!opts.force) {
+      const ok = await confirmPrompt('\n적용할까요? (y/N) ');
+      if (!ok) {
+        console.log('취소했습니다.');
+        return;
+      }
+    }
+
+    // Backup unless explicitly disabled (--no-backup → opts.backup === false).
+    // Skip when the target doesn't exist yet (fresh creation case) since
+    // there's nothing to back up.
+    let bakPath: string | null = null;
+    if (opts.backup !== false && fs.existsSync(target)) {
+      bakPath = target + '.bak';
+      fs.copyFileSync(target, bakPath);
+      console.log(`백업: ${bakPath}`);
+    }
+
+    try {
+      fs.writeFileSync(target, result.result);
+      console.log(`✓ ${target} 업데이트 완료`);
+    } catch (err) {
+      console.error(`× 쓰기 실패: ${(err as Error).message}`);
+      if (bakPath) {
+        console.error(`복구하려면: cp "${bakPath}" "${target}"`);
+      }
+      process.exit(1);
+    }
+  });
+
+// ----------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------
+
+// Single-line y/N confirm using readline. Resolves true on 'y'/'yes' (case
+// insensitive). Anything else → false (default no, matching the (y/N) hint).
+async function confirmPrompt(question: string): Promise<boolean> {
+  const readline = await import('node:readline/promises');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question(question)).trim().toLowerCase();
+    return answer === 'y' || answer === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
 function currentProject() {
   const cwd = process.cwd();
   const p = domain.getProjectByRoot(cwd);
@@ -204,40 +297,26 @@ function currentProject() {
   return p;
 }
 
+// First-time CLAUDE.md hint emitted by `pm init`. Detection guard preserves
+// existing user content — once any vibemate marker (legacy or paired) is
+// present, this is a no-op. Use `pm migrate-claude-md` to update.
+//
+// The actual template body lives in `domain.claudeMdTemplate` so `pm init`
+// and `pm migrate-claude-md` stay in lockstep.
 function writeClaudeMdHint(cwd: string, projectId: string): void {
   const claudeMdPath = path.join(cwd, 'CLAUDE.md');
-  const hint = `
-
-<!-- Vibemate section — added by 'pm init'. Edit freely. -->
-
-## 이 프로젝트는 Vibemate가 활성화되어 있습니다
-
-**Project ID**: \`${projectId}\`
-
-세션 시작 시:
-1. \`pm_session_start\` 호출 → session_id 저장
-2. \`pm_get_context\` 호출 → 진행 상태 / 최근 결정 / 다음 태스크 확인
-
-세션 중 의미있는 결정이 있으면:
-- \`pm_log_decision\` 으로 ADR 기록 제안 (사용자 confirm 후 호출)
-
-세션 종료 직전:
-- \`pm_session_end\` 호출 (session_id, 한 줄 요약, primary_feature_id)
-- summary는 한국어 권장. 어떤 기능을 어떻게 진행했는지 명확하게.
-
-태스크 / 기능 변경:
-- 태스크 시작: \`pm_update_task\` (status=in_progress)
-- 태스크 완료: \`pm_update_task\` (status=done)
-- 새 기능: \`pm_create_feature\`
-`;
+  const section = domain.claudeMdTemplate(projectId);
 
   if (fs.existsSync(claudeMdPath)) {
     const existing = fs.readFileSync(claudeMdPath, 'utf-8');
-    if (existing.includes('Vibemate가 활성화')) return; // already added
-    fs.appendFileSync(claudeMdPath, hint);
+    const alreadyHasVibemateSection =
+      existing.includes(domain.VIBEMATE_SECTION_BEGIN) ||
+      existing.includes(domain.VIBEMATE_LEGACY_MARKER);
+    if (alreadyHasVibemateSection) return;
+    fs.appendFileSync(claudeMdPath, `\n\n${section}\n`);
     console.log('  → CLAUDE.md에 Vibemate 섹션 추가됨');
   } else {
-    fs.writeFileSync(claudeMdPath, `# ${path.basename(cwd)}${hint}`);
+    fs.writeFileSync(claudeMdPath, `# ${path.basename(cwd)}\n\n${section}\n`);
     console.log('  → CLAUDE.md 생성됨');
   }
 }

@@ -12,11 +12,14 @@
     "dev:server": "tsx watch src/server/cli.ts -- start",
     "dev:web": "vite",
     "build": "npm run build:server && npm run build:web",
-    "build:server": "tsc -p tsconfig.server.json",
+    "build:server": "tsc -p tsconfig.server.json && node scripts/copy-migrations.mjs",
     "build:web": "vite build",
     "start": "node dist/server/cli.js start",
     "mcp": "node dist/server/cli.js mcp",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.test.json --noEmit"
   },
   "engines": {
     "node": ">=22.5.0"
@@ -32,9 +35,11 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@vitest/coverage-v8": "^4.1.5",
     "concurrently": "^9.1.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vite": "^6.0.1"
+    "vite": "^6.0.1",
+    "vitest": "^4.1.5"
   }
 }

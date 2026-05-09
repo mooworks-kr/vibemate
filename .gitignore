@@ -12,3 +12,6 @@ dist/
 
 # build artifacts
 *.tsbuildinfo
+
+# test coverage
+coverage/

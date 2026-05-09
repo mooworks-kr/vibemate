@@ -98,10 +98,14 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
       name: z.string().describe('기능 이름. 한국어 OK'),
       goal: z.string().optional().describe('1-2줄 목표 요약'),
       spec_md: z.string().optional().describe('전체 스펙 마크다운'),
+      // Mirror HTTP createFeatureSchema — let callers create a feature
+      // already in_progress / done without a follow-up update_feature call.
+      status: z.enum(['todo', 'in_progress', 'done', 'archived']).optional()
+        .describe('초기 상태. 미지정 시 todo'),
     },
-    async ({ project_id, name, goal, spec_md }) => {
+    async ({ project_id, name, goal, spec_md, status }) => {
       const pid = resolveProject(project_id);
-      const f = domain.createFeature({ projectId: pid, name, goal, spec_md });
+      const f = domain.createFeature({ projectId: pid, name, goal, spec_md, status });
       return ok({ feature_id: f.id, name: f.name });
     },
   );
@@ -144,11 +148,26 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
       name: z.string().optional(),
       status: z.enum(['todo', 'in_progress', 'done']).optional(),
       notes: z.string().optional(),
+      // Mirror HTTP updateTaskSchema. Domain's updateTask already accepts
+      // `position` — this just exposes it through MCP.
+      position: z.number().optional().describe('정렬 순서 (낮을수록 위)'),
     },
     async ({ task_id, ...patch }) => {
       const updated = domain.updateTask(task_id, patch);
       if (!updated) throw new Error(`Task not found: ${task_id}`);
       return ok({ ok: true, task: updated });
+    },
+  );
+
+  server.tool(
+    'pm_delete_task',
+    {
+      task_id: z.number(),
+    },
+    async ({ task_id }) => {
+      const removed = domain.deleteTask(task_id);
+      if (!removed) throw new Error(`Task not found: ${task_id}`);
+      return ok({ ok: true });
     },
   );
 
@@ -160,8 +179,11 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
       project_id: z.string().optional(),
       feature_id: z.string().optional(),
       title: z.string().describe('결정 한 줄 제목'),
-      context: z.string().describe('왜 이 결정이 필요했는지'),
-      decision: z.string().describe('어떻게 결정했는지'),
+      // All ADR body fields optional — matches the HTTP schema (line ~50 of
+      // http.ts). A one-line ADR (just `title`) is a valid use case: capture
+      // the decision now, fill in detail later via update.
+      context: z.string().optional().describe('왜 이 결정이 필요했는지'),
+      decision: z.string().optional().describe('어떻게 결정했는지'),
       alternatives: z.string().optional().describe('고려한 대안들'),
       consequences: z.string().optional().describe('이 결정의 영향'),
     },
@@ -177,6 +199,36 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
         consequences,
       });
       return ok({ adr_id: adr.id, title: adr.title });
+    },
+  );
+
+  server.tool(
+    'pm_update_decision',
+    {
+      decision_id: z.string(),
+      title: z.string().optional(),
+      context: z.string().optional(),
+      decision: z.string().optional(),
+      alternatives: z.string().optional(),
+      consequences: z.string().optional(),
+      feature_id: z.string().nullable().optional(),
+    },
+    async ({ decision_id, ...patch }) => {
+      const updated = domain.updateDecision(decision_id, patch);
+      if (!updated) throw new Error(`Decision not found: ${decision_id}`);
+      return ok({ ok: true, decision: updated });
+    },
+  );
+
+  server.tool(
+    'pm_delete_decision',
+    {
+      decision_id: z.string(),
+    },
+    async ({ decision_id }) => {
+      const removed = domain.deleteDecision(decision_id);
+      if (!removed) throw new Error(`Decision not found: ${decision_id}`);
+      return ok({ ok: true });
     },
   );
 
@@ -204,6 +256,185 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     async ({ feature_id, file_path }) => {
       domain.unlinkFile(feature_id, file_path);
       return ok({ ok: true });
+    },
+  );
+
+  // ----- File content + AI explanation storage -----
+  // These two tools let Claude Code (the user's IDE session) play the LLM role:
+  //   1. read clamped file content via `pm_get_file_content`
+  //   2. summarize locally
+  //   3. persist via `pm_save_file_explanation`
+  // vibemate stays a data store; the user's existing Claude subscription does
+  // the work, no separate API key required.
+
+  server.tool(
+    'pm_get_file_content',
+    {
+      project_id: z.string().optional()
+        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+      file_path: z.string().describe('프로젝트 root 기준 상대 경로'),
+    },
+    async ({ project_id, file_path }) => {
+      const pid = resolveProject(project_id);
+      const result = domain.getFileContent(pid, file_path);
+      // Return the raw clamped content as plain text — MCP transport is text,
+      // and Claude Code reads this directly to summarize.
+      return ok({
+        file_path,
+        content: result.content,
+        truncated: result.truncated,
+      });
+    },
+  );
+
+  server.tool(
+    'pm_clear_file_explanation',
+    {
+      project_id: z.string().optional()
+        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+      file_path: z.string().describe('프로젝트 root 기준 상대 경로'),
+    },
+    async ({ project_id, file_path }) => {
+      const pid = resolveProject(project_id);
+      const removed = domain.clearFileExplanation(pid, file_path);
+      if (!removed) throw new Error(`No cached explanation for: ${file_path}`);
+      return ok({ ok: true });
+    },
+  );
+
+  server.tool(
+    'pm_save_file_explanation',
+    {
+      project_id: z.string().optional()
+        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+      file_path: z.string().describe('프로젝트 root 기준 상대 경로'),
+      summary: z.string().describe('Claude Code가 작성한 한국어 파일 설명'),
+    },
+    async ({ project_id, file_path, summary }) => {
+      const pid = resolveProject(project_id);
+      const saved = domain.saveFileExplanation(pid, file_path, summary);
+      return ok({ ok: true, generated_at: saved.generated_at });
+    },
+  );
+
+  // ----- "Needs explanation" queue (Claude Code consumes this) -----
+
+  server.tool(
+    'pm_list_files_needing_explanation',
+    {
+      project_id: z.string().optional()
+        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+      limit: z.number().optional()
+        .describe('최대 결과 수 (기본 50, 최대 200)'),
+      stale_only: z.boolean().optional()
+        .describe('true(기본)면 explanation 없거나 stale인 것만, false면 후보 전체 (force regenerate용)'),
+      recent_days: z.number().optional()
+        .describe('이 일수 안에 modified/created로 touch된 파일만 포함 (기본 30)'),
+    },
+    async ({ project_id, limit, stale_only, recent_days }) => {
+      const pid = resolveProject(project_id);
+      const queue = domain.listFilesNeedingExplanation(pid, {
+        limit,
+        staleOnly: stale_only,
+        recentDays: recent_days,
+      });
+
+      if (queue.length === 0) {
+        return {
+          content: [
+            { type: 'text' as const, text: '설명이 필요한 파일이 없습니다.' },
+          ],
+        };
+      }
+
+      // Format as: "[stale|new] file_path (last touched: …)" — readable for the
+      // Claude Code session that's about to call get_file_content / save.
+      const formatted = queue
+        .map((q) => {
+          const tag = !q.has_explanation ? 'new' : q.explanation_stale ? 'stale' : 'fresh';
+          return `[${tag}] ${q.file_path} (last touched ${new Date(q.last_touched_at).toISOString()})`;
+        })
+        .join('\n');
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `${queue.length}개 파일에 설명이 필요합니다:\n\n${formatted}\n\n각 파일에 대해 pm_get_file_content + pm_save_file_explanation을 호출하세요.`,
+          },
+        ],
+      };
+    },
+  );
+
+  // ----- Search (FTS5 across features/decisions/sessions/files) -----
+
+  // The HTTP search response is HTML-escaped (`&lt;` etc.) plus literal
+  // `<mark>...</mark>` highlighting tags. For an LLM consumer we want the
+  // opposite: real angle brackets in user content, while keeping the marker
+  // tags intact so the model can see what matched. Decoding the few common
+  // entities in place is good enough — Claude reads the result, not a browser.
+  const decodeEntities = (s: string): string =>
+    s
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&');
+
+  const KIND_LABEL_MCP: Record<string, string> = {
+    feature: 'feature',
+    decision: 'decision',
+    session: 'session',
+    file: 'file',
+  };
+
+  server.tool(
+    'pm_search',
+    {
+      project_id: z
+        .string()
+        .optional()
+        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+      query: z.string().describe('검색어 (한국어/영문 모두 지원, prefix 매칭)'),
+      limit: z
+        .number()
+        .optional()
+        .describe('최대 결과 수 (기본 20, 최대 100). 도메인에서 자동 clamp'),
+    },
+    async ({ project_id, query, limit }) => {
+      const pid = resolveProject(project_id);
+      const results = domain.searchProject(pid, query, limit ?? 20);
+
+      if (results.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: '검색 결과가 없습니다.',
+            },
+          ],
+        };
+      }
+
+      // Format each row as: "[kind] title (id: ref_id)\n  snippet\n"
+      const formatted = results
+        .map((r) => {
+          const kind = KIND_LABEL_MCP[r.kind] ?? r.kind;
+          const title = decodeEntities(r.title);
+          const snippet = decodeEntities(r.snippet);
+          return `[${kind}] ${title} (id: ${r.ref_id})\n  ${snippet}`;
+        })
+        .join('\n\n');
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `${results.length}건 매칭:\n\n${formatted}`,
+          },
+        ],
+      };
     },
   );
 

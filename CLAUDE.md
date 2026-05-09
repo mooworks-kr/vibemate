@@ -9,7 +9,7 @@ src/
 ├── server/          # Node.js 백엔드 (MCP + HTTP + DB + CLI)
 │   ├── cli.ts            # commander 진입점
 │   ├── daemon.ts         # HTTP + 워처 백그라운드 데몬
-│   ├── mcp.ts            # Claude Code가 stdio로 호출 (11개 툴)
+│   ├── mcp.ts            # Claude Code가 stdio로 호출 (19개 툴)
 │   ├── http.ts           # Hono REST API + 정적 파일 서빙
 │   ├── watcher.ts        # chokidar 파일 감시
 │   ├── domain.ts         # 비즈니스 로직 단일 소스
@@ -68,7 +68,7 @@ npm run typecheck  # 서버 + 웹 둘 다
 
 ### 스키마 변경
 
-`db.ts`의 `SCHEMA` 상수 수정. 현재는 `CREATE TABLE IF NOT EXISTS`만 있어서 ALTER가 필요한 변경엔 마이그레이션 시스템 추가 필요.
+`src/server/migrations/` 디렉토리에 SQL 파일 추가 (`000N_<name>.sql`). `migrations.ts`가 `schema_migrations` 테이블로 적용 이력 추적. 현재 0001(init), 0002(search_fts FTS5 + 트리거 12개) 적용됨. 새 마이그레이션 추가 시 `migrations.test.ts`에 인덱스/트리거 존재 검증 추가 권장.
 
 ### 웹 ↔ 서버 타입 공유
 
@@ -78,9 +78,21 @@ npm run typecheck  # 서버 + 웹 둘 다
 
 `http.ts`가 `dist/web/`을 root로 `serveStatic`. 이 경로는 `import.meta.url` 기반으로 계산되어 dev(src/server/)와 prod(dist/server/) 양쪽에서 모두 `<project>/dist/web/`을 가리킴. 빌드 안 한 dev 모드에선 dist/web/이 없어서 fallback이 비활성화됨 (Vite가 5173에서 처리하므로 OK).
 
-## 테스트 (수동)
+## 테스트
 
-E2E 검증 패턴:
+### 자동 (단위)
+
+vitest. 도메인 + migrations 커버, HTTP 라우트/MCP/UI는 미커버 (수동 E2E로 검증).
+
+```bash
+npm test                # 66 tests — projects/features/sanitizer/searchProject/migrations/endSession/getFileContent/saveFileExplanation/migrate-claude-md/tasks/decisions/feature_files
+npm run test:watch
+npm run test:coverage   # v8 reporter
+```
+
+테스트는 `os.tmpdir()`에 격리된 SQLite 파일을 쓰므로 사용자의 `~/.vibemate/`를 건드리지 않음. `src/server/__tests__/helpers.ts`의 `createTempDb()` 패턴 참고.
+
+### 수동 (E2E)
 
 ```bash
 HOME=/tmp/vibemate-test node dist/server/cli.js init --name "테스트"
@@ -89,8 +101,6 @@ HOME=/tmp/vibemate-test node dist/server/cli.js start --port 7333 &
 curl -s http://localhost:7333/api/projects | jq
 HOME=/tmp/vibemate-test node dist/server/cli.js stop
 ```
-
-자동 테스트는 v0.2 후보.
 
 ## 프론트엔드 마이그레이션 메모
 
@@ -120,8 +130,31 @@ HOME=/tmp/vibemate-test node dist/server/cli.js stop
 
 ## 알려진 제약
 
-- 마이그레이션 시스템 없음 (스키마 변경 시 수동 처리)
-- 글로벌 검색 미구현 (FTS5 인덱스 추가 필요)
-- 큰 monorepo에서 chokidar 성능 검증 안 됨
-- AI 파일 설명 생성 미구현 (`file_explanations` 테이블만 있음)
-- 다크 모드 미구현
+- 큰 monorepo에서 chokidar 파일 워처 성능 미검증.
+- AI 파일 설명은 Claude Code MCP 호출(`pm_get_file_content` + `pm_save_file_explanation`)로 처리 — vibemate가 직접 LLM API를 호출하지 않으므로 별도 API 키 불필요.
+- 검색의 `file` 카인드는 `file_explanations`이 채워진 파일에만 매칭.
+- 자동 테스트는 도메인/migrations 한정 — HTTP 라우트 / MCP / UI 는 수동 E2E.
+- 양방향 spec.md 파일 동기화 미구현.
+
+
+<!-- Vibemate section — added by 'pm init'. Edit freely. -->
+
+## 이 프로젝트는 Vibemate가 활성화되어 있습니다
+
+**Project ID**: `vibemate`
+
+세션 시작 시:
+1. `pm_session_start` 호출 → session_id 저장
+2. `pm_get_context` 호출 → 진행 상태 / 최근 결정 / 다음 태스크 확인
+
+세션 중 의미있는 결정이 있으면:
+- `pm_log_decision` 으로 ADR 기록 제안 (사용자 confirm 후 호출)
+
+세션 종료 직전:
+- `pm_session_end` 호출 (session_id, 한 줄 요약, primary_feature_id)
+- summary는 한국어 권장. 어떤 기능을 어떻게 진행했는지 명확하게.
+
+태스크 / 기능 변경:
+- 태스크 시작: `pm_update_task` (status=in_progress)
+- 태스크 완료: `pm_update_task` (status=done)
+- 새 기능: `pm_create_feature`

@@ -84,6 +84,21 @@ export interface FileExplanation {
   generated_at: number;
 }
 
+/**
+ * One row in the "needs explanation" queue surfaced via
+ * `pm_list_files_needing_explanation` / GET /files/needs-explanation.
+ *
+ * `last_touched_at` is the most-recent session.started_at where this file was
+ * created or modified. `explanation_stale` is true when an explanation row
+ * exists but the file's mtime is newer than `generated_at`.
+ */
+export interface FileNeedingExplanation {
+  file_path: string;
+  last_touched_at: number;
+  has_explanation: boolean;
+  explanation_stale: boolean;
+}
+
 export interface ProjectStats {
   active_features: number;
   total_features: number;
@@ -117,4 +132,17 @@ export interface FileNode {
   path: string;
   type: 'file' | 'dir';
   children?: FileNode[];
+}
+
+export type SearchKind = 'feature' | 'decision' | 'session' | 'file';
+
+export interface SearchResult {
+  kind: SearchKind;
+  ref_id: string;
+  project_id: string;
+  title: string;
+  /** snippet() output with <mark>…</mark> wrapping the matched terms */
+  snippet: string;
+  /** bm25(); lower (more negative) = more relevant */
+  score: number;
 }

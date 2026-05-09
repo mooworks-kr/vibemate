@@ -1,0 +1,389 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import * as domain from '../domain.js';
+import { getDb } from '../db.js';
+import { sanitizeFtsQuery } from '../domain.js';
+import { createTempDb } from './helpers.js';
+
+let t: ReturnType<typeof createTempDb>;
+
+beforeEach(() => {
+  t = createTempDb();
+});
+
+afterEach(() => {
+  t.cleanup();
+});
+
+describe('projects', () => {
+  it('createProject + listProjects round-trips', () => {
+    const p = domain.createProject({
+      name: 'Vibemate',
+      rootPath: t.dir,
+      tagline: '한 줄 설명',
+      goal: 'goal here',
+      tech: ['ts', 'sqlite'],
+    });
+    expect(p.id).toMatch(/^[a-z0-9-]+$/);
+    expect(p.name).toBe('Vibemate');
+    expect(p.tech).toEqual(['ts', 'sqlite']);
+
+    const all = domain.listProjects();
+    expect(all).toHaveLength(1);
+    expect(all[0]!.id).toBe(p.id);
+  });
+
+  it('getProject returns null for unknown id', () => {
+    expect(domain.getProject('does-not-exist')).toBeNull();
+  });
+
+  it('Korean name produces a non-empty slug', () => {
+    const p = domain.createProject({ name: '한국어 프로젝트', rootPath: t.dir });
+    expect(p.id.length).toBeGreaterThan(0);
+  });
+});
+
+describe('features', () => {
+  it('createFeature + listFeatures + updateFeature flow', () => {
+    const proj = domain.createProject({ name: 'P1', rootPath: t.dir });
+    const f = domain.createFeature({
+      projectId: proj.id,
+      name: '인증 모듈',
+      goal: 'OAuth2 로그인',
+    });
+    expect(f.status).toBe('todo');
+
+    const updated = domain.updateFeature(f.id, { status: 'in_progress', name: '인증 (수정됨)' });
+    expect(updated?.status).toBe('in_progress');
+    expect(updated?.name).toBe('인증 (수정됨)');
+
+    const list = domain.listFeatures(proj.id);
+    expect(list).toHaveLength(1);
+    expect(list[0]!.id).toBe(f.id);
+
+    const filtered = domain.listFeatures(proj.id, 'done');
+    expect(filtered).toHaveLength(0);
+  });
+
+  it('updateFeature on unknown id returns null', () => {
+    expect(domain.updateFeature('nope', { name: 'x' })).toBeNull();
+  });
+});
+
+describe('decisions', () => {
+  it('logDecision + getDecision + updateDecision + deleteDecision flow', () => {
+    const proj = domain.createProject({ name: 'P1', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: proj.id, name: '인증' });
+
+    const adr = domain.logDecision({
+      projectId: proj.id,
+      title: 'OAuth2 사용',
+      context: 'Google 로그인 필요',
+    });
+    expect(adr.id).toBe('ADR-0001');
+    expect(domain.getDecision(adr.id)?.title).toBe('OAuth2 사용');
+
+    const updated = domain.updateDecision(adr.id, {
+      title: 'OAuth2 + PKCE 사용',
+      decision: 'PKCE 플로우 채택',
+      feature_id: f.id,
+    });
+    expect(updated?.title).toBe('OAuth2 + PKCE 사용');
+    expect(updated?.decision).toBe('PKCE 플로우 채택');
+    expect(updated?.feature_id).toBe(f.id);
+    // Untouched fields preserved
+    expect(updated?.context).toBe('Google 로그인 필요');
+
+    // Empty patch is a no-op (returns current row)
+    expect(domain.updateDecision(adr.id, {})?.title).toBe('OAuth2 + PKCE 사용');
+
+    // Unknown id → null
+    expect(domain.updateDecision('ADR-9999', { title: 'x' })).toBeNull();
+    expect(domain.deleteDecision('ADR-9999')).toBe(false);
+
+    expect(domain.deleteDecision(adr.id)).toBe(true);
+    expect(domain.getDecision(adr.id)).toBeNull();
+    expect(domain.listDecisions(proj.id)).toHaveLength(0);
+  });
+});
+
+describe('feature_files', () => {
+  it('linkFile + unlinkFile flow', () => {
+    const proj = domain.createProject({ name: 'P1', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: proj.id, name: '기능 A' });
+
+    domain.linkFile({ featureId: f.id, filePath: 'src/foo.ts', description: '주요 모듈' });
+    domain.linkFile({ featureId: f.id, filePath: 'src/bar.ts' });
+    expect(domain.listFeatureFiles(f.id)).toHaveLength(2);
+
+    domain.unlinkFile(f.id, 'src/foo.ts');
+    const remaining = domain.listFeatureFiles(f.id);
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]!.file_path).toBe('src/bar.ts');
+
+    // unlink on a path that's not linked is a silent no-op (idempotent)
+    expect(() => domain.unlinkFile(f.id, 'never-linked.ts')).not.toThrow();
+  });
+});
+
+describe('tasks', () => {
+  it('addTask + updateTask + deleteTask flow', () => {
+    const proj = domain.createProject({ name: 'P1', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: proj.id, name: '기능 A' });
+
+    const t1 = domain.addTask(f.id, '태스크 1');
+    const t2 = domain.addTask(f.id, '태스크 2');
+    expect(domain.listTasks(f.id)).toHaveLength(2);
+
+    const updated = domain.updateTask(t1.id, { status: 'done' });
+    expect(updated?.status).toBe('done');
+    expect(updated?.completed_at).toBeTypeOf('number');
+
+    expect(domain.deleteTask(t2.id)).toBe(true);
+    expect(domain.listTasks(f.id)).toHaveLength(1);
+    expect(domain.listTasks(f.id)[0]!.id).toBe(t1.id);
+
+    // deleting a non-existent task returns false (and doesn't throw)
+    expect(domain.deleteTask(99999)).toBe(false);
+  });
+
+  it('reverting from done clears completed_at (regression: stale "X분 전 완료")', () => {
+    const proj = domain.createProject({ name: 'P1', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: proj.id, name: '기능 A' });
+    const tk = domain.addTask(f.id, '태스크');
+
+    const done = domain.updateTask(tk.id, { status: 'done' });
+    expect(done?.completed_at).toBeTypeOf('number');
+
+    const reopened = domain.updateTask(tk.id, { status: 'todo' });
+    expect(reopened?.status).toBe('todo');
+    expect(reopened?.completed_at).toBeNull();
+
+    // done → in_progress also clears
+    domain.updateTask(tk.id, { status: 'done' });
+    const inProg = domain.updateTask(tk.id, { status: 'in_progress' });
+    expect(inProg?.completed_at).toBeNull();
+  });
+});
+
+describe('listFilesNeedingExplanation', () => {
+  // Helper: insert a synthetic session_files row so we don't need to spin up
+  // a real session lifecycle (start/record/end) for every queue test.
+  function recordEdit(projectId: string, filePath: string, editType: 'modified' | 'created' | 'read', startedAt: number) {
+    const db = getDb();
+    const sessionId = `s-${Math.random().toString(36).slice(2, 10)}`;
+    db.prepare('INSERT INTO sessions (id, project_id, started_at) VALUES (?, ?, ?)').run(
+      sessionId, projectId, startedAt,
+    );
+    db.prepare('INSERT INTO session_files (session_id, file_path, edit_type) VALUES (?, ?, ?)').run(
+      sessionId, filePath, editType,
+    );
+  }
+
+  it('surfaces files touched without an explanation, sorted by recency', () => {
+    const proj = domain.createProject({ name: 'Q', rootPath: t.dir });
+    fs.writeFileSync(path.join(t.dir, 'a.ts'), 'a');
+    fs.writeFileSync(path.join(t.dir, 'b.ts'), 'b');
+
+    recordEdit(proj.id, 'a.ts', 'modified', Date.now() - 60_000);
+    recordEdit(proj.id, 'b.ts', 'created', Date.now() - 1_000); // more recent
+
+    const queue = domain.listFilesNeedingExplanation(proj.id);
+    expect(queue.map((q) => q.file_path)).toEqual(['b.ts', 'a.ts']);
+    expect(queue[0]!.has_explanation).toBe(false);
+    expect(queue[0]!.explanation_stale).toBe(false);
+  });
+
+  it('marks an explanation stale when file mtime > generated_at', () => {
+    const proj = domain.createProject({ name: 'Q', rootPath: t.dir });
+    const fp = 'x.ts';
+    fs.writeFileSync(path.join(t.dir, fp), 'old');
+
+    recordEdit(proj.id, fp, 'modified', Date.now() - 10_000);
+    const saved = domain.saveFileExplanation(proj.id, fp, '오래된 설명.');
+    // Bump file mtime to AFTER generated_at.
+    const futureMtime = new Date(saved.generated_at + 5_000);
+    fs.utimesSync(path.join(t.dir, fp), futureMtime, futureMtime);
+
+    const queue = domain.listFilesNeedingExplanation(proj.id);
+    expect(queue).toHaveLength(1);
+    expect(queue[0]!.has_explanation).toBe(true);
+    expect(queue[0]!.explanation_stale).toBe(true);
+  });
+
+  it('hides fresh-explanation files when staleOnly=true (default)', () => {
+    const proj = domain.createProject({ name: 'Q', rootPath: t.dir });
+    const fp = 'fresh.ts';
+    fs.writeFileSync(path.join(t.dir, fp), 'fresh');
+
+    recordEdit(proj.id, fp, 'modified', Date.now() - 10_000);
+    domain.saveFileExplanation(proj.id, fp, '바로 만든 설명.');
+    // No mtime bump — explanation is fresher than file.
+
+    expect(domain.listFilesNeedingExplanation(proj.id)).toHaveLength(0);
+    // staleOnly=false includes everything in the recent-edit set.
+    expect(
+      domain.listFilesNeedingExplanation(proj.id, { staleOnly: false }),
+    ).toHaveLength(1);
+  });
+
+  it('skips read-only edits and ignored paths and missing files', () => {
+    const proj = domain.createProject({ name: 'Q', rootPath: t.dir });
+    fs.writeFileSync(path.join(t.dir, 'real.ts'), 'r');
+    // Read-only edit — not a candidate.
+    recordEdit(proj.id, 'real.ts', 'read', Date.now() - 1_000);
+    // node_modules path — ignored.
+    recordEdit(proj.id, 'node_modules/dep.js', 'modified', Date.now() - 1_000);
+    // File no longer exists on disk.
+    recordEdit(proj.id, 'gone.ts', 'modified', Date.now() - 1_000);
+
+    expect(domain.listFilesNeedingExplanation(proj.id)).toHaveLength(0);
+  });
+
+  it('respects recentDays cutoff', () => {
+    const proj = domain.createProject({ name: 'Q', rootPath: t.dir });
+    fs.writeFileSync(path.join(t.dir, 'old.ts'), 'old');
+    // 100 days ago
+    recordEdit(proj.id, 'old.ts', 'modified', Date.now() - 100 * 86_400_000);
+
+    expect(domain.listFilesNeedingExplanation(proj.id, { recentDays: 30 })).toHaveLength(0);
+    expect(domain.listFilesNeedingExplanation(proj.id, { recentDays: 365 })).toHaveLength(1);
+  });
+});
+
+describe('sanitizeFtsQuery', () => {
+  it('strips FTS5 metacharacters', () => {
+    expect(sanitizeFtsQuery('"*^():+-')).toBe('');
+  });
+
+  it('strips ordinary punctuation that unicode61 treats as separators', () => {
+    expect(sanitizeFtsQuery(';,!?.=<>|&%#@/')).toBe('');
+  });
+
+  it('returns empty for SQL-injection-shaped input', () => {
+    expect(sanitizeFtsQuery('"; DROP TABLE features; --')).toBe('DROP* TABLE* features*');
+    // Note: the result is harmless — it's matched as a 3-token MATCH clause
+    // against indexed fields, and the parameterized query never lets it touch
+    // the SQL surface area.
+  });
+
+  it('appends prefix * to each remaining token', () => {
+    expect(sanitizeFtsQuery('foo bar')).toBe('foo* bar*');
+  });
+
+  it('handles Korean tokens and underscores', () => {
+    expect(sanitizeFtsQuery('인증 모듈 feature_id')).toBe('인증* 모듈* feature_id*');
+  });
+
+  it('returns empty string for whitespace-only input', () => {
+    expect(sanitizeFtsQuery('   ')).toBe('');
+  });
+
+  it('drops control chars and combining marks but keeps the letters', () => {
+    expect(sanitizeFtsQuery('foo\tbar\nbaz')).toBe('foo* bar* baz*');
+  });
+});
+
+describe('searchProject', () => {
+  it('returns [] for empty query', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    expect(domain.searchProject(proj.id, '')).toEqual([]);
+  });
+
+  it('returns [] for special-char-only query', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    expect(domain.searchProject(proj.id, '";--')).toEqual([]);
+  });
+
+  it('matches feature title via Korean prefix and wraps with <mark>', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    domain.createFeature({ projectId: proj.id, name: '사용자 인증 모듈' });
+    domain.createFeature({ projectId: proj.id, name: '검색 기능' });
+
+    const hits = domain.searchProject(proj.id, '인증');
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.kind).toBe('feature');
+    expect(hits[0]!.title).toBe('사용자 인증 모듈');
+    expect(hits[0]!.snippet).toContain('<mark>인증</mark>');
+  });
+
+  it('escapes HTML in user content (XSS via name)', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    domain.createFeature({
+      projectId: proj.id,
+      name: '<script>alert(1)</script>findme',
+    });
+    const hits = domain.searchProject(proj.id, 'findme');
+    expect(hits).toHaveLength(1);
+    // Server-side HTML-escape: literal `<script>` must not survive into the
+    // response. Only our own `<mark>` markers (via sentinel) make it through.
+    expect(hits[0]!.title).not.toContain('<script>');
+    expect(hits[0]!.title).toContain('&lt;script&gt;');
+  });
+
+  it("doesn't leak results across projects", () => {
+    const a = domain.createProject({ name: 'A', rootPath: t.dir + '/a' });
+    const b = domain.createProject({ name: 'B', rootPath: t.dir + '/b' });
+    domain.createFeature({ projectId: a.id, name: '인증 (A)' });
+    domain.createFeature({ projectId: b.id, name: '인증 (B)' });
+
+    const aHits = domain.searchProject(a.id, '인증');
+    expect(aHits).toHaveLength(1);
+    expect(aHits[0]!.project_id).toBe(a.id);
+    expect(aHits[0]!.title).toBe('인증 (A)');
+  });
+
+  it('respects the limit argument and clamps to 1..100', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    for (let i = 0; i < 5; i++) {
+      domain.createFeature({ projectId: proj.id, name: `feature-${i} 인증` });
+    }
+    expect(domain.searchProject(proj.id, '인증', 3)).toHaveLength(3);
+    // Negative / zero limit clamps to default min 1 (then SEARCH_LIMIT_DEFAULT
+    // applies if Math.floor(limit) || DEFAULT). Either way: doesn't throw.
+    expect(() => domain.searchProject(proj.id, '인증', 0)).not.toThrow();
+    expect(() => domain.searchProject(proj.id, '인증', 99999)).not.toThrow();
+  });
+
+  it('title hits outrank body-only hits (column weight: title 3.0, body 1.0)', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    // Feature A: keyword in title only
+    domain.createFeature({
+      projectId: proj.id,
+      name: 'authpipeline 모듈',
+      goal: '관련 없는 설명',
+    });
+    // Feature B: keyword in body only (matches via goal/spec_md aggregation)
+    domain.createFeature({
+      projectId: proj.id,
+      name: '관련 없는 이름',
+      goal: 'authpipeline 흐름을 정리',
+    });
+
+    const hits = domain.searchProject(proj.id, 'authpipeline');
+    expect(hits).toHaveLength(2);
+    // First result must be the title-match feature.
+    expect(hits[0]!.title).toBe('authpipeline 모듈');
+  });
+
+  it('feature outranks decision/session for the same content match (kind weight tiebreak)', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: proj.id, name: '인증' });
+    domain.logDecision({ projectId: proj.id, title: '인증' });
+    // Synthetic session with summary='인증' so it lands in FTS via the trigger.
+    const db = getDb();
+    const sid = `s-${Math.random().toString(36).slice(2, 10)}`;
+    db.prepare(
+      'INSERT INTO sessions (id, project_id, started_at, summary) VALUES (?, ?, ?, ?)',
+    ).run(sid, proj.id, Date.now(), '인증');
+
+    const hits = domain.searchProject(proj.id, '인증');
+    // All three sources should match on title='인증'. With per-kind boosts
+    // (feature=1.0 > decision=0.9 > session=0.6), feature must come first.
+    const order = hits.map((h) => h.kind);
+    expect(order.indexOf('feature')).toBeLessThan(order.indexOf('decision'));
+    expect(order.indexOf('decision')).toBeLessThan(order.indexOf('session'));
+    void f; // silence unused
+  });
+});

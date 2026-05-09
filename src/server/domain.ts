@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { getDb, transact } from './db.js';
 import {
   formatAdrId,
@@ -17,9 +18,12 @@ import type {
   FeatureContext,
   FeatureFile,
   FeatureStatus,
+  FileExplanation,
+  FileNeedingExplanation,
   FileNode,
   Project,
   ProjectStats,
+  SearchResult,
   Session,
   SessionStartContext,
   Task,
@@ -233,6 +237,12 @@ export function addTask(featureId: string, name: string): Task {
   return rowToTask(row);
 }
 
+export function deleteTask(id: number): boolean {
+  const db = getDb();
+  const result = db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+  return result.changes > 0;
+}
+
 export function updateTask(
   id: number,
   patch: Partial<Pick<Task, 'name' | 'status' | 'notes' | 'position'>>,
@@ -250,7 +260,9 @@ export function updateTask(
     }
   }
 
-  // Status transitions update timestamps
+  // Status transitions update timestamps. Reverting away from done clears
+  // completed_at so the UI's "X분 전 완료" affordance doesn't lie about a task
+  // that's actually open again.
   if (patch.status === 'in_progress' && current.status !== 'in_progress') {
     fields.push('started_at = ?');
     params.push(now());
@@ -258,6 +270,10 @@ export function updateTask(
   if (patch.status === 'done' && current.status !== 'done') {
     fields.push('completed_at = ?');
     params.push(now());
+  }
+  if (patch.status && patch.status !== 'done' && current.status === 'done') {
+    fields.push('completed_at = ?');
+    params.push(null);
   }
 
   if (fields.length === 0) return rowToTask(current);
@@ -285,6 +301,39 @@ export function nextAdrId(projectId: string): string {
     .prepare('SELECT COUNT(*) AS n FROM decisions WHERE project_id = ?')
     .get(projectId) as { n: number };
   return formatAdrId(row.n + 1);
+}
+
+export function getDecision(id: string): Decision | null {
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM decisions WHERE id = ?').get(id) as any;
+  return row ? rowToDecision(row) : null;
+}
+
+export function updateDecision(
+  id: string,
+  patch: Partial<Pick<Decision, 'title' | 'context' | 'decision' | 'alternatives' | 'consequences' | 'feature_id'>>,
+): Decision | null {
+  const db = getDb();
+  if (!getDecision(id)) return null;
+
+  const fields: string[] = [];
+  const params: any[] = [];
+  for (const [k, v] of Object.entries(patch)) {
+    if (v !== undefined) {
+      fields.push(`${k} = ?`);
+      params.push(v);
+    }
+  }
+  if (fields.length === 0) return getDecision(id);
+  params.push(id);
+  db.prepare(`UPDATE decisions SET ${fields.join(', ')} WHERE id = ?`).run(...params);
+  return getDecision(id);
+}
+
+export function deleteDecision(id: string): boolean {
+  const db = getDb();
+  const result = db.prepare('DELETE FROM decisions WHERE id = ?').run(id);
+  return result.changes > 0;
 }
 
 export function logDecision(args: {
@@ -650,6 +699,451 @@ export function getFileTree(projectId: string): FileNode[] {
 }
 
 // ============================================================
+// File content access + explanation storage
+//
+// vibemate doesn't call any LLM directly. Claude Code (the user's IDE
+// session) plays the LLM role through MCP — it reads file content via
+// `pm_get_file_content`, summarizes locally, and stores the result via
+// `pm_save_file_explanation`. That keeps the user's existing Claude
+// subscription doing the work and avoids requiring a separate API key.
+// ============================================================
+
+const MAX_EXPLAIN_BYTES = 32 * 1024;
+const MAX_EXPLAIN_LINES = 600;
+
+// Lightweight binary heuristic: if any of the first 8KB is a null byte, treat
+// as binary. Plenty of "binary by accident" types (compiled .class, .png,
+// .pdf) trip this; legitimate UTF-8 / UTF-16 source code does not.
+function isLikelyBinary(buf: Buffer): boolean {
+  const sample = buf.subarray(0, Math.min(buf.length, 8192));
+  for (let i = 0; i < sample.length; i++) {
+    if (sample[i] === 0) return true;
+  }
+  return false;
+}
+
+// Clamp content to MAX_EXPLAIN_BYTES bytes AND MAX_EXPLAIN_LINES lines, taking
+// the smaller. Returns the clamped string + a `truncated` flag we surface to
+// the model so it knows the view is partial.
+function clampForExplain(text: string): { content: string; truncated: boolean } {
+  let truncated = false;
+  let result = text;
+
+  // Byte clamp: walk char-by-char accumulating UTF-8 bytes. Slicing by string
+  // index alone could leave us short or long; multi-byte chars (e.g. Korean)
+  // average ~3 bytes each.
+  if (Buffer.byteLength(result, 'utf8') > MAX_EXPLAIN_BYTES) {
+    let bytes = 0;
+    let cut = 0;
+    for (let i = 0; i < result.length; i++) {
+      const charBytes = Buffer.byteLength(result[i]!, 'utf8');
+      if (bytes + charBytes > MAX_EXPLAIN_BYTES) break;
+      bytes += charBytes;
+      cut = i + 1;
+    }
+    result = result.slice(0, cut);
+    truncated = true;
+  }
+
+  // Line clamp.
+  const lines = result.split('\n');
+  if (lines.length > MAX_EXPLAIN_LINES) {
+    result = lines.slice(0, MAX_EXPLAIN_LINES).join('\n');
+    truncated = true;
+  }
+
+  return { content: result, truncated };
+}
+
+// Sentinel error codes thrown by the file-access pipeline. The MCP/HTTP
+// wrappers map these to user-visible messages. Errors not in this set
+// surface as raw 500s.
+export const FILE_EXPLAIN_ERRORS = {
+  IGNORED: 'FILE_PATH_IGNORED',
+  OUTSIDE_ROOT: 'FILE_OUTSIDE_PROJECT_ROOT',
+  NOT_FOUND: 'FILE_NOT_FOUND',
+  BINARY: 'FILE_BINARY',
+  EMPTY_TEXT: 'EXPLANATION_TEXT_EMPTY',
+} as const;
+
+/**
+ * Surface the "files that should get an AI explanation" queue. Inputs that go
+ * into the result:
+ *   - Recent active edits: session_files with edit_type modified/created in the
+ *     last `recentDays` (default 30) days.
+ *   - Existing explanations: file_explanations row, if any.
+ *   - File mtime on disk: when an explanation exists, we mark it stale if the
+ *     file has been modified after the explanation was generated.
+ *
+ * Default behavior (`staleOnly=true`) returns only files that need work — no
+ * explanation, or stale explanation. With `staleOnly=false` everything in the
+ * recent-edit set comes back so a Claude Code session can do a force-regenerate
+ * pass (paired with #16).
+ *
+ * Sorted by `last_touched_at` descending so the most recently edited files
+ * surface first. `limit` is clamped to [1, 200] after parsing.
+ */
+export function listFilesNeedingExplanation(
+  projectId: string,
+  opts: { limit?: number; staleOnly?: boolean; recentDays?: number } = {},
+): FileNeedingExplanation[] {
+  const project = getProject(projectId);
+  if (!project) throw new Error(`Project not found: ${projectId}`);
+
+  const limit = Math.min(200, Math.max(1, Math.floor(opts.limit ?? 50)));
+  const staleOnly = opts.staleOnly !== false; // default true
+  const recentDays = Math.max(1, Math.floor(opts.recentDays ?? 30));
+  const cutoff = now() - recentDays * 86_400_000;
+
+  const db = getDb();
+  // Aggregate per file_path: max started_at among write-edits, plus explanation
+  // metadata via LEFT JOIN. We pull more rows than `limit` here because the
+  // mtime-stale filter can drop entries — we slice after filtering.
+  const rows = db
+    .prepare(
+      `SELECT sf.file_path AS file_path,
+              MAX(s.started_at) AS last_touched_at,
+              fe.generated_at AS generated_at
+         FROM session_files sf
+         JOIN sessions s ON s.id = sf.session_id
+         LEFT JOIN file_explanations fe
+           ON fe.project_id = s.project_id AND fe.file_path = sf.file_path
+        WHERE s.project_id = ?
+          AND sf.edit_type IN ('modified','created')
+          AND s.started_at >= ?
+        GROUP BY sf.file_path
+        ORDER BY last_touched_at DESC`,
+    )
+    .all(projectId, cutoff) as Array<{
+      file_path: string;
+      last_touched_at: number;
+      generated_at: number | null;
+    }>;
+
+  const result: FileNeedingExplanation[] = [];
+  for (const r of rows) {
+    if (shouldIgnoreFile(r.file_path)) continue;
+
+    const hasExplanation = r.generated_at != null;
+    let stale = false;
+    if (hasExplanation) {
+      // Compare the file's mtime on disk to generated_at. If the file vanished
+      // (rename/delete), drop it from the queue — no point asking for an
+      // explanation of something that's gone.
+      const absPath = path.resolve(project.root_path, r.file_path);
+      let mtimeMs: number;
+      try {
+        const st = fs.statSync(absPath);
+        if (!st.isFile()) continue;
+        mtimeMs = st.mtimeMs;
+      } catch {
+        continue;
+      }
+      // Truncate to whole ms so we don't false-positive on sub-ms filesystem
+      // resolution colliding with `Date.now()`'s integer ms (a write at
+      // 1234.567 ms compared to a Date.now() of 1234 looks "stale" without
+      // this normalization).
+      stale = Math.floor(mtimeMs) > (r.generated_at as number);
+    } else {
+      // Without an explanation we still want the file to exist on disk —
+      // otherwise Claude Code's get_file_content will just throw NOT_FOUND.
+      const absPath = path.resolve(project.root_path, r.file_path);
+      try {
+        const st = fs.statSync(absPath);
+        if (!st.isFile()) continue;
+      } catch {
+        continue;
+      }
+    }
+
+    if (staleOnly && hasExplanation && !stale) continue;
+
+    result.push({
+      file_path: r.file_path,
+      last_touched_at: r.last_touched_at,
+      has_explanation: hasExplanation,
+      explanation_stale: stale,
+    });
+
+    if (result.length >= limit) break;
+  }
+
+  return result;
+}
+
+/**
+ * Read existing cached explanation for a file. Returns null if not generated.
+ * Used by `/files/detail` to surface AI explanations alongside other metadata.
+ */
+export function getFileExplanation(
+  projectId: string,
+  filePath: string,
+): FileExplanation | null {
+  const db = getDb();
+  const row = db
+    .prepare('SELECT * FROM file_explanations WHERE project_id = ? AND file_path = ?')
+    .get(projectId, filePath) as FileExplanation | undefined;
+  return row ?? null;
+}
+
+// Read + validate + clamp + hash. Throws sentinel codes (see FILE_EXPLAIN_ERRORS)
+// for expected failure modes. Used by both `getFileContent` (Claude Code reads
+// the result) and `saveFileExplanation` (we re-hash to keep the cache marker
+// in sync with current file content).
+function prepareFileForExplanation(
+  projectId: string,
+  filePath: string,
+): { project: Project; content: string; truncated: boolean; contentHash: string } {
+  const project = getProject(projectId);
+  if (!project) throw new Error(`Project not found: ${projectId}`);
+
+  if (shouldIgnoreFile(filePath)) {
+    throw new Error(FILE_EXPLAIN_ERRORS.IGNORED);
+  }
+
+  const absPath = path.resolve(project.root_path, filePath);
+  const rel = path.relative(project.root_path, absPath);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(FILE_EXPLAIN_ERRORS.OUTSIDE_ROOT);
+  }
+  if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
+    throw new Error(FILE_EXPLAIN_ERRORS.NOT_FOUND);
+  }
+
+  const buf = fs.readFileSync(absPath);
+  if (isLikelyBinary(buf)) {
+    throw new Error(FILE_EXPLAIN_ERRORS.BINARY);
+  }
+
+  const { content, truncated } = clampForExplain(buf.toString('utf-8'));
+  // Hash on the *clamped* content so the cache stays warm even when a
+  // tail-only edit happened beyond MAX_EXPLAIN_BYTES/MAX_EXPLAIN_LINES.
+  const contentHash = createHash('sha256').update(content).digest('hex');
+
+  return { project, content, truncated, contentHash };
+}
+
+/**
+ * Read clamped file content for Claude Code (via the `pm_get_file_content`
+ * MCP tool) to summarize. Validation rejects binaries / ignore-patterns /
+ * paths outside the project root with sentinel error codes.
+ */
+export function getFileContent(
+  projectId: string,
+  filePath: string,
+): { content: string; truncated: boolean; content_hash: string } {
+  const prep = prepareFileForExplanation(projectId, filePath);
+  return {
+    content: prep.content,
+    truncated: prep.truncated,
+    content_hash: prep.contentHash,
+  };
+}
+
+/**
+ * Drop a cached explanation. Used by the "regenerate" button in the codemap
+ * panel and by `pm_clear_file_explanation`. The 0002 FTS5 trigger
+ * (`file_explanations_ad`) also clears the matching `search_fts` row, so the
+ * file stops matching `kind='file'` searches automatically.
+ *
+ * Returns true if a row was actually deleted (so the HTTP wrapper can 404
+ * cleanly when called against an uncached file).
+ */
+export function clearFileExplanation(projectId: string, filePath: string): boolean {
+  const db = getDb();
+  const result = db
+    .prepare('DELETE FROM file_explanations WHERE project_id = ? AND file_path = ?')
+    .run(projectId, filePath);
+  return result.changes > 0;
+}
+
+/**
+ * Persist an explanation produced by Claude Code into `file_explanations`.
+ * We re-read the file to compute `content_hash` against the current content
+ * — keeps the cache marker honest even if the file changed slightly between
+ * read and save. The FTS5 trigger from 0002 picks up the upsert and indexes
+ * the explanation automatically.
+ */
+export function saveFileExplanation(
+  projectId: string,
+  filePath: string,
+  text: string,
+): FileExplanation {
+  const trimmed = (text ?? '').trim();
+  if (!trimmed) throw new Error(FILE_EXPLAIN_ERRORS.EMPTY_TEXT);
+
+  const prep = prepareFileForExplanation(projectId, filePath);
+
+  const t = now();
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO file_explanations (project_id, file_path, content_hash, explanation, generated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(project_id, file_path) DO UPDATE SET
+       content_hash = excluded.content_hash,
+       explanation  = excluded.explanation,
+       generated_at = excluded.generated_at`,
+  ).run(projectId, filePath, prep.contentHash, trimmed, t);
+
+  return {
+    project_id: projectId,
+    file_path: filePath,
+    content_hash: prep.contentHash,
+    explanation: trimmed,
+    generated_at: t,
+  };
+}
+
+// ============================================================
+// Search (FTS5)
+// ============================================================
+
+/**
+ * Build a safe FTS5 MATCH expression from raw user input. Two layers of
+ * defense, in order:
+ *
+ *  1. Per-token cleanup: strip everything that isn't a Unicode letter, digit,
+ *     or underscore. That kills FTS5 syntax characters (`"*^():+-`) AND
+ *     ordinary punctuation (`;,!?.=<>|&%#@/`) which unicode61 also treats as
+ *     separators — leaving them in a token would either break the parser or
+ *     produce queries the tokenizer can never match.
+ *  2. Each remaining token gets a `*` suffix for prefix search. unicode61
+ *     doesn't morphologically split Korean, so a literal MATCH '인증' only
+ *     matches the exact token. '인증*' picks up '인증을', '인증의', etc.
+ *
+ * Tokens are AND-ed (FTS5 default for space-separated terms). Empty input
+ * returns '' — callers should treat that as "no results" without running a
+ * query.
+ */
+export function sanitizeFtsQuery(raw: string): string {
+  const tokens = raw
+    .split(/\s+/)
+    // \p{L} = letters (covers ASCII + CJK + everything else),
+    // \p{N} = digits. Underscore stays for identifiers like `feature_id`.
+    .map((t) => t.replace(/[^\p{L}\p{N}_]/gu, ''))
+    .filter((t) => t.length > 0);
+  if (tokens.length === 0) return '';
+  return tokens.map((t) => `${t}*`).join(' ');
+}
+
+const SEARCH_LIMIT_DEFAULT = 20;
+const SEARCH_LIMIT_MAX = 100;
+
+// FTS5 column weights for bm25(): a hit in `title` is worth 3× a hit in `body`.
+// The other columns are UNINDEXED so they don't take weights.
+const TITLE_WEIGHT = 3.0;
+const BODY_WEIGHT = 1.0;
+
+// Per-kind score multiplier applied to bm25(). `bm25()` returns a negative
+// number where smaller = more relevant; multiplying by a number > 0 keeps the
+// sign and re-scales the magnitude. Larger multipliers → stronger boost.
+//
+// Picked so that base content match still dominates kind: a session result
+// with a much better content match (bm25 = -10) outranks a feature with a
+// weak match (bm25 = -5) even after the boost — the kind tier only swings
+// ties or near-ties.
+const KIND_WEIGHT: Record<string, number> = {
+  feature: 1.0,
+  decision: 0.9,
+  file: 0.7,
+  session: 0.6,
+};
+
+// Sentinel markers handed to SQLite's snippet(). They survive the round-trip
+// through SQLite untouched, then we HTML-escape the entire snippet and swap
+// the sentinels back for real <mark>…</mark> tags. The result: any user
+// content (e.g. `<img onerror=...>` in a feature goal) is rendered inert
+// while our own marker tags pass through. Picking sentinel strings that are
+// unlikely in real prose AND won't survive HTML-escaping if they ever did
+// (the `` SOH char would show up as a literal — fine, it's invisible
+// in any sane render path).
+const SNIPPET_OPEN_SENTINEL = 'MARK_OPEN';
+const SNIPPET_CLOSE_SENTINEL = 'MARK_CLOSE';
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+export function searchProject(
+  projectId: string,
+  query: string,
+  limit: number = SEARCH_LIMIT_DEFAULT,
+): SearchResult[] {
+  const safeLimit = Math.min(Math.max(1, Math.floor(limit) || SEARCH_LIMIT_DEFAULT), SEARCH_LIMIT_MAX);
+  const ftsQuery = sanitizeFtsQuery(query);
+  if (!ftsQuery) return [];
+
+  const db = getDb();
+  // snippet(table, col=-1 → search across all indexed cols, open, close, ellipsis, n_tokens)
+  let rows: Array<{
+    kind: string;
+    ref_id: string;
+    project_id: string;
+    title: string;
+    snippet: string;
+    score: number;
+  }>;
+  try {
+    // bm25 args: weights for indexed columns in declaration order
+    // (title, body — kind/ref_id/project_id are UNINDEXED). Per-kind boost
+    // is folded in via CASE WHEN: kinds with a higher KIND_WEIGHT see a more
+    // negative score (= ranks higher), with the multiplier preserving sign.
+    rows = db
+      .prepare(
+        `SELECT kind, ref_id, project_id, title,
+                snippet(search_fts, -1, ?, ?, '…', 16) AS snippet,
+                bm25(search_fts, ?, ?) * (
+                  CASE kind
+                    WHEN 'feature'  THEN ?
+                    WHEN 'decision' THEN ?
+                    WHEN 'file'     THEN ?
+                    WHEN 'session'  THEN ?
+                    ELSE 1.0
+                  END
+                ) AS score
+         FROM search_fts
+         WHERE project_id = ? AND search_fts MATCH ?
+         ORDER BY score
+         LIMIT ?`,
+      )
+      .all(
+        SNIPPET_OPEN_SENTINEL,
+        SNIPPET_CLOSE_SENTINEL,
+        TITLE_WEIGHT,
+        BODY_WEIGHT,
+        KIND_WEIGHT.feature,
+        KIND_WEIGHT.decision,
+        KIND_WEIGHT.file,
+        KIND_WEIGHT.session,
+        projectId,
+        ftsQuery,
+        safeLimit,
+      ) as unknown as typeof rows;
+  } catch {
+    // FTS5 parser errors (e.g. an exotic input the sanitizer didn't catch)
+    // shouldn't surface as 500s. Fail closed: the user gets an empty result,
+    // not a stack trace.
+    return [];
+  }
+
+  return rows.map((r) => ({
+    kind: r.kind as SearchResult['kind'],
+    ref_id: r.ref_id,
+    project_id: r.project_id,
+    title: escapeHtml(r.title),
+    snippet: escapeHtml(r.snippet)
+      .split(SNIPPET_OPEN_SENTINEL).join('<mark>')
+      .split(SNIPPET_CLOSE_SENTINEL).join('</mark>'),
+    score: r.score,
+  }));
+}
+
+// ============================================================
 // Row converters
 // ============================================================
 
@@ -735,3 +1229,232 @@ function featureToContext(f: Feature): FeatureContext {
 }
 
 export { relativizeToProject };
+
+// ============================================================
+// CLAUDE.md migration
+//
+// vibemate drops a section into the user's CLAUDE.md so Claude Code knows
+// which MCP tools to call. The template evolves across sprints — this module
+// owns the template + the diff/replace logic that updates an existing file
+// without clobbering content the user added on top.
+//
+// Marker design (see ADR-0008):
+//   * Opening:  <!-- vibemate-section:v2 -->  ← detection sentinel, also the
+//     starting boundary for migrate.
+//   * Closing:  <!-- /vibemate-section -->    ← end boundary so user content
+//     after the section is preserved.
+//   * A meta line `<!-- vibemate-template-version: N -->` lives inside the
+//     section so future migrations know the body's vintage without parsing
+//     the body itself.
+//   * Legacy v1 (Sprint ≤8 single-marker — "Vibemate section — added by 'pm
+//     init'. Edit freely.") is detected and treated as marker→EOF for the
+//     first migration pass.
+//
+// User customisations preserved across migration:
+//   * Anything outside the marker pair (free-form additions before/after).
+//   * The Project ID line — regex-extracted from the old section and threaded
+//     into the new template so manual edits like vibemate's own
+//     `testft → vibemate` rename survive.
+// ============================================================
+
+export const VIBEMATE_SECTION_BEGIN = '<!-- vibemate-section:v2 -->';
+export const VIBEMATE_SECTION_END = '<!-- /vibemate-section -->';
+export const VIBEMATE_TEMPLATE_VERSION = 2;
+// Legacy single-line marker emitted by Sprint ≤8 templates. Single-shot,
+// no closing marker. Detected for backward-compat; first migration pass
+// rewrites these to the v2 pair.
+export const VIBEMATE_LEGACY_MARKER = "<!-- Vibemate section — added by 'pm init'. Edit freely. -->";
+
+// Matches `**Project ID**: \`<id>\`` line — used to lift the user's Project ID
+// out of an existing section so we don't clobber a manual rename.
+const PROJECT_ID_LINE_RE = /\*\*Project ID\*\*:\s*`([^`]+)`/;
+
+/**
+ * Render the canonical CLAUDE.md vibemate section for a given project id.
+ * Wraps the body in begin/end markers so future migrations have clean
+ * boundaries even when the user adds content after the section.
+ *
+ * Keep edits to the body in lockstep with `cli.ts` historical output —
+ * `pm init` and `pm migrate-claude-md` share this exact template.
+ */
+export function claudeMdTemplate(projectId: string): string {
+  return `${VIBEMATE_SECTION_BEGIN}
+<!-- vibemate-template-version: ${VIBEMATE_TEMPLATE_VERSION} -->
+
+## 이 프로젝트는 Vibemate가 활성화되어 있습니다
+
+**Project ID**: \`${projectId}\`
+
+세션 시작 시:
+1. \`pm_session_start\` 호출 → session_id 저장
+2. \`pm_get_context\` 호출 → 진행 상태 / 최근 결정 / 다음 태스크 확인
+
+세션 중 의미있는 결정이 있으면:
+- \`pm_log_decision\` 으로 ADR 기록 제안 (사용자 confirm 후 호출)
+
+세션 종료 직전:
+- \`pm_session_end\` 호출 (session_id, 한 줄 요약, primary_feature_id)
+- summary는 한국어 권장. 어떤 기능을 어떻게 진행했는지 명확하게.
+
+세션 종료 직후 (사용자가 "세션 정리해줘" 또는 "파일 설명 채워줘"라고 명시할 때만):
+- \`pm_session_end\` 호출 후, \`pm_list_files_needing_explanation\` 호출
+- 큐의 길이가 **5개 이상이면** "총 N개 파일에 설명 채울게요. 진행할까요?" 라고 사용자에게 먼저 확인
+- 결과 파일들 각각에 대해:
+  - \`pm_get_file_content(file_path)\` 로 클램프된 내용 받기 (32KB / 600라인 한도 내)
+  - 그 내용을 직접 읽어 2-3문장의 한국어 설명 작성
+  - \`pm_save_file_explanation(file_path, summary)\` 으로 저장
+- **자동 트리거가 아님** — 매 세션마다 자동으로 돌리지 말 것. 사용자가 명시적으로 요청할 때만.
+
+태스크 / 기능 변경:
+- 태스크 시작: \`pm_update_task\` (status=in_progress)
+- 태스크 완료: \`pm_update_task\` (status=done)
+- 새 기능: \`pm_create_feature\`
+
+${VIBEMATE_SECTION_END}`;
+}
+
+export interface MigrateClaudeMdResult {
+  /** True when the on-disk content would change (or is missing entirely). */
+  changed: boolean;
+  /** Unified-style line diff (' '/'-'/'+' prefixes). Empty when !changed. */
+  diff: string;
+  /** Full new file content the caller should write to disk. */
+  result: string;
+  /** Marker variant detected in the input. Useful for reporting. */
+  detected: 'none' | 'legacy' | 'paired';
+}
+
+/**
+ * Compute the migration result for `filePath`. Caller decides whether to
+ * apply (write `result`) or just print the `diff`. We never touch disk here.
+ *
+ * Behavior matrix:
+ *   - file missing → result = '# <basename>\n\n<template>\n', changed = true
+ *   - file exists, no marker → result = existing + '\n\n' + <template>
+ *   - file exists, paired markers → replace from begin to end (inclusive)
+ *   - file exists, legacy single marker → replace from marker → EOF
+ *
+ * `diff` only covers the section being changed (not the whole file) so the
+ * user reviews exactly what's churning.
+ */
+export function migrateClaudeMd(
+  filePath: string,
+  opts: { projectId: string },
+): MigrateClaudeMdResult {
+  const fileExists = fs.existsSync(filePath);
+  const existing = fileExists ? fs.readFileSync(filePath, 'utf-8') : '';
+
+  // Locate the section first so we can lift the user's Project ID before
+  // building the new template. Prefer paired markers; fall back to legacy.
+  let detected: 'none' | 'legacy' | 'paired' = 'none';
+  let oldSection = '';
+  let prefix = existing;
+  let suffix = '';
+
+  const beginIdx = existing.indexOf(VIBEMATE_SECTION_BEGIN);
+  if (beginIdx >= 0) {
+    const endIdx = existing.indexOf(VIBEMATE_SECTION_END, beginIdx);
+    if (endIdx >= 0) {
+      detected = 'paired';
+      const endClose = endIdx + VIBEMATE_SECTION_END.length;
+      oldSection = existing.slice(beginIdx, endClose);
+      prefix = existing.slice(0, beginIdx).replace(/\n+$/, '\n\n');
+      suffix = existing.slice(endClose);
+    }
+  }
+
+  if (detected === 'none' && existing) {
+    const legacyIdx = existing.indexOf(VIBEMATE_LEGACY_MARKER);
+    if (legacyIdx >= 0) {
+      // Legacy single-marker: section runs from marker to EOF. We can't
+      // distinguish user content beyond it, so caller backups before write.
+      detected = 'legacy';
+      oldSection = existing.slice(legacyIdx);
+      prefix = existing.slice(0, legacyIdx).replace(/\n+$/, '\n\n');
+      suffix = '';
+    }
+  }
+
+  // Preserve user-edited Project ID. The vibemate dogfood case (a manual
+  // `testft → vibemate` rename) would otherwise be reverted to whatever the
+  // caller resolved from CWD.
+  const preservedId = oldSection.match(PROJECT_ID_LINE_RE)?.[1];
+  const effectiveId = preservedId ?? opts.projectId;
+  const newSection = claudeMdTemplate(effectiveId);
+
+  if (!fileExists) {
+    const dirName = path.basename(path.dirname(filePath));
+    const result = `# ${dirName}\n\n${newSection}\n`;
+    return {
+      changed: true,
+      diff: lineDiff([], result.split('\n')).join('\n'),
+      result,
+      detected: 'none',
+    };
+  }
+
+  let result: string;
+  if (detected === 'none') {
+    // No marker at all — append at EOF, preserving a single trailing newline.
+    const trimmed = existing.replace(/\s+$/, '');
+    result = `${trimmed}\n\n${newSection}\n`;
+  } else {
+    // Replace section. Re-normalize trailing newline so we don't accumulate.
+    const trimmedSuffix = suffix.replace(/^\s+/, '');
+    result = `${prefix}${newSection}${trimmedSuffix ? '\n\n' + trimmedSuffix : '\n'}`;
+  }
+
+  if (result === existing) {
+    return { changed: false, diff: '', result, detected };
+  }
+
+  // Diff is scoped to the section. Showing the entire file would bury the
+  // change in unchanged lines.
+  const diff = lineDiff(
+    oldSection ? oldSection.split('\n') : [],
+    newSection.split('\n'),
+  ).join('\n');
+
+  return { changed: true, diff, result, detected };
+}
+
+/**
+ * Line-level diff using LCS. Output mirrors `diff -u` body format without
+ * hunk headers — each line gets a single ' ' / '-' / '+' prefix:
+ *   ' unchanged'
+ *   '-only-in-old'
+ *   '+only-in-new'
+ *
+ * Implementation is the standard O(n·m) DP. CLAUDE.md sections are tens of
+ * lines so this is cheap; we'd revisit if sections ever grow into thousands.
+ */
+export function lineDiff(oldLines: string[], newLines: string[]): string[] {
+  const m = oldLines.length;
+  const n = newLines.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldLines[i - 1] === newLines[j - 1]) {
+        dp[i]![j] = dp[i - 1]![j - 1]! + 1;
+      } else {
+        dp[i]![j] = Math.max(dp[i - 1]![j]!, dp[i]![j - 1]!);
+      }
+    }
+  }
+
+  const out: string[] = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+      out.unshift(' ' + oldLines[i - 1]);
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i]![j - 1]! >= dp[i - 1]![j]!)) {
+      out.unshift('+' + newLines[j - 1]);
+      j--;
+    } else {
+      out.unshift('-' + oldLines[i - 1]);
+      i--;
+    }
+  }
+  return out;
+}

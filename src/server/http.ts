@@ -53,6 +53,17 @@ const logDecisionSchema = z.object({
   feature_id: z.string().optional(),
 }).strict();
 
+// All fields optional for update — clients can patch one field at a time.
+// title still rejects empty string when present (mirrors create-side `min(1)`).
+const updateDecisionSchema = z.object({
+  title: z.string().min(1).optional(),
+  context: z.string().optional(),
+  decision: z.string().optional(),
+  alternatives: z.string().optional(),
+  consequences: z.string().optional(),
+  feature_id: z.string().nullable().optional(),
+}).strict();
+
 function formatZodError(err: z.ZodError): string {
   return err.errors.map((e) => `${e.path.join('.') || '<root>'}: ${e.message}`).join('; ');
 }
@@ -112,12 +123,15 @@ export function createApp() {
     const files = domain.listFeatureFiles(id);
     const { progress, done, total } = domain.getFeatureProgress(id);
 
-    // Sessions for this feature, with their session_files
+    // Sessions for this feature, with their session_files. `id` is included
+    // so the UI can attach data-ref-id to each card — used by the search
+    // palette's scroll-to-row + flash on navigateToResult('session', …).
     const sessions = domain
       .listSessions(feature.project_id, 100)
       .filter((s) => s.feature_id === id)
       .slice(0, 20)
       .map((s) => ({
+        id: s.id,
         time: relativeTime(s.started_at),
         summary: s.summary,
         files: s.files,
@@ -167,6 +181,27 @@ export function createApp() {
     );
   });
 
+  // ----- Search (FTS5 across features/decisions/sessions/files) -----
+
+  app.get('/api/projects/:id/search', (c) => {
+    const projectId = c.req.param('id');
+    if (!domain.getProject(projectId)) {
+      return c.json({ error: `Project not found: ${projectId}` }, 404);
+    }
+    const q = c.req.query('q') ?? '';
+    const limitRaw = c.req.query('limit');
+    let limit: number | undefined;
+    if (limitRaw !== undefined) {
+      const n = Number(limitRaw);
+      if (!Number.isFinite(n) || n <= 0) {
+        return c.json({ error: 'limit must be a positive number' }, 400);
+      }
+      limit = n;
+    }
+    const results = domain.searchProject(projectId, q, limit);
+    return c.json(results);
+  });
+
   // ----- File tree (for code map sidebar) -----
 
   app.get('/api/projects/:id/file-tree', (c) => {
@@ -177,6 +212,55 @@ export function createApp() {
     } catch (err) {
       return c.json({ error: (err as Error).message }, 404);
     }
+  });
+
+  // ----- Files needing explanation (queue surfaced for Claude Code) -----
+
+  app.get('/api/projects/:id/files/needs-explanation', (c) => {
+    const projectId = c.req.param('id');
+    if (!domain.getProject(projectId)) {
+      return c.json({ error: `Project not found: ${projectId}` }, 404);
+    }
+    const limitRaw = c.req.query('limit');
+    const staleOnlyRaw = c.req.query('staleOnly');
+    const recentDaysRaw = c.req.query('recentDays');
+
+    const opts: { limit?: number; staleOnly?: boolean; recentDays?: number } = {};
+    if (limitRaw !== undefined) {
+      const n = Number(limitRaw);
+      if (!Number.isFinite(n) || n <= 0) {
+        return c.json({ error: 'limit must be a positive number' }, 400);
+      }
+      opts.limit = n;
+    }
+    if (staleOnlyRaw !== undefined) {
+      // Permissive parsing: 'false' / '0' → false, anything else truthy → true.
+      // The query layer doesn't have JSON bool semantics so we DIY.
+      opts.staleOnly = !(staleOnlyRaw === 'false' || staleOnlyRaw === '0');
+    }
+    if (recentDaysRaw !== undefined) {
+      const n = Number(recentDaysRaw);
+      if (!Number.isFinite(n) || n <= 0) {
+        return c.json({ error: 'recentDays must be a positive number' }, 400);
+      }
+      opts.recentDays = n;
+    }
+
+    return c.json(domain.listFilesNeedingExplanation(projectId, opts));
+  });
+
+  // ----- Clear cached explanation (force-regenerate path) -----
+
+  app.delete('/api/projects/:id/file-explanations', (c) => {
+    const projectId = c.req.param('id');
+    const filePath = c.req.query('path');
+    if (!filePath) return c.json({ error: 'path query param required' }, 400);
+    if (!domain.getProject(projectId)) {
+      return c.json({ error: `Project not found: ${projectId}` }, 404);
+    }
+    const removed = domain.clearFileExplanation(projectId, filePath);
+    if (!removed) return c.json({ error: 'No cached explanation for that path' }, 404);
+    return c.json({ ok: true });
   });
 
   // ----- File detail (for code map) -----
@@ -200,8 +284,24 @@ export function createApp() {
       feature_name: s.feature_name,
     }));
 
-    return c.json({ path: filePath, features: featureNames, sessions });
+    // Surface the cached AI explanation if one exists. UI uses this to decide
+    // between rendering the cached summary and showing a "generate" button.
+    const explanation = domain.getFileExplanation(projectId, filePath);
+
+    return c.json({
+      path: filePath,
+      features: featureNames,
+      sessions,
+      explanation: explanation
+        ? { text: explanation.explanation, generated_at: explanation.generated_at }
+        : null,
+    });
   });
+
+  // (AI explanation generation has moved to MCP — see `pm_get_file_content` +
+  // `pm_save_file_explanation` in mcp.ts. Claude Code reads the file via MCP,
+  // summarizes locally, and writes the explanation back. The HTTP surface
+  // keeps `/files/detail` (above) for read-side display only.)
 
   // ----- File-feature links (manual override) -----
 
@@ -218,6 +318,21 @@ export function createApp() {
   app.delete('/api/feature-files', async (c) => {
     const body = await c.req.json<{ feature_id: string; file_path: string }>();
     domain.unlinkFile(body.feature_id, body.file_path);
+    return c.json({ ok: true });
+  });
+
+  // Cleaner URL-shaped variant of the unlink above. The feature-files row is
+  // keyed by (feature_id, file_path), and file_path can contain slashes — so
+  // we put feature_id in the path and accept file_path via query param rather
+  // than carving it into the URL.
+  app.delete('/api/features/:fid/files', (c) => {
+    const featureId = c.req.param('fid');
+    const filePath = c.req.query('path');
+    if (!filePath) return c.json({ error: 'path query param required' }, 400);
+    if (!domain.getFeature(featureId)) {
+      return c.json({ error: `Feature not found: ${featureId}` }, 404);
+    }
+    domain.unlinkFile(featureId, filePath);
     return c.json({ ok: true });
   });
 
@@ -300,6 +415,17 @@ export function createApp() {
     return c.json(updated);
   });
 
+  app.delete('/api/tasks/:id', (c) => {
+    const idParam = c.req.param('id');
+    const id = Number(idParam);
+    if (!Number.isInteger(id) || id <= 0) {
+      return c.json({ error: `Invalid task id: ${idParam}` }, 400);
+    }
+    const removed = domain.deleteTask(id);
+    if (!removed) return c.json({ error: `Task not found: ${id}` }, 404);
+    return c.json({ ok: true });
+  });
+
   // ----- Mutations: decisions -----
 
   app.post('/api/projects/:id/decisions', async (c) => {
@@ -319,6 +445,29 @@ export function createApp() {
     const { feature_id, ...rest } = parsed.data;
     const adr = domain.logDecision({ projectId, featureId: feature_id, ...rest });
     return c.json(adr, 201);
+  });
+
+  app.patch('/api/decisions/:id', async (c) => {
+    const id = c.req.param('id');
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+    const parsed = updateDecisionSchema.safeParse(raw);
+    if (!parsed.success) return c.json({ error: formatZodError(parsed.error) }, 400);
+
+    const updated = domain.updateDecision(id, parsed.data);
+    if (!updated) return c.json({ error: `Decision not found: ${id}` }, 404);
+    return c.json(updated);
+  });
+
+  app.delete('/api/decisions/:id', (c) => {
+    const id = c.req.param('id');
+    const removed = domain.deleteDecision(id);
+    if (!removed) return c.json({ error: `Decision not found: ${id}` }, 404);
+    return c.json({ ok: true });
   });
 
   // Serve built web app from dist/web/ when present.
