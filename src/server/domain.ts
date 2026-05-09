@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { getDb, transact } from './db.js';
+import { runGitLog, type ParsedCommit } from './git-import.js';
 import {
   formatAdrId,
   makeSlug,
@@ -1228,7 +1229,172 @@ function featureToContext(f: Feature): FeatureContext {
   };
 }
 
+// ============================================================
+// Git history import
+//
+// `pm import-history` and `pm_import_git_history` (MCP) call into here.
+// Single-commit path is `importGitCommit` — pure DB op, idempotent against
+// `imported_commits`. Bulk path is `importGitHistory` — spawns git log via
+// `git-import.runGitLog` then loops single-commit imports.
+// ============================================================
+
+export interface ImportGitCommitArgs {
+  projectId: string;
+  commitHash: string;
+  /** Author timestamp in ms since epoch (git emits seconds; caller × 1000). */
+  authorTimestampMs: number;
+  subject: string;
+  body?: string;
+  files: Array<{ path: string; edit_type: EditType }>;
+  /** Optional explicit feature mapping for the synthesised session. */
+  featureId?: string;
+}
+
+export interface ImportGitCommitResult {
+  sessionId: string;
+  /** false when the commit was already imported — caller did nothing. */
+  created: boolean;
+}
+
+/**
+ * Persist one git commit as a synthetic session. Idempotent against
+ * `imported_commits`: a repeat call returns the prior session_id with
+ * `created: false`. All inserts run in a single transaction so either the
+ * full commit (session + files + idempotency marker) lands or none of it.
+ */
+export function importGitCommit(args: ImportGitCommitArgs): ImportGitCommitResult {
+  const db = getDb();
+
+  const existing = db
+    .prepare('SELECT session_id FROM imported_commits WHERE project_id = ? AND commit_hash = ?')
+    .get(args.projectId, args.commitHash) as { session_id: string } | undefined;
+  if (existing) {
+    return { sessionId: existing.session_id, created: false };
+  }
+
+  const sessionId = newSessionId();
+  const ts = args.authorTimestampMs;
+  const notes = args.body && args.body.trim() ? args.body : null;
+
+  const insertSession = db.prepare(
+    `INSERT INTO sessions (id, project_id, feature_id, started_at, ended_at, summary, notes)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const insertFile = db.prepare(
+    `INSERT OR IGNORE INTO session_files (session_id, file_path, edit_type) VALUES (?, ?, ?)`,
+  );
+  const insertMarker = db.prepare(
+    `INSERT INTO imported_commits (project_id, commit_hash, session_id, imported_at)
+     VALUES (?, ?, ?, ?)`,
+  );
+
+  transact(db, () => {
+    insertSession.run(
+      sessionId,
+      args.projectId,
+      args.featureId ?? null,
+      ts,
+      ts, // ended_at = started_at — a commit is instantaneous
+      args.subject,
+      notes,
+    );
+    for (const f of args.files) {
+      // Apply the same ignore policy used by the live watcher; keeps imported
+      // sessions free of node_modules / build artifacts churn.
+      if (shouldIgnoreFile(f.path)) continue;
+      insertFile.run(sessionId, f.path, f.edit_type);
+    }
+    insertMarker.run(args.projectId, args.commitHash, sessionId, now());
+  });
+
+  return { sessionId, created: true };
+}
+
+export interface ImportGitHistoryOpts {
+  /** YYYY-MM-DD or any string git --since accepts. */
+  since?: string;
+  /** Hard cap on commits returned. Defaults to git-import.DEFAULT_LIMIT. */
+  limit?: number;
+  /** When true, parse commits but skip writes. Counts still populate. */
+  dryRun?: boolean;
+}
+
+export interface ImportGitHistoryResult {
+  /** Total commits returned by `git log` (post-filter). */
+  total: number;
+  /** Commits this run actually inserted. */
+  newCount: number;
+  /** Commits skipped because they were already imported. */
+  skippedCount: number;
+  /** Per-commit failures during apply. Empty on a clean run. */
+  errors: Array<{ hash: string; reason: string }>;
+}
+
+/**
+ * Spawn `git log` against the project's root_path and import each commit as
+ * a session. Returns counts so the caller (CLI / MCP) can report.
+ *
+ * `dryRun: true` skips `importGitCommit` writes. We still classify each
+ * commit (already-imported vs new) by checking `imported_commits` directly.
+ */
+export async function importGitHistory(
+  projectId: string,
+  opts: ImportGitHistoryOpts = {},
+): Promise<ImportGitHistoryResult> {
+  const project = getProject(projectId);
+  if (!project) throw new Error(`Project not found: ${projectId}`);
+
+  const commits = await runGitLog({
+    rootPath: project.root_path,
+    since: opts.since,
+    limit: opts.limit,
+  });
+
+  const result: ImportGitHistoryResult = {
+    total: commits.length,
+    newCount: 0,
+    skippedCount: 0,
+    errors: [],
+  };
+
+  if (commits.length === 0) return result;
+
+  if (opts.dryRun) {
+    // Classify without writes.
+    const db = getDb();
+    const isImported = db.prepare(
+      'SELECT 1 FROM imported_commits WHERE project_id = ? AND commit_hash = ?',
+    );
+    for (const c of commits) {
+      if (isImported.get(projectId, c.hash)) result.skippedCount++;
+      else result.newCount++;
+    }
+    return result;
+  }
+
+  for (const c of commits) {
+    try {
+      const r = importGitCommit({
+        projectId,
+        commitHash: c.hash,
+        authorTimestampMs: c.author_timestamp_ms,
+        subject: c.subject,
+        body: c.body,
+        files: c.files,
+      });
+      if (r.created) result.newCount++;
+      else result.skippedCount++;
+    } catch (err) {
+      result.errors.push({ hash: c.hash, reason: (err as Error).message });
+    }
+  }
+
+  return result;
+}
+
 export { relativizeToProject };
+// Re-export so cli.ts and tests can compose without reaching into the helper.
+export type { ParsedCommit };
 
 // ============================================================
 // CLAUDE.md migration

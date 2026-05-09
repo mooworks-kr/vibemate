@@ -191,6 +191,71 @@ program
   });
 
 // ----------------------------------------------------------------
+// pm import-history [--since YYYY-MM-DD] [--limit N] [--dry-run] [--force]
+// Walk `git log` in the current project's root and import each commit as a
+// synthetic session. Idempotent — re-runs skip already-imported commits.
+// ----------------------------------------------------------------
+program
+  .command('import-history')
+  .description('현재 프로젝트의 git history를 sessions로 일괄 import')
+  .option('--since <date>', "git --since 값 (예: '2025-01-01' 또는 '2 weeks ago')")
+  .option('--limit <n>', '가져올 커밋 최대 개수 (기본 1000)', (v) => parseInt(v, 10))
+  .option('--dry-run', '신규/스킵 카운트만 출력, DB 변경 없음')
+  .option('--force', 'confirm 건너뛰고 즉시 적용')
+  .action(async (opts: { since?: string; limit?: number; dryRun?: boolean; force?: boolean }) => {
+    getDb();
+    const project = currentProject();
+
+    // First pass: dry-run classification so we know counts before asking
+    // for confirm. Always runs even when --dry-run is set (single source of
+    // truth for the counts the user sees).
+    let preview;
+    try {
+      preview = await domain.importGitHistory(project.id, {
+        since: opts.since,
+        limit: opts.limit,
+        dryRun: true,
+      });
+    } catch (err) {
+      console.error(`× git log 호출 실패: ${(err as Error).message}`);
+      console.error('  현재 디렉토리가 git repo이고 git이 PATH에 있어야 합니다.');
+      process.exit(1);
+      return;
+    }
+
+    console.log(`총 ${preview.total}건 / 신규 ${preview.newCount}건 / 이미 import됨 ${preview.skippedCount}건`);
+
+    if (opts.dryRun) {
+      console.log('(--dry-run: DB는 변경되지 않았습니다.)');
+      return;
+    }
+    if (preview.newCount === 0) {
+      console.log('새로 import할 커밋이 없습니다.');
+      return;
+    }
+
+    if (!opts.force) {
+      const ok = await confirmPrompt(`\n신규 ${preview.newCount}건을 import할까요? (y/N) `);
+      if (!ok) {
+        console.log('취소했습니다.');
+        return;
+      }
+    }
+
+    const result = await domain.importGitHistory(project.id, {
+      since: opts.since,
+      limit: opts.limit,
+    });
+
+    console.log(`✓ 신규 ${result.newCount}건 import 완료 (스킵 ${result.skippedCount}건)`);
+    if (result.errors.length > 0) {
+      console.error(`× ${result.errors.length}건 실패:`);
+      for (const e of result.errors) console.error(`  ${e.hash.slice(0, 8)}: ${e.reason}`);
+      process.exit(1);
+    }
+  });
+
+// ----------------------------------------------------------------
 // pm migrate-claude-md [path] [--dry-run] [--force] [--no-backup]
 // Update an existing CLAUDE.md to the current pm-init template. Marker-aware
 // so user customisations between markers are preserved (see ADR-0003).

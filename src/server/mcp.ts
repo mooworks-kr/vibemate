@@ -317,6 +317,50 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     },
   );
 
+  // ----- Git history import -----
+
+  server.tool(
+    'pm_import_git_history',
+    {
+      project_id: z.string().optional()
+        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+      since: z.string().optional()
+        .describe("git --since 값 (ISO 날짜 또는 'N weeks ago'). 미지정 시 전체 history"),
+      limit: z.number().optional()
+        .describe('최대 커밋 수 (기본 1000). 큰 repo 보호용 cap'),
+      dry_run: z.boolean().optional()
+        .describe('true면 신규/스킵 카운트만 반환, 실제 INSERT 안 함. 기본 false'),
+    },
+    async ({ project_id, since, limit, dry_run }) => {
+      const pid = resolveProject(project_id);
+      const result = await domain.importGitHistory(pid, {
+        since,
+        limit,
+        dryRun: dry_run,
+      });
+      // Compose a short human-readable summary alongside the structured
+      // counts. Claude Code reads the text; the JSON is for any caller that
+      // wants to programmatically chain on it.
+      const lines = [
+        `총 ${result.total}건 / 신규 ${result.newCount}건 / 스킵 ${result.skippedCount}건` +
+          (dry_run ? ' (dry-run, DB 변경 없음)' : ''),
+      ];
+      if (result.errors.length > 0) {
+        lines.push(`실패 ${result.errors.length}건:`);
+        for (const e of result.errors.slice(0, 5)) {
+          lines.push(`  ${e.hash.slice(0, 8)}: ${e.reason}`);
+        }
+        if (result.errors.length > 5) lines.push(`  … +${result.errors.length - 5}건`);
+      }
+      return {
+        content: [
+          { type: 'text' as const, text: lines.join('\n') },
+          { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+        ],
+      };
+    },
+  );
+
   // ----- "Needs explanation" queue (Claude Code consumes this) -----
 
   server.tool(

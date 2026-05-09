@@ -1,4 +1,4 @@
-# Vibemate — Claude Code 개발 가이드
+# Vibemate — Codex 개발 가이드
 
 이 디렉토리는 **Vibemate 자체의 코드베이스**다. 사용자 프로젝트가 아닌, 툴 자체를 개발/유지보수하는 컨텍스트.
 
@@ -9,7 +9,7 @@ src/
 ├── server/          # Node.js 백엔드 (MCP + HTTP + DB + CLI)
 │   ├── cli.ts            # commander 진입점
 │   ├── daemon.ts         # HTTP + 워처 백그라운드 데몬
-│   ├── mcp.ts            # Claude Code가 stdio로 호출 (20개 툴)
+│   ├── mcp.ts            # Codex가 stdio로 호출 (19개 툴)
 │   ├── http.ts           # Hono REST API + 정적 파일 서빙
 │   ├── watcher.ts        # chokidar 파일 감시
 │   ├── domain.ts         # 비즈니스 로직 단일 소스
@@ -85,7 +85,7 @@ npm run typecheck  # 서버 + 웹 둘 다
 vitest. 도메인 + migrations 커버, HTTP 라우트/MCP/UI는 미커버 (수동 E2E로 검증).
 
 ```bash
-npm test                # 82 tests — projects/features/sanitizer/searchProject/migrations/endSession/getFileContent/saveFileExplanation/migrate-claude-md/tasks/decisions/feature_files/import-git-history
+npm test                # 66 tests — projects/features/sanitizer/searchProject/migrations/endSession/getFileContent/saveFileExplanation/migrate-Codex-md/tasks/decisions/feature_files
 npm run test:watch
 npm run test:coverage   # v8 reporter
 ```
@@ -131,7 +131,7 @@ HOME=/tmp/vibemate-test node dist/server/cli.js stop
 ## 알려진 제약
 
 - 큰 monorepo에서 chokidar 파일 워처 성능 미검증.
-- AI 파일 설명은 Claude Code MCP 호출(`pm_get_file_content` + `pm_save_file_explanation`)로 처리 — vibemate가 직접 LLM API를 호출하지 않으므로 별도 API 키 불필요.
+- AI 파일 설명은 Codex MCP 호출(`pm_get_file_content` + `pm_save_file_explanation`)로 처리 — vibemate가 직접 LLM API를 호출하지 않으므로 별도 API 키 불필요.
 - 검색의 `file` 카인드는 `file_explanations`이 채워진 파일에만 매칭.
 - 자동 테스트는 도메인/migrations 한정 — HTTP 라우트 / MCP / UI 는 수동 E2E.
 - 양방향 spec.md 파일 동기화 미구현.

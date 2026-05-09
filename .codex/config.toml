@@ -1,0 +1,6 @@
+[mcp_servers.vibemate]
+args = [
+    "/Users/jin/dev/vibemate/dist/server/cli.js",
+    "mcp",
+]
+command = "node"

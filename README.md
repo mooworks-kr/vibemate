@@ -90,13 +90,19 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 - 프론트엔드 점진적 타입화: `// @ts-nocheck` 제거 + tsc strict + `src/web/types.ts` (16 인터페이스)
 - `pm migrate-claude-md` 명령: 4 vintage 분기(none/no-marker/paired/legacy) + Project ID 보존 + .bak 백업
 - 측정 인프라: `scripts/measure-search.ts`, `compare-trigram.ts`, `measure-tasks-search.ts` — 향후 토크나이저/인덱싱 정책 재검토 자산
-- 단위 테스트 38 → **66** (도메인/migrations/migrate-claude-md 등)
+
+**Sprint 12 — 기존 작업 import**
+- `pm import-history [--since][--limit][--dry-run][--force]` 명령 + `pm_import_git_history` MCP 툴
+- git log → vibemate sessions 일괄 변환 (commit hash 멱등성, edit_type 매핑 A/M/T/R/C, D 스킵)
+- 새 마이그레이션 `0003_imported_commits.sql`: PK(project_id, commit_hash)로 중복 차단, cascade delete
+- 단위 테스트 38 → **82** (도메인/migrations/migrate-claude-md/import-git-history 등)
 
 ### 다음 백로그 후보
 
 - `[Maintenance]` `main.ts` 잔존 `any` ~42건 narrow (Sprint 8 후속)
 - 검색 한계 재검토: 한국어 형태소 분석기/임베딩 (ADR-0009 비범위)
 - tasks 검색 인덱싱 재검토: 운영 데이터로 가치 재평가 (ADR-0010 비범위)
+- 다른 source import: jira/notion/linear (Sprint 12의 `imported_<source>` 패턴 확장)
 - 양방향 spec.md 동기화 (미구현 명시)
 
 ## 데이터 위치
@@ -129,6 +135,7 @@ Sprint 4-11 ADR (vibemate DB에 ADR-0001~0011 기록, 웹 대시보드 또는 `p
 - 0009 trigram 미도입 (측정 데이터 기반): 한국어 2자 키워드 0 hit
 - 0010 tasks 인덱싱 미도입 (측정 재확인): noise-probe 49%
 - 0011 측정-기반 의사결정 sprint 패턴 (회고)
+- 0012 git import: imported_commits 테이블(옵션 B) + spawn array + edit_type 매핑(D 스킵)
 
 ## 알려진 제약
 
