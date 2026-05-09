@@ -15,11 +15,12 @@ describe('migrations runner — fresh DB', () => {
       .prepare('SELECT version FROM schema_migrations ORDER BY version')
       .all() as { version: number }[];
     const versions = rows.map((r) => r.version);
-    // 0001_init + 0002_search_fts + 0003_imported_commits. Bump as new
-    // migrations land.
+    // 0001_init + 0002_search_fts + 0003_imported_commits + 0004_extracted_features.
+    // Bump as new migrations land.
     expect(versions).toContain(1);
     expect(versions).toContain(2);
     expect(versions).toContain(3);
+    expect(versions).toContain(4);
   });
 
   it('creates the expected tables', () => {
@@ -37,6 +38,7 @@ describe('migrations runner — fresh DB', () => {
       'feature_files',
       'file_explanations',
       'imported_commits',
+      'extracted_features',
       'schema_migrations',
     ]) {
       expect(names.has(expected), `missing table: ${expected}`).toBe(true);
@@ -131,8 +133,8 @@ describe('migrations runner — legacy baseline', () => {
         .prepare('SELECT version FROM schema_migrations ORDER BY version')
         .all() as { version: number }[];
       const versions = rows.map((r) => r.version);
-      // Baseline marker for v1, plus newly-applied v2 / v3.
-      expect(versions).toEqual([1, 2, 3]);
+      // Baseline marker for v1, plus newly-applied v2 / v3 / v4.
+      expect(versions).toEqual([1, 2, 3, 4]);
     } finally {
       closeDb();
       try { fs.rmSync(legacy.dir, { recursive: true, force: true }); } catch {}

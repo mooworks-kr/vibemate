@@ -317,6 +317,56 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     },
   );
 
+  // ----- Conventional-commit feature extraction -----
+
+  server.tool(
+    'pm_extract_features_from_commits',
+    {
+      project_id: z.string().optional()
+        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+      types: z.array(z.string()).optional()
+        .describe("추출할 commit type 화이트리스트 (기본: feat/fix/docs/style/refactor/test/chore/perf/build/ci/revert)"),
+      min_count: z.number().optional()
+        .describe('그룹당 최소 commit 수 (기본 2)'),
+      include_untyped: z.boolean().optional()
+        .describe('scope 없는 commit도 type 단위로 묶기 (기본 false)'),
+      dry_run: z.boolean().optional()
+        .describe('true면 카운트만 반환, INSERT 없음. 기본 false'),
+    },
+    async ({ project_id, types, min_count, include_untyped, dry_run }) => {
+      const pid = resolveProject(project_id);
+      const result = domain.extractFeaturesFromCommits(pid, {
+        allowTypes: types,
+        minCount: min_count,
+        includeUntyped: include_untyped,
+        dryRun: dry_run,
+      });
+
+      const qualifying = result.groups.filter((g) => g.outcome !== 'under-threshold');
+      const headline = dry_run
+        ? `${qualifying.length}개 그룹 자격 (dry-run, DB 변경 없음)`
+        : `신규 ${result.created} / 합치기 ${result.merged} / 스킵 ${result.skipped} / 백필 ${result.sessionsBackfilled} sessions`;
+
+      const lines = [headline];
+      for (const g of qualifying.slice(0, 20)) {
+        const tag = g.outcome === 'created' ? '+'
+          : g.outcome === 'merged' ? '~'
+          : g.outcome === 'skipped' ? '·'
+          : g.outcome === 'dry-run' ? '?'
+          : ' ';
+        lines.push(`  ${tag} ${g.signature}  (${g.commitCount}건${g.featureId ? ` → ${g.featureId}` : ''})`);
+      }
+      if (qualifying.length > 20) lines.push(`  … +${qualifying.length - 20}개`);
+
+      return {
+        content: [
+          { type: 'text' as const, text: lines.join('\n') },
+          { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+        ],
+      };
+    },
+  );
+
   // ----- Git history import -----
 
   server.tool(

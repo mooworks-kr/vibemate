@@ -95,7 +95,13 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 - `pm import-history [--since][--limit][--dry-run][--force]` 명령 + `pm_import_git_history` MCP 툴
 - git log → vibemate sessions 일괄 변환 (commit hash 멱등성, edit_type 매핑 A/M/T/R/C, D 스킵)
 - 새 마이그레이션 `0003_imported_commits.sql`: PK(project_id, commit_hash)로 중복 차단, cascade delete
-- 단위 테스트 38 → **82** (도메인/migrations/migrate-claude-md/import-git-history 등)
+
+**Sprint 13 — 과거 feature 추출**
+- `pm extract-features [--types][--min-count][--include-untyped][--dry-run][--force]` + `pm_extract_features_from_commits` MCP 툴
+- conventional commit prefix(`feat(scope):`/`fix(scope):` 등)에서 (type, scope) 그룹핑 → vibemate feature 자동 생성 + sessions.feature_id backfill
+- type whitelist 11종 + scope 필수 + case-insensitive 이름 머지 + min-count 3 default
+- 새 마이그레이션 `0004_extracted_features.sql`: PK(project_id, source_signature)
+- 단위 테스트 38 → **97** (도메인/migrations/migrate-claude-md/import-git-history/extract-features 등)
 
 ### 다음 백로그 후보
 
@@ -136,6 +142,7 @@ Sprint 4-11 ADR (vibemate DB에 ADR-0001~0011 기록, 웹 대시보드 또는 `p
 - 0010 tasks 인덱싱 미도입 (측정 재확인): noise-probe 49%
 - 0011 측정-기반 의사결정 sprint 패턴 (회고)
 - 0012 git import: imported_commits 테이블(옵션 B) + spawn array + edit_type 매핑(D 스킵)
+- 0013 commit prefix → feature: type whitelist + scope 필수 + case-insensitive 머지 + min-count 3
 
 ## 알려진 제약
 

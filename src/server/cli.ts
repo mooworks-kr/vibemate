@@ -191,6 +191,76 @@ program
   });
 
 // ----------------------------------------------------------------
+// pm extract-features [--types feat,fix,refactor] [--min-count N]
+//                     [--include-untyped] [--dry-run] [--force]
+// Walk this project's sessions, parse conventional-commit subjects, and
+// turn each (type, scope) bucket into a feature row + session backfill.
+// Idempotent — re-runs hit the extracted_features marker and skip cleanly.
+// ----------------------------------------------------------------
+program
+  .command('extract-features')
+  .description('이미 import된 sessions에서 conventional commit prefix를 파싱해 feature 단위로 그룹핑')
+  .option('--types <list>', 'CSV로 추출할 type 제한 (기본: feat,fix,refactor 등 표준 11종)')
+  .option('--min-count <n>', '그룹당 최소 commit 수 (기본 2)', (v) => parseInt(v, 10))
+  .option('--include-untyped', 'scope 없는 commit도 type 단위로 묶기 (기본 off)')
+  .option('--dry-run', '결과 카운트만 출력, DB 변경 없음')
+  .option('--force', 'confirm 건너뛰고 즉시 적용')
+  .action(async (opts: {
+    types?: string;
+    minCount?: number;
+    includeUntyped?: boolean;
+    dryRun?: boolean;
+    force?: boolean;
+  }) => {
+    getDb();
+    const project = currentProject();
+
+    const allowTypes = opts.types
+      ? opts.types.split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
+
+    // Dry-run pass first — gives the user concrete counts before they confirm.
+    const preview = domain.extractFeaturesFromCommits(project.id, {
+      allowTypes,
+      minCount: opts.minCount,
+      includeUntyped: opts.includeUntyped,
+      dryRun: true,
+    });
+
+    const qualifying = preview.groups.filter((g) => g.outcome === 'dry-run');
+    console.log(`총 ${preview.groups.length}개 그룹 발견 / 자격 ${qualifying.length}개 (min-count ${opts.minCount ?? 2} 통과)`);
+    for (const g of qualifying) {
+      console.log(`  • ${g.signature}  (${g.commitCount}건)`);
+    }
+
+    if (opts.dryRun) {
+      console.log('\n(--dry-run: DB는 변경되지 않았습니다.)');
+      return;
+    }
+    if (qualifying.length === 0) {
+      console.log('생성할 feature가 없습니다. --min-count를 낮추거나 --include-untyped를 시도하세요.');
+      return;
+    }
+
+    if (!opts.force) {
+      const ok = await confirmPrompt(`\n${qualifying.length}개 그룹을 적용할까요? (y/N) `);
+      if (!ok) {
+        console.log('취소했습니다.');
+        return;
+      }
+    }
+
+    const result = domain.extractFeaturesFromCommits(project.id, {
+      allowTypes,
+      minCount: opts.minCount,
+      includeUntyped: opts.includeUntyped,
+    });
+    console.log(
+      `✓ 신규 ${result.created}개 / 합치기 ${result.merged}개 / 스킵 ${result.skipped}개 / sessions 백필 ${result.sessionsBackfilled}건`,
+    );
+  });
+
+// ----------------------------------------------------------------
 // pm import-history [--since YYYY-MM-DD] [--limit N] [--dry-run] [--force]
 // Walk `git log` in the current project's root and import each commit as a
 // synthetic session. Idempotent — re-runs skip already-imported commits.

@@ -1395,6 +1395,17 @@ export async function importGitHistory(
 export { relativizeToProject };
 // Re-export so cli.ts and tests can compose without reaching into the helper.
 export type { ParsedCommit };
+export {
+  CONVENTIONAL_TYPES,
+  extractFeaturesFromCommits,
+  parseConventionalCommit,
+} from './extract-features.js';
+export type {
+  ConventionalCommit,
+  ExtractFeaturesOpts,
+  ExtractFeaturesResult,
+  ExtractedGroup,
+} from './extract-features.js';
 
 // ============================================================
 // CLAUDE.md migration
