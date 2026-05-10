@@ -4,6 +4,7 @@ import {
   CONVENTIONAL_TYPES,
   extractFeaturesFromCommits,
   parseConventionalCommit,
+  parseCustomPattern,
 } from '../extract-features.js';
 import { createTempDb } from './helpers.js';
 
@@ -230,5 +231,169 @@ describe('extractFeaturesFromCommits', () => {
     expect(CONVENTIONAL_TYPES).toContain('feat');
     expect(CONVENTIONAL_TYPES).toContain('fix');
     expect(CONVENTIONAL_TYPES).not.toContain('init');
+  });
+});
+
+describe('parseCustomPattern', () => {
+  it('returns scope from capture group 1', () => {
+    const re = /^:[a-z_]+: (M\d+)/;
+    expect(parseCustomPattern(re, ':gemini_pro: M37 implemented login flow'))
+      .toEqual({ scope: 'M37' });
+  });
+
+  it("prefers a named <scope> group over group 1", () => {
+    // Both group 1 and named scope present — named wins.
+    const re = /^(\w+): (?<scope>M\d+)/;
+    expect(parseCustomPattern(re, 'gemini_pro: M37 hi')).toEqual({ scope: 'M37' });
+  });
+
+  it('returns null on no match', () => {
+    expect(parseCustomPattern(/^:M(\d+):/, 'no marker here')).toBeNull();
+  });
+
+  it('returns null when the matched scope is empty / whitespace', () => {
+    // `(?<scope>.*?)` matches greedy-but-empty.
+    expect(parseCustomPattern(/^prefix(?<scope>\s*)/, 'prefix    suffix')).toBeNull();
+  });
+});
+
+describe('extractFeaturesFromCommits — customPattern mode', () => {
+  function seedSession(projectId: string, summary: string, t0 = Date.now()): string {
+    const id = 's' + Math.random().toString(36).slice(2, 12).padEnd(11, '0');
+    t.db.prepare(
+      'INSERT INTO sessions (id, project_id, started_at, summary) VALUES (?, ?, ?, ?)',
+    ).run(id, projectId, t0, summary);
+    return id;
+  }
+
+  it('extracts groups from commits matching a custom regex (group 1)', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    seedSession(proj.id, ':gemini_pro: M37 first');
+    seedSession(proj.id, ':claude_haiku: M37 second');
+    seedSession(proj.id, ':claude_opus: M38 first');
+    seedSession(proj.id, ':claude_opus: M38 second');
+    // Doesn't match — should be ignored cleanly.
+    seedSession(proj.id, 'feat(auth): conventional commit');
+
+    const r = extractFeaturesFromCommits(proj.id, {
+      customPattern: '^:[a-z_]+: (M\\d+)',
+      customPatternType: 'milestone',
+      minCount: 2,
+    });
+
+    expect(r.created).toBe(2);
+    const sigs = r.groups.map((g) => g.signature).sort();
+    expect(sigs).toEqual(['milestone:M37', 'milestone:M38']);
+    expect(r.sessionsBackfilled).toBe(4);
+    // The conventional commit was NOT picked up — custom mode bypasses it.
+    expect(domain.listFeatures(proj.id).map((f) => f.name).sort())
+      .toEqual(['M37', 'M38']);
+  });
+
+  it("uses named <scope> when present even if group 1 differs", () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    seedSession(proj.id, 'gemini_pro: M37 a');
+    seedSession(proj.id, 'gemini_pro: M37 b');
+
+    const r = extractFeaturesFromCommits(proj.id, {
+      // group 1 captures the model id; named <scope> captures the milestone.
+      // Without our preference for `<scope>` we'd bucket by model, not milestone.
+      customPattern: '^(\\w+): (?<scope>M\\d+)',
+      minCount: 2,
+    });
+    expect(r.created).toBe(1);
+    expect(r.groups[0]!.signature).toBe('custom:M37');
+  });
+
+  it('throws on invalid regex syntax', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    expect(() =>
+      extractFeaturesFromCommits(proj.id, { customPattern: '(unclosed' }),
+    ).toThrow(/Invalid --pattern regex/);
+  });
+
+  it('throws when the pattern has no capture group', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    expect(() =>
+      extractFeaturesFromCommits(proj.id, { customPattern: '^:[a-z]+: M\\d+' }),
+    ).toThrow(/at least one capture group/);
+  });
+
+  it("throws when --pattern-type contains ':'", () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    expect(() =>
+      extractFeaturesFromCommits(proj.id, {
+        customPattern: '^(\\w+)',
+        customPatternType: 'milestone:bad',
+      }),
+    ).toThrow(/--pattern-type must not contain/);
+  });
+
+  it('throws when --pattern exceeds length cap', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    expect(() =>
+      extractFeaturesFromCommits(proj.id, { customPattern: 'a'.repeat(201) + '(b)' }),
+    ).toThrow(/exceeds .* limit/);
+  });
+
+  it('ignores conventional whitelist when customPattern is set', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    seedSession(proj.id, 'feat(auth): one');
+    seedSession(proj.id, 'feat(auth): two');
+    seedSession(proj.id, ':gemini_pro: M37 a');
+    seedSession(proj.id, ':gemini_pro: M37 b');
+
+    const r = extractFeaturesFromCommits(proj.id, {
+      customPattern: '^:[a-z_]+: (M\\d+)',
+      // Even though we explicitly pass allowTypes, custom mode ignores it.
+      allowTypes: ['feat'],
+      minCount: 2,
+    });
+    expect(r.created).toBe(1);
+    expect(r.groups.map((g) => g.signature)).toEqual(['custom:M37']);
+  });
+
+  it('is idempotent across runs (custom signature dedup via marker)', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    seedSession(proj.id, ':x: M5 a');
+    seedSession(proj.id, ':y: M5 b');
+    const opts = { customPattern: '^:\\w+: (M\\d+)', customPatternType: 'milestone', minCount: 2 };
+
+    const first = extractFeaturesFromCommits(proj.id, opts);
+    expect(first.created).toBe(1);
+    expect(first.sessionsBackfilled).toBe(2);
+
+    const second = extractFeaturesFromCommits(proj.id, opts);
+    expect(second.created).toBe(0);
+    expect(second.skipped).toBe(1);
+    expect(second.sessionsBackfilled).toBe(0);
+  });
+
+  it('coexists with prior conventional extraction (separate signature namespaces)', () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    seedSession(proj.id, 'feat(auth): a');
+    seedSession(proj.id, 'feat(auth): b');
+    seedSession(proj.id, ':gemini_pro: M37 a');
+    seedSession(proj.id, ':claude_opus: M37 b');
+
+    const conv = extractFeaturesFromCommits(proj.id, { minCount: 2 });
+    expect(conv.created).toBe(1);
+
+    const cust = extractFeaturesFromCommits(proj.id, {
+      customPattern: '^:\\w+: (M\\d+)',
+      customPatternType: 'milestone',
+      minCount: 2,
+    });
+    expect(cust.created).toBe(1);
+
+    // Both `auth` and `M37` features exist, with their own backfills.
+    expect(domain.listFeatures(proj.id).map((f) => f.name).sort()).toEqual(['M37', 'auth']);
+    // Markers live in the same table but with distinct signatures.
+    const markers = (t.db
+      .prepare('SELECT source_signature FROM extracted_features WHERE project_id = ?')
+      .all(proj.id) as Array<{ source_signature: string }>)
+      .map((r) => r.source_signature)
+      .sort();
+    expect(markers).toEqual(['feat:auth', 'milestone:M37']);
   });
 });

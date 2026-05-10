@@ -54,14 +54,99 @@ export function parseConventionalCommit(subject: string): ConventionalCommit | n
 }
 
 export interface ExtractFeaturesOpts {
-  /** Subset of types to extract. Default = CONVENTIONAL_TYPES. */
+  /** Subset of types to extract. Default = CONVENTIONAL_TYPES. (conventional mode only) */
   allowTypes?: string[];
   /** Min commits per (type, scope) group to qualify as a feature. Default 2. */
   minCount?: number;
-  /** When true, scope-less commits are also bucketed (by type alone). */
+  /** When true, scope-less commits are also bucketed (by type alone). (conventional mode only) */
   includeUntyped?: boolean;
   /** When true, classify and report counts but skip all writes. */
   dryRun?: boolean;
+
+  /**
+   * Custom regex (string source) to parse session.summary instead of the
+   * conventional commit grammar. When set, conventional parsing is bypassed
+   * entirely — `allowTypes` and `includeUntyped` are ignored.
+   *
+   * Group resolution: if the regex has a named group `<scope>` we use that;
+   * otherwise we use capture group 1. A regex without any capture group is
+   * rejected at validation time.
+   *
+   * source_signature for these groups becomes `${customPatternType ?? 'custom'}:${scope}`,
+   * which lives in a separate namespace from conventional `feat:auth` etc.
+   */
+  customPattern?: string;
+  /**
+   * Type-prefix used in the source_signature when `customPattern` is set.
+   * Defaults to `'custom'`. Free-form (no whitelist) but cannot contain `:`
+   * since that's the signature separator.
+   */
+  customPatternType?: string;
+}
+
+/** Hard cap on `customPattern` length. Generous for legit patterns; raises
+ *  the bar against accidental ReDoS by limiting the input surface. */
+const MAX_PATTERN_LENGTH = 200;
+
+/**
+ * Pull a scope out of a single subject using a pre-compiled custom regex.
+ * Returns null on miss (no match, or matched but the captured scope is
+ * empty / whitespace). Caller is responsible for compiling + validating
+ * the regex once and passing it in.
+ */
+export function parseCustomPattern(re: RegExp, subject: string): { scope: string } | null {
+  const m = subject.match(re);
+  if (!m) return null;
+  const raw = m.groups?.scope ?? m[1];
+  if (!raw) return null;
+  const scope = raw.trim();
+  if (!scope) return null;
+  return { scope };
+}
+
+/**
+ * Compile + validate a user-supplied pattern. Throws with a user-facing
+ * message on syntax errors, missing capture groups, or when the
+ * accompanying patternType is malformed (would break source_signature).
+ */
+function compileCustomPattern(
+  pattern: string,
+  patternType: string | undefined,
+): { re: RegExp; signaturePrefix: string } {
+  if (pattern.length > MAX_PATTERN_LENGTH) {
+    throw new Error(`--pattern exceeds ${MAX_PATTERN_LENGTH}-char limit`);
+  }
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern);
+  } catch (e) {
+    throw new Error(`Invalid --pattern regex: ${(e as Error).message}`);
+  }
+
+  // Detect at least one capture group. Named `(?<x>...)` and plain `(...)`
+  // both qualify. We exclude non-capturing `(?:...)`, lookahead `(?=...)`,
+  // and lookbehind `(?<=...)` / `(?<!...)`.
+  //
+  // The check operates on `re.source` rather than walking parsed AST — we
+  // strip escaped `\(` first, then count `(` that are NOT followed by `?:`
+  // / `?=` / `?!` / `?<=` / `?<!`. Negative-lookahead does the work.
+  const sourceWithoutEscapedParens = re.source.replace(/\\./g, '');
+  const captureGroupCount = (
+    sourceWithoutEscapedParens.match(/\((?!\?(?:[:!=]|<[!=]))/g) ?? []
+  ).length;
+  if (captureGroupCount === 0) {
+    throw new Error('--pattern must have at least one capture group (named <scope> or group 1)');
+  }
+
+  const signaturePrefix = (patternType ?? 'custom').trim();
+  if (!signaturePrefix) {
+    throw new Error('--pattern-type must not be empty');
+  }
+  if (signaturePrefix.includes(':')) {
+    throw new Error('--pattern-type must not contain ":" (signature separator)');
+  }
+
+  return { re, signaturePrefix };
 }
 
 export interface ExtractedGroup {
@@ -112,13 +197,34 @@ export function extractFeaturesFromCommits(
   opts: ExtractFeaturesOpts = {},
 ): ExtractFeaturesResult {
   const db = getDb();
-  const allow = new Set(opts.allowTypes ?? CONVENTIONAL_TYPES);
   const minCount = Math.max(1, Math.floor(opts.minCount ?? 2));
-  const includeUntyped = opts.includeUntyped === true;
 
   // Project must exist; bail loudly so the caller can surface a clean error.
   const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
   if (!project) throw new Error(`Project not found: ${projectId}`);
+
+  // Mode dispatch. customPattern wins exclusively — when set, conventional
+  // grammar (and `allowTypes` / `includeUntyped`) is ignored. This keeps the
+  // mental model simple: one extraction per invocation, no implicit OR.
+  let parse: (summary: string) => { type: string; scope: string } | null;
+  if (opts.customPattern != null && opts.customPattern.length > 0) {
+    const { re, signaturePrefix } = compileCustomPattern(opts.customPattern, opts.customPatternType);
+    parse = (summary) => {
+      const got = parseCustomPattern(re, summary);
+      if (!got) return null;
+      return { type: signaturePrefix, scope: got.scope };
+    };
+  } else {
+    const allow = new Set(opts.allowTypes ?? CONVENTIONAL_TYPES);
+    const includeUntyped = opts.includeUntyped === true;
+    parse = (summary) => {
+      const c = parseConventionalCommit(summary);
+      if (!c) return null;
+      if (!allow.has(c.type)) return null;
+      if (c.scope == null && !includeUntyped) return null;
+      return { type: c.type, scope: c.scope ?? '__notype__' };
+    };
+  }
 
   // 1. Pull every session's id + summary in start order. We iterate this in
   // memory rather than crafting a SQL group-by because the bucketing key
@@ -134,20 +240,21 @@ export function extractFeaturesFromCommits(
   // 2. Bucket by signature.
   const buckets = new Map<string, ExtractedGroup>();
   for (const r of rows) {
-    const parsed = parseConventionalCommit(r.summary);
+    const parsed = parse(r.summary);
     if (!parsed) continue;
-    if (!allow.has(parsed.type)) continue;
-    if (parsed.scope == null && !includeUntyped) continue;
 
-    const sigKey = parsed.scope == null ? '__notype__' : parsed.scope;
-    const signature = `${parsed.type}:${sigKey}`;
+    const signature = `${parsed.type}:${parsed.scope}`;
+    // Restore null for the conventional sentinel so the rendered group keeps
+    // the original `scope: null` semantics (used by proposedName fallback
+    // and downstream display).
+    const displayScope = parsed.scope === '__notype__' ? null : parsed.scope;
     let g = buckets.get(signature);
     if (!g) {
       g = {
         signature,
         type: parsed.type,
-        scope: parsed.scope,
-        proposedName: parsed.scope ?? parsed.type,
+        scope: displayScope,
+        proposedName: displayScope ?? parsed.type,
         commitCount: 0,
         sessionIds: [],
         applied: false,

@@ -199,16 +199,20 @@ program
 // ----------------------------------------------------------------
 program
   .command('extract-features')
-  .description('이미 import된 sessions에서 conventional commit prefix를 파싱해 feature 단위로 그룹핑')
-  .option('--types <list>', 'CSV로 추출할 type 제한 (기본: feat,fix,refactor 등 표준 11종)')
+  .description('이미 import된 sessions에서 commit prefix를 파싱해 feature 단위로 그룹핑')
+  .option('--types <list>', 'CSV로 추출할 type 제한 (conventional 모드, 기본: feat,fix,refactor 등 표준 11종)')
   .option('--min-count <n>', '그룹당 최소 commit 수 (기본 2)', (v) => parseInt(v, 10))
-  .option('--include-untyped', 'scope 없는 commit도 type 단위로 묶기 (기본 off)')
+  .option('--include-untyped', 'scope 없는 commit도 type 단위로 묶기 (conventional 모드, 기본 off)')
+  .option('--pattern <regex>', '사용자 정의 regex 모드. group 1 또는 (?<scope>…)로 scope 캡처. 지정 시 conventional 모드 무시.')
+  .option('--pattern-type <name>', "사용자 정의 모드의 type 라벨 (signature prefix). 기본 'custom'", 'custom')
   .option('--dry-run', '결과 카운트만 출력, DB 변경 없음')
   .option('--force', 'confirm 건너뛰고 즉시 적용')
   .action(async (opts: {
     types?: string;
     minCount?: number;
     includeUntyped?: boolean;
+    pattern?: string;
+    patternType?: string;
     dryRun?: boolean;
     force?: boolean;
   }) => {
@@ -218,17 +222,32 @@ program
     const allowTypes = opts.types
       ? opts.types.split(',').map((s) => s.trim()).filter(Boolean)
       : undefined;
+    const customMode = opts.pattern != null && opts.pattern.length > 0;
 
     // Dry-run pass first — gives the user concrete counts before they confirm.
-    const preview = domain.extractFeaturesFromCommits(project.id, {
-      allowTypes,
-      minCount: opts.minCount,
-      includeUntyped: opts.includeUntyped,
-      dryRun: true,
-    });
+    // Wrap in try/catch so regex compile / validation errors land as clean
+    // user-facing messages, not stack traces.
+    let preview;
+    try {
+      preview = domain.extractFeaturesFromCommits(project.id, {
+        allowTypes,
+        minCount: opts.minCount,
+        includeUntyped: opts.includeUntyped,
+        customPattern: opts.pattern,
+        customPatternType: opts.patternType,
+        dryRun: true,
+      });
+    } catch (err) {
+      console.error(`× ${(err as Error).message}`);
+      process.exit(1);
+      return;
+    }
 
     const qualifying = preview.groups.filter((g) => g.outcome === 'dry-run');
-    console.log(`총 ${preview.groups.length}개 그룹 발견 / 자격 ${qualifying.length}개 (min-count ${opts.minCount ?? 2} 통과)`);
+    const modeLabel = customMode ? ` (custom pattern mode, type='${opts.patternType ?? 'custom'}')` : '';
+    console.log(
+      `총 ${preview.groups.length}개 그룹 발견 / 자격 ${qualifying.length}개 (min-count ${opts.minCount ?? 2} 통과)${modeLabel}`,
+    );
     for (const g of qualifying) {
       console.log(`  • ${g.signature}  (${g.commitCount}건)`);
     }
@@ -238,7 +257,10 @@ program
       return;
     }
     if (qualifying.length === 0) {
-      console.log('생성할 feature가 없습니다. --min-count를 낮추거나 --include-untyped를 시도하세요.');
+      const hint = customMode
+        ? '--pattern을 확인하거나 --min-count를 낮추세요.'
+        : '--min-count를 낮추거나 --include-untyped 또는 --pattern을 시도하세요.';
+      console.log(`생성할 feature가 없습니다. ${hint}`);
       return;
     }
 
@@ -254,6 +276,8 @@ program
       allowTypes,
       minCount: opts.minCount,
       includeUntyped: opts.includeUntyped,
+      customPattern: opts.pattern,
+      customPatternType: opts.patternType,
     });
     console.log(
       `✓ 신규 ${result.created}개 / 합치기 ${result.merged}개 / 스킵 ${result.skipped}개 / sessions 백필 ${result.sessionsBackfilled}건`,

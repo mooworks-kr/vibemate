@@ -325,20 +325,26 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
       project_id: z.string().optional()
         .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
       types: z.array(z.string()).optional()
-        .describe("추출할 commit type 화이트리스트 (기본: feat/fix/docs/style/refactor/test/chore/perf/build/ci/revert)"),
+        .describe('추출할 commit type 화이트리스트 (conventional 모드, 기본: feat/fix/docs/style/refactor/test/chore/perf/build/ci/revert)'),
       min_count: z.number().optional()
         .describe('그룹당 최소 commit 수 (기본 2)'),
       include_untyped: z.boolean().optional()
-        .describe('scope 없는 commit도 type 단위로 묶기 (기본 false)'),
+        .describe('scope 없는 commit도 type 단위로 묶기 (conventional 모드, 기본 false)'),
+      pattern: z.string().optional()
+        .describe('사용자 정의 regex (group 1 또는 named <scope>로 scope 캡처). 지정 시 conventional 모드 무시.'),
+      pattern_type: z.string().optional()
+        .describe("사용자 정의 모드의 signature prefix. 기본 'custom'"),
       dry_run: z.boolean().optional()
         .describe('true면 카운트만 반환, INSERT 없음. 기본 false'),
     },
-    async ({ project_id, types, min_count, include_untyped, dry_run }) => {
+    async ({ project_id, types, min_count, include_untyped, pattern, pattern_type, dry_run }) => {
       const pid = resolveProject(project_id);
       const result = domain.extractFeaturesFromCommits(pid, {
         allowTypes: types,
         minCount: min_count,
         includeUntyped: include_untyped,
+        customPattern: pattern,
+        customPatternType: pattern_type,
         dryRun: dry_run,
       });
 
