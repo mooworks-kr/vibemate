@@ -8,7 +8,6 @@ import type {
   Feature,
   FeatureFile,
   FeatureStatus,
-  FileNode,
   Project,
   SearchKind,
   SearchResult,
@@ -29,8 +28,6 @@ import type {
   FeatureFileRow,
   FeatureListItem,
   FeaturePatch,
-  FileDetailResponse,
-  FileTreeNode,
   ProjectListEntry,
   ProjectListItem,
   RawSessionResponse,
@@ -46,8 +43,6 @@ const DATA: DataCache = {
   projects: [],
   features: {},
   decisions: {},
-  fileTree: {},
-  fileExplanations: {},
 };
 
 
@@ -58,7 +53,6 @@ const state: AppState = {
   // for new users (or users with several projects) before they pick one.
   currentTab: 'workspace',
   currentFeature: null,
-  currentFile: null,
   loading: true,               // initial fetch in flight
   error: null,
   loadedProjects: new Set<string>(),
@@ -67,14 +61,12 @@ const state: AppState = {
   addingFeature: false,
   addingTaskFor: null,         // feature id while inline form is open
   addingDecision: false,
-  linkingFile: null,           // codemap: file path while picker is open (null = closed)
   editingFeatureName: null,    // feature id while name is being inline-edited
   editingDecisionId: null,     // ADR id while edit form is open
 
   // Transient UI
   errorMsg: null,              // last toast banner text
   toastKind: 'error',          // tint for the transient banner
-  fileDetailLoading: false,
 
   // Workspace tab
   workspaceStatuses: ['in_progress'],
@@ -83,12 +75,7 @@ const state: AppState = {
   workspaceError: null,
 };
 
-// Per-(project,path) cache for `/files/detail`, populated lazily from codemap.
-const FILE_DETAIL: Record<string, FileDetailResponse | null> = {};
-
-function fdKey(projectId: string, p: string): string {
-  return `${projectId}::${p}`;
-}
+// (Removed in ADR-0016: FILE_DETAIL cache + fdKey helper. Code Map retired.)
 
 // =================================================
 // API helpers
@@ -155,10 +142,14 @@ function validateRequired(fields: Array<[string, string | undefined | null]>): s
 // On success returns the parsed JSON (or null if response had no body, e.g. some
 // 204s — currently all our endpoints return at least {ok:true}). On failure or
 // cancel returns null and the caller should bail without touching local cache.
+// T defaults to `any` deliberately — most callers ignore the return value and
+// only care about success/failure; an explicit default makes those sites
+// (e.g. `mutate({ ... })` without generics) read cleanly. `body` stays `unknown`
+// because it's `JSON.stringify`-ed and the caller knows the shape.
 async function mutate<T = any>(opts: {
   method: 'POST' | 'PATCH' | 'DELETE' | 'PUT';
   url: string;
-  body?: any;
+  body?: unknown;
   confirm?: string;
   successToast?: string;
 }): Promise<T | null> {
@@ -173,8 +164,9 @@ async function mutate<T = any>(opts: {
   let res: Response;
   try {
     res = await fetch(opts.url, init);
-  } catch (e: any) {
-    showToast(e?.message ?? '네트워크 오류', 'error');
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : '네트워크 오류';
+    showToast(msg, 'error');
     return null;
   }
 
@@ -185,13 +177,13 @@ async function mutate<T = any>(opts: {
     return null;
   }
 
-  let data: any = null;
+  let data: unknown = null;
   try { data = await res.json(); } catch { /* empty body — fine */ }
   if (opts.successToast) showToast(opts.successToast, 'success');
   return data as T;
 }
 
-function progressFromTasks(tasks: any[]): number {
+function progressFromTasks(tasks: Array<{ status: TaskStatus }> | undefined | null): number {
   if (!tasks || tasks.length === 0) return 0;
   const done = tasks.filter((t) => t.status === 'done').length;
   return Math.round((done / tasks.length) * 100);
@@ -253,7 +245,7 @@ async function deleteTaskUI(taskId: number): Promise<void> {
   if (!ok) return;
   for (const feat of DATA.features[state.currentProject!] || []) {
     const before = (feat.tasks || []).length;
-    feat.tasks = (feat.tasks || []).filter((x: any) => x.id !== taskId);
+    feat.tasks = (feat.tasks || []).filter((x) => x.id !== taskId);
     if (feat.tasks.length !== before) {
       feat.progress = progressFromTasks(feat.tasks);
       break;
@@ -271,7 +263,7 @@ async function toggleTaskUI(taskId: number, currentStatus: TaskStatus): Promise<
   });
   if (!t) return;
   for (const feat of DATA.features[state.currentProject!] || []) {
-    const tk = (feat.tasks || []).find((x: any) => x.id === taskId);
+    const tk = (feat.tasks || []).find((x) => x.id === taskId);
     if (tk) {
       tk.status = t.status;
       tk.completed_at = t.completed_at;
@@ -301,10 +293,10 @@ async function updateDecisionUI(adrId: string, patch: DecisionPatch): Promise<vo
   });
   if (!updated) return;
   const list = DATA.decisions[state.currentProject!] || [];
-  const idx = list.findIndex((d: any) => d.id === adrId);
+  const idx = list.findIndex((d) => d.id === adrId);
   if (idx >= 0) {
     const featureName = updated.feature_id
-      ? (DATA.features[state.currentProject!] || []).find((f: any) => f.id === updated.feature_id)?.name ?? null
+      ? (DATA.features[state.currentProject!] || []).find((f) => f.id === updated.feature_id)?.name ?? null
       : null;
     list[idx] = {
       ...list[idx],
@@ -330,7 +322,7 @@ async function deleteDecisionUI(adrId: string): Promise<void> {
   });
   if (!ok) return;
   DATA.decisions[state.currentProject!] =
-    (DATA.decisions[state.currentProject!] || []).filter((d: any) => d.id !== adrId);
+    (DATA.decisions[state.currentProject!] || []).filter((d) => d.id !== adrId);
   if (state.editingDecisionId === adrId) state.editingDecisionId = null;
   render();
 }
@@ -384,7 +376,7 @@ async function updateFeatureUI(
   });
   if (!updated) return;
   const list = DATA.features[state.currentProject!] || [];
-  const idx = list.findIndex((x: any) => x.id === featureId);
+  const idx = list.findIndex((x) => x.id === featureId);
   if (idx >= 0) {
     list[idx] = {
       ...list[idx],
@@ -397,24 +389,7 @@ async function updateFeatureUI(
   render();
 }
 
-// Drop the cached AI explanation for a file. The actual regeneration happens
-// in Claude Code (MCP) — clearing the row just kicks the file back into the
-// "needs explanation" queue so the next session's cleanup pass picks it up.
-async function clearExplanationUI(filePath: string): Promise<void> {
-  const projectId = state.currentProject;
-  if (!projectId) return;
-  const url = `/api/projects/${encodeURIComponent(projectId)}/file-explanations?path=${encodeURIComponent(filePath)}`;
-  const ok = await mutate({
-    method: 'DELETE',
-    url,
-    confirm: '이 파일의 AI 설명을 비울까요?\n다음 Claude Code 세션에서 다시 채워집니다.',
-    successToast: '설명 캐시 비움',
-  });
-  if (!ok) return;
-  // Drop & re-fetch the file detail so the panel flips back to the empty state.
-  delete FILE_DETAIL[fdKey(projectId, filePath)];
-  await loadFileDetail(filePath);
-}
+// (Removed in ADR-0016: clearExplanationUI. AI file-explanation workflow retired.)
 
 async function unlinkFileUI(featureId: string, filePath: string): Promise<void> {
   const url = `/api/features/${encodeURIComponent(featureId)}/files?path=${encodeURIComponent(filePath)}`;
@@ -425,17 +400,14 @@ async function unlinkFileUI(featureId: string, filePath: string): Promise<void> 
     successToast: '매핑 해제됨',
   });
   if (!ok) return;
-  // Remove from feature.files
-  const feat = (DATA.features[state.currentProject!] || []).find((x: any) => x.id === featureId);
-  if (feat) feat.files = (feat.files || []).filter((ff: any) => ff.path !== filePath);
-  // Drop & re-fetch the file detail
-  delete FILE_DETAIL[fdKey(state.currentProject!, filePath)];
-  await loadFileDetail(filePath);
+  // Remove from feature.files cache so the next render reflects the unlink.
+  const feat = (DATA.features[state.currentProject!] || []).find((x) => x.id === featureId);
+  if (feat) feat.files = (feat.files || []).filter((ff) => ff.path !== filePath);
+  render();
 }
 
-// Map a file to a feature. Mirror of unlinkFileUI: hit the API, then keep the
-// per-feature cache and the per-file detail cache in sync so render() shows
-// the new link without a full reload.
+// Map a file to a feature. After the API confirms, update the local feature
+// cache so renderFeatureDetail's "관련 코드" section reflects the new link.
 async function linkFileUI(featureId: string, filePath: string): Promise<void> {
   const link = await mutate<FeatureFile>({
     method: 'POST',
@@ -443,81 +415,20 @@ async function linkFileUI(featureId: string, filePath: string): Promise<void> {
     body: { feature_id: featureId, file_path: filePath },
   });
   if (!link) return;
-  // Add to feature.files (skip if already present — server upserts)
-  const feat = (DATA.features[state.currentProject!] || []).find((x: any) => x.id === featureId);
+  const feat = (DATA.features[state.currentProject!] || []).find((x) => x.id === featureId);
   if (feat) {
     feat.files = feat.files || [];
-    if (!feat.files.some((ff: any) => ff.path === filePath)) {
+    if (!feat.files.some((ff) => ff.path === filePath)) {
       feat.files.push({ path: link.file_path, desc: link.description ?? '' });
     }
   }
-  // Drop & re-fetch the file detail so the chip list refreshes from server.
-  delete FILE_DETAIL[fdKey(state.currentProject!, filePath)];
-  state.linkingFile = null;
-  await loadFileDetail(filePath);
-}
-
-// AI explanations now flow through Claude Code's MCP session — see the
-// `pm_get_file_content` + `pm_save_file_explanation` tools. The web UI is
-// read-only here: it shows the cached explanation when present, and a hint
-// pointing the user at Claude Code when not. There's no in-app trigger.
-
-// Copy `path` to the clipboard, then briefly swap the triggering button's
-// label to "복사됨!" for ~1s so the user sees the action took. We avoid
-// showError because it's a 4.5s warn-tinted toast — wrong tone for a
-// successful copy.
-async function copyPathToClipboard(path: string, btn?: HTMLButtonElement): Promise<void> {
-  let ok = false;
-  try {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(path);
-      ok = true;
-    }
-  } catch (_) { /* fall through to legacy path */ }
-  if (!ok) {
-    // Older fallback — selectable input + execCommand. Best-effort only.
-    const ta = document.createElement('textarea');
-    ta.value = path;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    try { ok = document.execCommand('copy'); } catch { ok = false; }
-    document.body.removeChild(ta);
-  }
-  if (btn) {
-    const originalText = btn.textContent;
-    btn.textContent = ok ? '복사됨!' : '복사 실패';
-    btn.disabled = true;
-    setTimeout(() => {
-      // The DOM may have been re-rendered in the meantime — guard by checking
-      // the button's still attached.
-      if (btn.isConnected) {
-        btn.textContent = originalText;
-        btn.disabled = false;
-      }
-    }, 1000);
-  } else if (!ok) {
-    showError('복사에 실패했습니다.');
-  }
-}
-
-async function loadFileDetail(filePath: string): Promise<void> {
-  const key = fdKey(state.currentProject!, filePath);
-  if (FILE_DETAIL[key]) { render(); return; }
-  state.fileDetailLoading = true;
-  render();
-  try {
-    const d = await fetchJSON<FileDetailResponse>(
-      `/api/projects/${state.currentProject!}/files/detail?path=${encodeURIComponent(filePath)}`,
-    );
-    FILE_DETAIL[key] = d;
-  } catch {
-    FILE_DETAIL[key] = { path: filePath, features: [], sessions: [], explanation: null };
-  }
-  state.fileDetailLoading = false;
   render();
 }
+
+// (Removed in ADR-0016: copyPathToClipboard. Sole caller was renderCodeMap's
+// path-copy button; both retired together.)
+
+// (Removed in ADR-0016: loadFileDetail. /files/detail endpoint retired.)
 
 // Stable visual identity from project name/id (mockup used hand-picked values).
 function makeMark(name: string): string {
@@ -531,31 +442,8 @@ function makeMarkColor(seed: string): string {
   return `hsl(${hue}, 32%, 28%)`;
 }
 
-// Convert backend `/file-tree` shape ({type:'dir'|'file'}) to renderer shape
-// ({type:'folder'|'file'}). The `hot` flag is set if the file's path is in the
-// caller-provided set (paths touched in the last 7 days of sessions).
-function adaptFileTree(nodes: FileNode[], hot: Set<string>): any[] {
-  return nodes.map((n) => ({
-    type: n.type === 'dir' ? 'folder' : 'file',
-    name: n.name,
-    children: n.children ? adaptFileTree(n.children, hot) : undefined,
-    features: [],
-    hot: n.type === 'file' && hot.has(n.path),
-  }));
-}
-
-// Files touched in the last 7 days, gathered from project-wide sessions.
-const SEVEN_DAYS_MS = 7 * 86_400_000;
-function computeHotFiles(sessions: any[]): Set<string> {
-  const cutoff = Date.now() - SEVEN_DAYS_MS;
-  const hot = new Set<string>();
-  for (const s of sessions || []) {
-    const ts = s.started_at ?? 0;
-    if (ts < cutoff) continue;
-    for (const fp of s.files || []) hot.add(fp);
-  }
-  return hot;
-}
+// (Removed in ADR-0016: adaptFileTree, computeHotFiles, SEVEN_DAYS_MS.
+// File tree / hot-file affordances retired with Code Map.)
 
 // Korean relative time. Buckets are coarse — "방금/5분 전/2시간 전/3일 전" etc.
 function relTime(ts: number | null | undefined): string | null {
@@ -573,8 +461,10 @@ function relTime(ts: number | null | undefined): string | null {
   return `${Math.floor(d / 30)}달 전`;
 }
 
-// Pick the most informative timestamp for a task row.
-function pickWhenForTask(t: any): string | null {
+// Pick the most informative timestamp for a task row. Accepts any task-shaped
+// object that exposes the three timestamps — both the server `Task` and the
+// view-layer `TaskRow` qualify.
+function pickWhenForTask(t: Pick<Task, 'completed_at' | 'started_at' | 'created_at'>): string | null {
   return relTime(t.completed_at) ?? relTime(t.started_at) ?? relTime(t.created_at);
 }
 
@@ -626,11 +516,10 @@ async function loadProjectDetail(projectId: string): Promise<void> {
   // folds in derived fields like `progress`, `date`, etc.), so each fetchJSON
   // call gets a narrow generic. The richer "feature detail" shape comes from
   // `/api/features/:id` and lands in `featureDetails` below.
-  const [features, decisions, sessions, fileTree] = await Promise.all([
+  const [features, decisions, sessions] = await Promise.all([
     fetchJSON<FeatureListItem[]>(`/api/projects/${projectId}/features`),
     fetchJSON<DecisionListItem[]>(`/api/projects/${projectId}/decisions`),
     fetchJSON<RawSessionResponse[]>(`/api/projects/${projectId}/sessions`),
-    fetchJSON<FileNode[]>(`/api/projects/${projectId}/file-tree`),
   ]);
 
   // Hydrate each feature with tasks/files/sessions.
@@ -639,7 +528,7 @@ async function loadProjectDetail(projectId: string): Promise<void> {
   );
 
   const featureNameById: Record<string, string> = {};
-  const enrichedFeatures = featureDetails.map((fd: any) => {
+  const enrichedFeatures: EnrichedFeature[] = featureDetails.map((fd) => {
     featureNameById[fd.id] = fd.name;
     return {
       id: fd.id,
@@ -647,17 +536,20 @@ async function loadProjectDetail(projectId: string): Promise<void> {
       goal: fd.goal,
       status: fd.status,
       progress: fd.progress,
-      tasks: (fd.tasks || []).map((t: any) => ({
+      tasks: (fd.tasks || []).map((t): TaskRow => ({
         id: t.id, // numeric task id, used by PATCH /api/tasks/:id
+        feature_id: t.feature_id,
         name: t.name,
         status: t.status,
+        position: t.position,
+        notes: t.notes,
         // Carry server timestamps so toggle re-renders pick the new "when".
         completed_at: t.completed_at,
         started_at: t.started_at,
         created_at: t.created_at,
         when: pickWhenForTask(t),
       })),
-      files: (fd.files || []).map((ff: any) => ({
+      files: (fd.files || []).map((ff): FeatureFileRow => ({
         path: ff.file_path,
         desc: ff.description ?? '',
       })),
@@ -672,12 +564,10 @@ async function loadProjectDetail(projectId: string): Promise<void> {
     feature: d.feature_id ? featureNameById[d.feature_id] ?? null : null,
   }));
 
-  // Cache sessions for hot-file computation and future tab queries.
+  // Cache sessions for future tab queries (sessions tab, last-activity calcs).
   DATA.sessions = DATA.sessions || {};
   DATA.sessions[projectId] = sessions;
 
-  const hotSet = computeHotFiles(sessions);
-  DATA.fileTree[projectId] = adaptFileTree(fileTree, hotSet);
   state.loadedProjects.add(projectId);
 }
 
@@ -689,8 +579,8 @@ async function setActiveProject(projectId: string): Promise<void> {
     render();
     try {
       await loadProjectDetail(projectId);
-    } catch (e: any) {
-      state.error = e?.message ?? String(e);
+    } catch (e: unknown) {
+      state.error = e instanceof Error ? e.message : String(e);
       state.loading = false;
       render();
       return;
@@ -699,8 +589,6 @@ async function setActiveProject(projectId: string): Promise<void> {
   state.loading = false;
   const fs = DATA.features[projectId] || [];
   state.currentFeature = fs[0]?.id ?? null;
-  const ft = DATA.fileTree[projectId] || [];
-  state.currentFile = firstFile(ft);
   render();
 }
 
@@ -777,7 +665,7 @@ function inlineInputRow(opts: { placeholder: string; onSubmit: (v: string) => vo
     'box-sizing: border-box',
     'margin-top: 6px',
   ].join('; ');
-  input.addEventListener('keydown', (e: any) => {
+  input.addEventListener('keydown', (e: KeyboardEvent) => {
     if (e.key === 'Enter') {
       const v = input.value.trim();
       if (v) opts.onSubmit(v);
@@ -795,7 +683,7 @@ function inlineInputRow(opts: { placeholder: string; onSubmit: (v: string) => vo
 // is required, others optional. Cmd/Ctrl+Enter submits; ESC cancels.
 // `editing`: when present, the form is in update mode — fields are pre-filled
 // and submit calls updateDecisionUI instead of createDecisionUI.
-function renderDecisionForm(editing?: any) {
+function renderDecisionForm(editing?: AdrCard) {
   const wrap = el('div');
   wrap.style.cssText = [
     'background: var(--bg-elevated)',
@@ -821,13 +709,14 @@ function renderDecisionForm(editing?: any) {
   ].join('; ');
   const labelStyle = 'font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em;';
 
-  const inputs: Record<string, HTMLInputElement | HTMLTextAreaElement> = {};
+  const inputs: Record<string, HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement> = {};
   const mk = (key: string, label: string, multiline: boolean, required = false) => {
     const lab = el('label', { text: label });
     lab.style.cssText = labelStyle;
-    const node = document.createElement(multiline ? 'textarea' : 'input') as any;
-    if (!multiline) node.type = 'text';
-    if (multiline) node.rows = 2;
+    const node = document.createElement(multiline ? 'textarea' : 'input') as
+      HTMLInputElement | HTMLTextAreaElement;
+    if (node instanceof HTMLInputElement) node.type = 'text';
+    if (node instanceof HTMLTextAreaElement) node.rows = 2;
     node.placeholder = required ? `${label} (필수)` : label;
     node.style.cssText = fieldStyle;
     inputs[key] = node;
@@ -861,9 +750,9 @@ function renderDecisionForm(editing?: any) {
     const sel = document.createElement('select');
     sel.style.cssText = fieldStyle;
     sel.appendChild(new Option('— 없음 —', ''));
-    features.forEach((f: any) => sel.appendChild(new Option(f.name, f.id)));
+    features.forEach((f) => sel.appendChild(new Option(f.name, f.id)));
     if (editing?.feature_id) sel.value = editing.feature_id;
-    inputs['feature_id'] = sel as any;
+    inputs['feature_id'] = sel;
     const grp = el('div');
     grp.style.cssText = 'display: flex; flex-direction: column; gap: 4px;';
     grp.appendChild(lab);
@@ -917,7 +806,7 @@ function renderDecisionForm(editing?: any) {
   wrap.appendChild(actions);
 
   // Keybindings: ESC cancels anywhere; Cmd/Ctrl+Enter on any field submits.
-  wrap.addEventListener('keydown', (e: any) => {
+  wrap.addEventListener('keydown', (e: KeyboardEvent) => {
     if (e.key === 'Escape') closeForm();
     else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit();
   });
@@ -938,9 +827,7 @@ function getFeature() {
 function getDecisions() {
   return DATA.decisions[state.currentProject!] || [];
 }
-function getFileTree() {
-  return DATA.fileTree[state.currentProject!] || [];
-}
+// (Removed in ADR-0016: getFileTree. file-tree retired.)
 function getAllSessions(): SessionSummaryRow[] {
   const projId = state.currentProject;
   if (!projId) return [];
@@ -1000,16 +887,7 @@ function renderProjectSwitcher(): void {
     dd.appendChild(opt);
   });
 }
-function firstFile(tree: FileTreeNode[], prefix = ''): string | null {
-  for (const node of tree) {
-    if (node.type === 'file') return prefix + node.name;
-    if (node.children) {
-      const found = firstFile(node.children, prefix + node.name + '/');
-      if (found) return found;
-    }
-  }
-  return null;
-}
+// (Removed in ADR-0016: firstFile. Code Map file-tree auto-select retired.)
 
 $('#projectBtn')!.onclick = (e) => {
   e.stopPropagation();
@@ -1024,7 +902,6 @@ const TABS: ReadonlyArray<{ id: Tab; label: string }> = [
   { id: 'workspace', label: '📋 내 작업' },
   { id: 'dashboard', label: '대시보드' },
   { id: 'features', label: '기능' },
-  { id: 'codemap', label: '코드 맵' },
   { id: 'decisions', label: '결정 기록' },
   { id: 'sessions', label: '세션 로그' },
 ];
@@ -1055,9 +932,8 @@ function renderSidebar() {
   const sb = $('#sidebar')!;
   sb.innerHTML = '';
   const showFeatureSidebar = state.currentTab === 'features';
-  const showFileSidebar = state.currentTab === 'codemap';
 
-  if (!showFeatureSidebar && !showFileSidebar) {
+  if (!showFeatureSidebar) {
     sb.classList.remove('visible');
     return;
   }
@@ -1117,37 +993,10 @@ function renderSidebar() {
     });
     sb.appendChild(sec);
   }
-
-  if (showFileSidebar) {
-    const sec = el('div', { class: 'sb-section' });
-    sec.appendChild(el('div', { class: 'sb-heading' }, [el('span', { text: '파일' })]));
-    renderFileTree(getFileTree(), sec);
-    sb.appendChild(sec);
-  }
+  // (Removed in ADR-0016: file-tree sidebar branch. Code Map retired.)
 }
 
-function renderFileTree(nodes: FileTreeNode[], parent: HTMLElement, prefix = ''): void {
-  nodes.forEach((node) => {
-    if (node.type === 'folder') {
-      const folder = el('div', { class: 'tree-folder' });
-      const header = el('div', { class: 'tree-folder-header' });
-      header.appendChild(el('svg', { width: '10', height: '10', viewBox: '0 0 10 10', html: '<path d="M3 2 L6 5 L3 8" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>' }));
-      header.appendChild(el('span', { text: node.name }));
-      folder.appendChild(header);
-      const children = el('div', { class: 'tree-children' });
-      renderFileTree(node.children ?? [], children, prefix + node.name + '/');
-      folder.appendChild(children);
-      parent.appendChild(folder);
-    } else {
-      const fullPath = prefix + node.name;
-      const isActive = state.currentFile != null && fullPath === state.currentFile;
-      const item = el('div', { class: 'tree-file' + (isActive ? ' active' : ''), onClick: () => { state.currentFile = fullPath; render(); } });
-      item.appendChild(el('span', { text: node.name }));
-      if (node.hot) item.appendChild(el('span', { class: 'tree-file-meta' }));
-      parent.appendChild(item);
-    }
-  });
-}
+// (Removed in ADR-0016: renderFileTree. File-tree sidebar retired.)
 
 // =================================================
 // Main: Dashboard
@@ -1307,7 +1156,7 @@ function renderFeatureDetail() {
       'font-size: inherit',
       'min-width: 280px',
     ].join('; ');
-    input.addEventListener('keydown', (e: any) => {
+    input.addEventListener('keydown', (e: KeyboardEvent) => {
       if (e.key === 'Enter') {
         const v = input.value.trim();
         const err = validateRequired([['이름', v]]);
@@ -1380,7 +1229,7 @@ function renderFeatureDetail() {
     });
     if (typeof t.id === 'number') {
       dot.style.cursor = 'pointer';
-      dot.onclick = (e: any) => { e.stopPropagation(); toggleTaskUI(t.id, t.status); };
+      dot.onclick = (e: MouseEvent) => { e.stopPropagation(); toggleTaskUI(t.id, t.status); };
     }
     row.appendChild(dot);
     row.appendChild(el('span', { class: 'task-name' + (t.status === 'done' ? ' done' : ''), text: t.name }));
@@ -1389,7 +1238,7 @@ function renderFeatureDetail() {
       const delBtn = el('button', {
         text: '×',
         title: '태스크 삭제',
-        onClick: (e: any) => { e.stopPropagation(); deleteTaskUI(t.id); },
+        onClick: (e: MouseEvent) => { e.stopPropagation(); deleteTaskUI(t.id); },
       });
       delBtn.style.cssText = 'margin-left: auto; padding: 0 6px; background: transparent; border: 1px solid var(--border); color: var(--text-3); border-radius: 4px; font-size: 12px; line-height: 18px; cursor: pointer;';
       row.appendChild(delBtn);
@@ -1426,13 +1275,16 @@ function renderFeatureDetail() {
     ]));
     const flist = el('div', { class: 'file-list' });
     f.files.forEach(file => {
-      const row = el('div', { class: 'file-row', onClick: () => { state.currentTab = 'codemap'; state.currentFile = file.path; render(); } });
+      // ADR-0016: code-map drilldown retired — row no longer navigates.
+      // Path stays visible as plain text so users can still copy it manually
+      // for Claude Code prompts.
+      const row = el('div', { class: 'file-row' });
       row.appendChild(el('div', { class: 'file-path' }, [el('code', { text: file.path })]));
       row.appendChild(el('div', { class: 'file-desc', text: file.desc }));
       const unlinkBtn = el('button', {
         text: '매핑 해제',
         title: '이 기능에서 파일 매핑을 해제',
-        onClick: (e: any) => { e.stopPropagation(); unlinkFileUI(f.id, file.path); },
+        onClick: (e: MouseEvent) => { e.stopPropagation(); unlinkFileUI(f.id, file.path); },
       });
       unlinkBtn.style.cssText = 'margin-left: auto; padding: 4px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-3); border-radius: 4px; font-size: 11px; cursor: pointer;';
       row.appendChild(unlinkBtn);
@@ -1470,228 +1322,9 @@ function renderFeatureDetail() {
   }
 }
 
-// =================================================
-// Main: Code map
-// =================================================
-function renderCodeMap() {
-  const main = $('#main')!;
-  main.innerHTML = '';
-  const path = state.currentFile;
-  if (!path) {
-    main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '파일을 선택해주세요' }),
-      el('div', { class: 'empty-state-text', text: '왼쪽 트리에서 파일을 클릭하면 어떤 기능에 속하는지, AI가 생성한 설명이 표시됩니다.' })
-    ]));
-    return;
-  }
-
-  const p = getProject()!;
-  const header = el('div', { class: 'page-header' });
-  header.appendChild(el('div', { class: 'breadcrumb', text: p.name + ' / 코드 맵' }));
-  main.appendChild(header);
-
-  const ch = el('div', { class: 'codemap-detail-header' });
-  ch.appendChild(el('h2', { class: 'codemap-path', text: path }));
-  const meta = el('div', { class: 'codemap-meta' }, [
-    el('div', { class: 'codemap-meta-item' }, [el('span', { text: '최근 수정 · 오늘 14:30' })]),
-    el('div', { class: 'codemap-meta-item' }, [el('span', { text: '124 라인' })]),
-    el('div', { class: 'codemap-meta-item' }, [el('span', { text: '7 세션 동안 수정' })])
-  ]);
-  ch.appendChild(meta);
-  main.appendChild(ch);
-
-  // Connected features (and the AI explanation, if cached) come from
-  // `/api/projects/:id/files/detail`. Lazily fetched the first time the user
-  // views this file in the codemap.
-  const detail = FILE_DETAIL[fdKey(state.currentProject!, path)];
-  if (!detail && !state.fileDetailLoading) {
-    // kick off; render() runs again on completion
-    loadFileDetail(path);
-  }
-
-  // AI explanation block. Generation is no longer in-app — Claude Code does
-  // it via MCP (pm_get_file_content + pm_save_file_explanation). The web UI
-  // is read-only: shows cached text when present, otherwise a hint pointing
-  // the user at Claude Code with a copyable path.
-  const cached = detail?.explanation;
-  const expBox = el('div', { class: 'ai-explanation' });
-  const eyebrow = el('div', { class: 'ai-explanation-eyebrow' });
-  eyebrow.style.cssText = 'display: flex; align-items: center; gap: 8px;';
-
-  if (cached) {
-    eyebrow.appendChild(el('span', { text: 'AI 설명 · ' + (relTime(cached.generated_at) ?? '캐시됨') }));
-    // "재생성" clears the cache; the next Claude Code cleanup pass refills it.
-    // We don't trigger an LLM call from the web — vibemate stays a data store.
-    const regenBtn = el('button', {
-      text: '재생성',
-      title: '캐시를 비우고 다음 Claude Code 세션에서 재생성',
-      onClick: () => clearExplanationUI(path),
-    });
-    regenBtn.style.cssText = 'margin-left: auto; padding: 3px 10px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-2); border-radius: 4px; font: inherit; font-size: 11px; cursor: pointer;';
-    eyebrow.appendChild(regenBtn);
-    expBox.appendChild(eyebrow);
-    // Server stores plain text from Claude Code — render as textContent.
-    const body = el('p', { class: 'ai-explanation-text', text: cached.text });
-    body.style.whiteSpace = 'pre-wrap';
-    expBox.appendChild(body);
-  } else {
-    eyebrow.appendChild(el('span', { text: 'AI 설명' }));
-    expBox.appendChild(eyebrow);
-    if (state.fileDetailLoading && !detail) {
-      expBox.appendChild(el('p', { class: 'ai-explanation-text', text: '불러오는 중…', style: 'color: var(--text-3);' }));
-    } else {
-      expBox.appendChild(el('p', {
-        class: 'ai-explanation-text',
-        text: `Claude Code 세션에서 "${path} 파일 설명을 생성해줘" 라고 요청하면 자동으로 pm_get_file_content + pm_save_file_explanation을 호출합니다.`,
-        style: 'color: var(--text-2);',
-      }));
-      // Path-copy button: lets users paste the path into a Claude Code prompt.
-      const copyRow = el('div');
-      copyRow.style.cssText = 'margin-top: 8px; display: flex; gap: 8px; align-items: center;';
-      const copyBtn = el('button', {
-        text: 'path 복사',
-        title: '경로를 클립보드에 복사',
-      }) as HTMLButtonElement;
-      copyBtn.style.cssText = 'padding: 4px 10px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-2); border-radius: 4px; font: inherit; font-size: 11px; cursor: pointer;';
-      copyBtn.addEventListener('click', () => copyPathToClipboard(path, copyBtn));
-      copyRow.appendChild(copyBtn);
-      const pathLabel = el('code', { text: path });
-      pathLabel.style.cssText = 'font-size: 11px; color: var(--text-3);';
-      copyRow.appendChild(pathLabel);
-      expBox.appendChild(copyRow);
-    }
-  }
-  main.appendChild(expBox);
-
-  const sec = el('div', { class: 'detail-section' });
-  // "연결된 기능" header gets a "+ 기능에 매핑" toggle on the right.
-  const pickerOpen = state.linkingFile === path;
-  const linkBtn = el('button', {
-    text: pickerOpen ? '취소' : '+ 기능에 매핑',
-    onClick: () => { state.linkingFile = pickerOpen ? null : path; render(); },
-  });
-  linkBtn.style.cssText = 'margin-left: auto; padding: 4px 10px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-2); border-radius: 4px; font: inherit; font-size: 11px; cursor: pointer;';
-  const secTitle = el('div', { class: 'detail-section-title' });
-  secTitle.style.cssText = 'display: flex; align-items: center; gap: 8px;';
-  secTitle.appendChild(el('span', { text: '연결된 기능' }));
-  secTitle.appendChild(linkBtn);
-  sec.appendChild(secTitle);
-
-  // Inline picker: dropdown of features in this project, excluding ones
-  // already linked to this file. Selecting one calls linkFileUI().
-  if (pickerOpen) {
-    const linkedIds = new Set((detail?.features || []).map((ff: any) => ff.feature_id));
-    const candidates = getFeatures().filter((f: any) => !linkedIds.has(f.id));
-    const picker = el('div');
-    picker.style.cssText = 'display: flex; gap: 8px; margin: 8px 0; align-items: center;';
-    if (candidates.length === 0) {
-      picker.appendChild(el('span', {
-        text: '매핑할 수 있는 기능이 없습니다 (모든 기능이 이미 연결됨).',
-        style: 'color: var(--text-3); font-size: 12px;',
-      }));
-    } else {
-      const sel = document.createElement('select');
-      sel.style.cssText = [
-        'padding: 6px 8px',
-        'background: var(--bg-elevated)',
-        'border: 1px solid var(--border-strong, var(--border))',
-        'color: var(--text)',
-        'border-radius: 4px',
-        'font: inherit',
-        'min-width: 220px',
-      ].join('; ');
-      sel.appendChild(new Option('— 기능 선택 —', ''));
-      candidates.forEach((f: any) => sel.appendChild(new Option(f.name, f.id)));
-      const submit = el('button', {
-        text: '매핑',
-        onClick: () => {
-          const fid = (sel as HTMLSelectElement).value;
-          const err = validateRequired([['기능', fid]]);
-          if (err) { showError(err); return; }
-          linkFileUI(fid, path);
-        },
-      });
-      submit.style.cssText = 'padding: 6px 12px; background: var(--accent); border: 1px solid var(--accent); color: var(--text); border-radius: 4px; font: inherit; font-size: 12px; cursor: pointer;';
-      picker.appendChild(sel);
-      picker.appendChild(submit);
-      queueMicrotask(() => sel.focus());
-    }
-    sec.appendChild(picker);
-  }
-
-  if (state.fileDetailLoading && !detail) {
-    sec.appendChild(el('div', { class: 'empty-state-text', text: '불러오는 중…', style: 'padding: 8px 0; color: var(--text-3)' }));
-  } else if (!detail || detail.features.length === 0) {
-    sec.appendChild(el('div', { class: 'empty-state-text', text: '아직 매핑된 기능이 없습니다. 세션 종료 시 자동 매핑되거나, 기능 상세에서 직접 연결할 수 있습니다.', style: 'padding: 8px 0; color: var(--text-3)' }));
-  } else {
-    const chips = el('div', { class: 'feature-chip-list' });
-    detail.features.forEach((ff: any, i: number) => {
-      const chip = el('div', { class: 'feature-chip' + (i === 0 ? ' primary' : '') });
-      chip.appendChild(el('span', {
-        text: ff.name,
-        style: 'cursor: pointer',
-        onClick: () => { state.currentTab = 'features'; state.currentFeature = ff.feature_id; render(); },
-      }));
-      const x = el('span', {
-        text: '×',
-        title: '매핑 해제',
-        onClick: (e: any) => { e.stopPropagation(); unlinkFileUI(ff.feature_id, path); },
-      });
-      x.style.cssText = 'margin-left: 6px; padding: 0 4px; cursor: pointer; color: var(--text-3); font-weight: 600;';
-      chip.appendChild(x);
-      chips.appendChild(chip);
-    });
-    sec.appendChild(chips);
-  }
-  main.appendChild(sec);
-
-  if (detail && detail.sessions.length > 0) {
-    const ssec = el('div', { class: 'detail-section' });
-    ssec.appendChild(el('div', { class: 'detail-section-title' }, [
-      el('span', { text: '이 파일을 건드린 세션' }),
-      el('span', { class: 'detail-section-count', text: String(detail.sessions.length) }),
-    ]));
-    const slist = el('div', { class: 'session-list' });
-    detail.sessions.forEach((s) => {
-      const row = el('div', { class: 'session-row' });
-      row.appendChild(el('div', { class: 'session-time', text: s.time }));
-      row.appendChild(el('div', { class: 'session-summary', text: s.summary }));
-      slist.appendChild(row);
-    });
-    ssec.appendChild(slist);
-    main.appendChild(ssec);
-  }
-}
-
-// Currently unused — kept as a forward-looking helper for codemap leaf clicks.
-// `node.features` is always [] on the wire; this would surface confirmed links.
-function featuresForFile(path: string): FeatureFile[] {
-  const fname = path.split('/').pop() ?? '';
-  const found: FeatureFile[] = [];
-  function walk(nodes: FileTreeNode[]): void {
-    nodes.forEach((n) => {
-      if (n.type === 'file' && n.name === fname) {
-        (n.features || []).forEach((f) => { if (!found.includes(f)) found.push(f); });
-      }
-      if (n.children) walk(n.children);
-    });
-  }
-  walk(getFileTree());
-  return found;
-}
-
-function sessionsForFile(path: string): SessionSummaryRow[] {
-  const fname = path.split('/').pop() ?? '';
-  const out: SessionSummaryRow[] = [];
-  getFeatures().forEach((f) => {
-    (f.sessions || []).forEach((s) => {
-      if ((s.files || []).some((sf) => sf === fname || sf.endsWith('/' + fname))) {
-        out.push({ ...s, feature: f.name });
-      }
-    });
-  });
-  return out;
-}
+// (Removed in ADR-0016: renderCodeMap + featuresForFile + sessionsForFile.
+// Code Map view, AI file-explanation surface, and file-tree helpers retired.
+// The "관련 코드" row in feature detail is now read-only — see renderFeatures.)
 
 // =================================================
 // Main: Decisions (ADRs)
@@ -1754,7 +1387,7 @@ function renderDecisions(): void {
     const editBtn = el('button', {
       text: '수정',
       title: '결정 수정',
-      onClick: (e: any) => {
+      onClick: (e: MouseEvent) => {
         e.stopPropagation();
         state.editingDecisionId = adr.id;
         state.addingDecision = false;
@@ -1765,7 +1398,7 @@ function renderDecisions(): void {
     const delBtn = el('button', {
       text: '삭제',
       title: '결정 삭제',
-      onClick: (e: any) => { e.stopPropagation(); deleteDecisionUI(adr.id); },
+      onClick: (e: MouseEvent) => { e.stopPropagation(); deleteDecisionUI(adr.id); },
     });
     delBtn.style.cssText = 'padding: 2px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-3); border-radius: 4px; font-size: 11px; cursor: pointer;';
     actionGroup.appendChild(editBtn);
@@ -2033,7 +1666,7 @@ function render() {
   if (state.currentTab === 'workspace') renderWorkspace();
   else if (state.currentTab === 'dashboard') renderDashboard();
   else if (state.currentTab === 'features') renderFeatureDetail();
-  else if (state.currentTab === 'codemap') renderCodeMap();
+  // ADR-0016: 'codemap' tab retired.
   else if (state.currentTab === 'decisions') renderDecisions();
   else if (state.currentTab === 'sessions') renderSessions();
 
@@ -2142,11 +1775,11 @@ function ensureSearchPaletteDom(): void {
     </div>
   `;
   // Click-on-backdrop closes; clicks inside the panel don't bubble to here.
-  overlay.addEventListener('click', (e: any) => {
+  overlay.addEventListener('click', (e: MouseEvent) => {
     if (e.target === overlay) closeSearchPalette();
   });
   const input = overlay.querySelector('#searchPaletteInput') as HTMLInputElement;
-  input.addEventListener('input', (e: any) => onSearchInput(e.target.value));
+  input.addEventListener('input', (e: Event) => onSearchInput((e.target as HTMLInputElement).value));
   document.body.appendChild(overlay);
 }
 
@@ -2218,11 +1851,11 @@ async function doSearch(q: string): Promise<void> {
     searchState.loading = false;
     searchState.error = null;
     searchState.selectedIndex = 0;
-  } catch (e: any) {
-    if (e?.name === 'AbortError') return;
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === 'AbortError') return;
     searchState.results = [];
     searchState.loading = false;
-    searchState.error = e?.message ?? '검색에 실패했습니다';
+    searchState.error = e instanceof Error ? e.message : '검색에 실패했습니다';
   }
   renderSearchResults();
 }
@@ -2376,9 +2009,9 @@ function navigateToResult(r: SearchResult): void {
       flashRefId('session', r.ref_id);
       break;
     case 'file':
-      state.currentTab = 'codemap';
-      state.currentFile = r.ref_id; // ref_id IS the file_path
-      render();
+      // ADR-0016: 'file' kind retired on the server (search_fts purged in
+      // migration 0005). Defensive branch in case a stale row sneaks in:
+      // no-op rather than navigate to a removed tab.
       break;
   }
   // Clear the query so reopening the palette starts fresh.
@@ -2388,7 +2021,7 @@ function navigateToResult(r: SearchResult): void {
 
 // Global keyboard wiring. Cmd+K / Ctrl+K toggles. Esc closes when open.
 // While the palette is open, ↑/↓ move the selection and Enter routes.
-document.addEventListener('keydown', (e: any) => {
+document.addEventListener('keydown', (e: KeyboardEvent) => {
   if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
     e.preventDefault();
     if (searchState.open) closeSearchPalette();
@@ -2426,8 +2059,8 @@ document.addEventListener('keydown', (e: any) => {
 const topbarSearchInput = document.querySelector('.global-search input') as HTMLInputElement | null;
 if (topbarSearchInput) {
   topbarSearchInput.readOnly = true;
-  topbarSearchInput.addEventListener('focus', (e: any) => {
-    e.target.blur();
+  topbarSearchInput.addEventListener('focus', (e: FocusEvent) => {
+    (e.target as HTMLInputElement).blur();
     openSearchPalette();
   });
   topbarSearchInput.addEventListener('click', () => openSearchPalette());
@@ -2452,8 +2085,8 @@ if (themeToggleBtn) {
   render(); // initial paint with loading state
   try {
     await loadProjectList();
-  } catch (e: any) {
-    state.error = e?.message ?? String(e);
+  } catch (e: unknown) {
+    state.error = e instanceof Error ? e.message : String(e);
     state.loading = false;
     render();
     return;

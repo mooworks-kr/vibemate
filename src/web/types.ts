@@ -22,6 +22,10 @@ import type {
   TaskStatus,
 } from '../server/types.js';
 
+// (Removed in ADR-0016: FileTreeNode + FileDetailResponse + DataCache.fileTree
+// + AppState.currentFile + AppState.linkingFile + AppState.fileDetailLoading.
+// Code Map / file-tree / AI file-explanation UI retired.)
+
 // ============================================================
 // View-layer enrichments
 // ============================================================
@@ -38,11 +42,16 @@ export interface TaskRow extends Task {
 }
 
 export interface FeatureFileRow {
-  /** = `feature_files.file_path`, renamed for terser UI templates. */
+  /** = `feature_files.file_path`, renamed for terser UI templates. Surfaced
+   *  in feature detail "관련 코드" section. */
   path: string;
   /** = `description ?? ''`. */
   desc: string;
 }
+
+// Note: `FileFile`-style codemap entities (FileTreeNode, FileDetailResponse)
+// were removed in ADR-0016. The feature_files "관련 코드" display still uses
+// FeatureFileRow above — that's separate from codemap.
 
 export interface SessionSummaryRow {
   /** Stable session id; threaded through to the search palette's flash target. */
@@ -74,39 +83,6 @@ export interface AdrCard extends Decision {
   feature: string | null;
 }
 
-export interface FileTreeNode {
-  /** Adapter renames `dir` → `folder` to match the renderer's CSS hooks. */
-  type: 'folder' | 'file';
-  name: string;
-  children?: FileTreeNode[];
-  /** Reserved — currently always [], kept for future per-node feature tagging. */
-  features: FeatureFile[];
-  /** True when the file path appears in any session within the last 7 days. */
-  hot: boolean;
-}
-
-/**
- * Shape returned by `GET /api/projects/:id/files/detail?path=…`.
- * The web UI caches this in `FILE_DETAIL` keyed by (projectId, path).
- */
-export interface FileDetailResponse {
-  path: string;
-  features: Array<{
-    feature_id: string;
-    name: string;
-    confidence: number;
-    source: string;
-  }>;
-  sessions: Array<{
-    id: string;
-    time: string;
-    summary: string;
-    feature_id: string | null;
-    feature_name: string | null;
-  }>;
-  explanation: { text: string; generated_at: number } | null;
-}
-
 /**
  * In-memory client cache. Populated on-demand by `loadProjectList()` and
  * `loadProjectDetail()`. Keyed by project id where appropriate.
@@ -115,11 +91,8 @@ export interface DataCache {
   projects: ProjectListEntry[];
   features: Record<string, EnrichedFeature[]>;
   decisions: Record<string, AdrCard[]>;
-  fileTree: Record<string, FileTreeNode[]>;
-  /** Raw `/sessions` response, used only for the hot-file cutoff calc. */
+  /** Raw `/sessions` response, used only by hot-file affordances elsewhere. */
   sessions?: Record<string, RawSessionResponse[]>;
-  /** Legacy slot — currently unused. */
-  fileExplanations: Record<string, string>;
 }
 
 /**
@@ -185,7 +158,7 @@ export interface FeatureDetailResponse extends Feature {
 // App state
 // ============================================================
 
-export type Tab = 'workspace' | 'dashboard' | 'features' | 'codemap' | 'decisions' | 'sessions';
+export type Tab = 'workspace' | 'dashboard' | 'features' | 'decisions' | 'sessions';
 
 /**
  * Mirror of the server's `WorkspaceFeature` row (types.ts on the server).
@@ -214,7 +187,6 @@ export interface AppState {
   currentProject: string | null;
   currentTab: Tab;
   currentFeature: string | null;
-  currentFile: string | null;
   loading: boolean;
   error: string | null;
   loadedProjects: Set<string>;
@@ -226,8 +198,6 @@ export interface AppState {
   addingTaskFor: string | null;
   /** Decisions tab "+ 결정" form open. */
   addingDecision: boolean;
-  /** Codemap file path while the "+ 기능에 매핑" picker is open (null = closed). */
-  linkingFile: string | null;
   /** Feature id while name is being inline-edited. */
   editingFeatureName: string | null;
   /** ADR id whose edit form is open in-place of its card. */
@@ -238,8 +208,6 @@ export interface AppState {
   errorMsg: string | null;
   /** Border tint for the toast — set together with `errorMsg`. */
   toastKind: ToastKind;
-  /** True while `/files/detail` fetch is in flight for the current file. */
-  fileDetailLoading: boolean;
 
   // Workspace tab --------------------------------------------------------
   /** Active filter for the cross-project view. Default `['in_progress']`. */

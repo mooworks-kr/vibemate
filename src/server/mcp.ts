@@ -259,63 +259,8 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     },
   );
 
-  // ----- File content + AI explanation storage -----
-  // These two tools let Claude Code (the user's IDE session) play the LLM role:
-  //   1. read clamped file content via `pm_get_file_content`
-  //   2. summarize locally
-  //   3. persist via `pm_save_file_explanation`
-  // vibemate stays a data store; the user's existing Claude subscription does
-  // the work, no separate API key required.
-
-  server.tool(
-    'pm_get_file_content',
-    {
-      project_id: z.string().optional()
-        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
-      file_path: z.string().describe('프로젝트 root 기준 상대 경로'),
-    },
-    async ({ project_id, file_path }) => {
-      const pid = resolveProject(project_id);
-      const result = domain.getFileContent(pid, file_path);
-      // Return the raw clamped content as plain text — MCP transport is text,
-      // and Claude Code reads this directly to summarize.
-      return ok({
-        file_path,
-        content: result.content,
-        truncated: result.truncated,
-      });
-    },
-  );
-
-  server.tool(
-    'pm_clear_file_explanation',
-    {
-      project_id: z.string().optional()
-        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
-      file_path: z.string().describe('프로젝트 root 기준 상대 경로'),
-    },
-    async ({ project_id, file_path }) => {
-      const pid = resolveProject(project_id);
-      const removed = domain.clearFileExplanation(pid, file_path);
-      if (!removed) throw new Error(`No cached explanation for: ${file_path}`);
-      return ok({ ok: true });
-    },
-  );
-
-  server.tool(
-    'pm_save_file_explanation',
-    {
-      project_id: z.string().optional()
-        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
-      file_path: z.string().describe('프로젝트 root 기준 상대 경로'),
-      summary: z.string().describe('Claude Code가 작성한 한국어 파일 설명'),
-    },
-    async ({ project_id, file_path, summary }) => {
-      const pid = resolveProject(project_id);
-      const saved = domain.saveFileExplanation(pid, file_path, summary);
-      return ok({ ok: true, generated_at: saved.generated_at });
-    },
-  );
+  // (Removed in ADR-0016: pm_get_file_content / pm_save_file_explanation /
+  // pm_clear_file_explanation lived here. Code Map feature retired.)
 
   // ----- Workspace (cross-project active-features view) -----
 
@@ -451,55 +396,7 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     },
   );
 
-  // ----- "Needs explanation" queue (Claude Code consumes this) -----
-
-  server.tool(
-    'pm_list_files_needing_explanation',
-    {
-      project_id: z.string().optional()
-        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
-      limit: z.number().optional()
-        .describe('최대 결과 수 (기본 50, 최대 200)'),
-      stale_only: z.boolean().optional()
-        .describe('true(기본)면 explanation 없거나 stale인 것만, false면 후보 전체 (force regenerate용)'),
-      recent_days: z.number().optional()
-        .describe('이 일수 안에 modified/created로 touch된 파일만 포함 (기본 30)'),
-    },
-    async ({ project_id, limit, stale_only, recent_days }) => {
-      const pid = resolveProject(project_id);
-      const queue = domain.listFilesNeedingExplanation(pid, {
-        limit,
-        staleOnly: stale_only,
-        recentDays: recent_days,
-      });
-
-      if (queue.length === 0) {
-        return {
-          content: [
-            { type: 'text' as const, text: '설명이 필요한 파일이 없습니다.' },
-          ],
-        };
-      }
-
-      // Format as: "[stale|new] file_path (last touched: …)" — readable for the
-      // Claude Code session that's about to call get_file_content / save.
-      const formatted = queue
-        .map((q) => {
-          const tag = !q.has_explanation ? 'new' : q.explanation_stale ? 'stale' : 'fresh';
-          return `[${tag}] ${q.file_path} (last touched ${new Date(q.last_touched_at).toISOString()})`;
-        })
-        .join('\n');
-
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: `${queue.length}개 파일에 설명이 필요합니다:\n\n${formatted}\n\n각 파일에 대해 pm_get_file_content + pm_save_file_explanation을 호출하세요.`,
-          },
-        ],
-      };
-    },
-  );
+  // (Removed in ADR-0016: pm_list_files_needing_explanation. Code Map retired.)
 
   // ----- Search (FTS5 across features/decisions/sessions/files) -----
 

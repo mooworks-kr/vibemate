@@ -202,17 +202,7 @@ export function createApp() {
     return c.json(results);
   });
 
-  // ----- File tree (for code map sidebar) -----
-
-  app.get('/api/projects/:id/file-tree', (c) => {
-    const projectId = c.req.param('id');
-    try {
-      const tree = domain.getFileTree(projectId);
-      return c.json(tree);
-    } catch (err) {
-      return c.json({ error: (err as Error).message }, 404);
-    }
-  });
+  // (Removed in ADR-0016: GET /api/projects/:id/file-tree)
 
   // ----- Workspace (cross-project active-features view) -----
 
@@ -236,94 +226,9 @@ export function createApp() {
     return c.json(domain.listWorkspaceFeatures({ statuses, limit }));
   });
 
-  // ----- Files needing explanation (queue surfaced for Claude Code) -----
-
-  app.get('/api/projects/:id/files/needs-explanation', (c) => {
-    const projectId = c.req.param('id');
-    if (!domain.getProject(projectId)) {
-      return c.json({ error: `Project not found: ${projectId}` }, 404);
-    }
-    const limitRaw = c.req.query('limit');
-    const staleOnlyRaw = c.req.query('staleOnly');
-    const recentDaysRaw = c.req.query('recentDays');
-
-    const opts: { limit?: number; staleOnly?: boolean; recentDays?: number } = {};
-    if (limitRaw !== undefined) {
-      const n = Number(limitRaw);
-      if (!Number.isFinite(n) || n <= 0) {
-        return c.json({ error: 'limit must be a positive number' }, 400);
-      }
-      opts.limit = n;
-    }
-    if (staleOnlyRaw !== undefined) {
-      // Permissive parsing: 'false' / '0' → false, anything else truthy → true.
-      // The query layer doesn't have JSON bool semantics so we DIY.
-      opts.staleOnly = !(staleOnlyRaw === 'false' || staleOnlyRaw === '0');
-    }
-    if (recentDaysRaw !== undefined) {
-      const n = Number(recentDaysRaw);
-      if (!Number.isFinite(n) || n <= 0) {
-        return c.json({ error: 'recentDays must be a positive number' }, 400);
-      }
-      opts.recentDays = n;
-    }
-
-    return c.json(domain.listFilesNeedingExplanation(projectId, opts));
-  });
-
-  // ----- Clear cached explanation (force-regenerate path) -----
-
-  app.delete('/api/projects/:id/file-explanations', (c) => {
-    const projectId = c.req.param('id');
-    const filePath = c.req.query('path');
-    if (!filePath) return c.json({ error: 'path query param required' }, 400);
-    if (!domain.getProject(projectId)) {
-      return c.json({ error: `Project not found: ${projectId}` }, 404);
-    }
-    const removed = domain.clearFileExplanation(projectId, filePath);
-    if (!removed) return c.json({ error: 'No cached explanation for that path' }, 404);
-    return c.json({ ok: true });
-  });
-
-  // ----- File detail (for code map) -----
-
-  app.get('/api/projects/:id/files/detail', (c) => {
-    const projectId = c.req.param('id');
-    const filePath = c.req.query('path');
-    if (!filePath) return c.json({ error: 'path query param required' }, 400);
-
-    const features = domain.listFeaturesForFile(filePath, projectId);
-    const featureNames = features.map((ff) => {
-      const f = domain.getFeature(ff.feature_id);
-      return { feature_id: ff.feature_id, name: f?.name ?? '?', confidence: ff.confidence, source: ff.source };
-    });
-
-    const sessions = domain.listSessionsForFile(filePath, projectId).slice(0, 20).map((s) => ({
-      id: s.id,
-      time: relativeTime(s.started_at),
-      summary: s.summary,
-      feature_id: s.feature_id,
-      feature_name: s.feature_name,
-    }));
-
-    // Surface the cached AI explanation if one exists. UI uses this to decide
-    // between rendering the cached summary and showing a "generate" button.
-    const explanation = domain.getFileExplanation(projectId, filePath);
-
-    return c.json({
-      path: filePath,
-      features: featureNames,
-      sessions,
-      explanation: explanation
-        ? { text: explanation.explanation, generated_at: explanation.generated_at }
-        : null,
-    });
-  });
-
-  // (AI explanation generation has moved to MCP — see `pm_get_file_content` +
-  // `pm_save_file_explanation` in mcp.ts. Claude Code reads the file via MCP,
-  // summarizes locally, and writes the explanation back. The HTTP surface
-  // keeps `/files/detail` (above) for read-side display only.)
+  // (Removed in ADR-0016: GET /api/projects/:id/files/needs-explanation,
+  // DELETE /api/projects/:id/file-explanations, GET /api/projects/:id/files/detail.
+  // Code Map UI retired; AI file-explanation workflow retired.)
 
   // ----- File-feature links (manual override) -----
 

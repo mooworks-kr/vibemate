@@ -71,7 +71,7 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 
 ## 진행 상황
 
-### ✓ 완료 (Sprint 1-11)
+### ✓ 완료 (Sprint 1-16)
 
 **기반 (Sprint 1-3)**
 - 도메인 레이어 E2E
@@ -80,10 +80,10 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 - 멀티 프로젝트 + 자동 파일 매핑 (confidence 0.7~0.85)
 
 **Sprint 4-7 — 핵심 기능**
-- 파일트리 API (`GET /api/projects/:id/file-tree`)
+- 파일트리 API (`GET /api/projects/:id/file-tree`) — *Sprint 16에서 제거*
 - 웹 mock → 실제 API wire-up
 - Mutation UI: feature/task/ADR 풀 CRUD + 매핑 끊기 + 헬퍼 통일 (`mutate`/`validateRequired`/`showToast`)
-- AI 파일 설명 워크플로우: `pm_list_files_needing_explanation` 큐 + `pm_clear_file_explanation` 강제 재생성
+- ~~AI 파일 설명 워크플로우~~ — *Sprint 16(ADR-0016)에서 제거. `sessions.files`와 `feature_files` 매핑은 유지.*
 - 글로벌 검색: SQLite FTS5 + BM25 가중치(title 3:1, KIND multiplier) + Cmd+K palette + 결과 점프
 
 **Sprint 8-11 — 품질/도구**
@@ -113,7 +113,16 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 - 모든 프로젝트의 진행 중 features 통합 view (single endpoint, N+1 회피)
 - 카드 클릭 → 해당 프로젝트 + feature로 navigate
 - `currentTab` default `'features'` → `'workspace'` (멀티 프로젝트 사용자 진입 흐름 개선)
-- 단위 테스트 38 → **119** (도메인/migrations/migrate-claude-md/import-git-history/extract-features/workspace)
+
+**Sprint 16 — Code Map 완전 제거 (ADR-0016)**
+- AI 파일 설명 / 코드 맵 탭 제거: 실제 사용량이 가설보다 낮고 유지비용 > 가치
+- HTTP 24 → **20** (file-tree / files/detail / files/needs-explanation / file-explanations 제거)
+- MCP 22 → **18** (pm_get_file_content / pm_save_file_explanation / pm_list_files_needing_explanation / pm_clear_file_explanation 제거)
+- 마이그레이션 `0005_drop_file_explanations.sql`: DROP TABLE + 트리거 3개 + search_fts file kind row 일괄 정리
+- Frontend: TABS 6 → **5** (codemap 부재), `renderCodeMap`/`loadFileDetail`/`clearExplanationUI` 제거, `searchProject` 방어 필터 (`kind != 'file'`)
+- **보존**: `sessions.files` 표시 (sessions 탭 + feature detail), `feature_files` 매핑 (POST/DELETE `/api/feature-files` + `/api/features/:fid/files`), chokidar watcher
+- 단위 테스트 38 → **119 → 103** (Sprint 16에서 -16, +1 회귀 가드)
+- 번들 50.28 KB → **40.84 KB** (-19% — codemap UI + 4 file 함수 제거)
 
 ### 다음 백로그 후보
 
@@ -141,11 +150,11 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 - **자동 매핑 + 수동 보정**. 세션 종료 시 touch한 파일을 active feature에 confidence 0.7~0.85로 자동 매핑.
 - **단일 프로젝트 구조**. 백엔드/프론트엔드를 분리하지 않음 — 로컬 데스크톱 앱이라 분리 이유 없음.
 
-Sprint 4-11 ADR (vibemate DB에 ADR-0001~0011 기록, 웹 대시보드 또는 `pm_get_context`로 조회):
+Sprint 4-16 ADR (vibemate DB에 ADR-0001~0016 기록, 웹 대시보드 또는 `pm_get_context`로 조회):
 - 0001 API 에러 응답: list = 200+`[]`, 단일 = 404+`{error}`
 - 0002 삭제 정책: feature=archive, task/decision=hard delete + decision PATCH 지원
-- 0003 AI 파일 설명: edit_type {modified, created} 필터 + 강제 재생성=DELETE 캐시 + CLAUDE.md 마이그레이션은 명시 트리거만
-- 0004 검색 BM25: title 3:1 가중치 + kind multiplier (feature 1.0 / decision 0.9 / file 0.7 / session 0.6)
+- 0003 ~~AI 파일 설명~~: edit_type {modified, created} 필터 + 강제 재생성=DELETE 캐시 + CLAUDE.md 마이그레이션은 명시 트리거만 — **historical (ADR-0016에서 기능 자체가 제거됨)**
+- 0004 검색 BM25: title 3:1 가중치 + kind multiplier (feature 1.0 / decision 0.9 / ~~file 0.7~~ / session 0.6) — Sprint 16에서 `file` 가중치 삭제
 - 0005 검색 인덱싱 범위: tasks 미인덱싱 + tokenizer 옵션 미적용
 - 0006 인벤토리 우선 워크플로우 (스프린트 첫 task는 항상 인벤토리)
 - 0007 프론트엔드 타입화: types-first + ElProps loose union, @ts-nocheck 제거는 strict 통과 시
@@ -157,13 +166,13 @@ Sprint 4-11 ADR (vibemate DB에 ADR-0001~0011 기록, 웹 대시보드 또는 `p
 - 0013 commit prefix → feature: type whitelist + scope 필수 + case-insensitive 머지 + min-count 3
 - 0014 사용자 정의 regex 추출: named scope 우선 + custom 모드 분리 + 그룹 0 reject + 패턴 길이 200
 - 0015 Workspace view: 단일 endpoint + Tab union 확장 + 사이드바 dual-mode + mark 클라 계산
+- 0016 Code Map / AI 파일 설명 제거: 실 사용량이 가설보다 낮음 + 유지비용 > 가치 + sessions.files / feature_files 매핑은 유지
 
 ## 알려진 제약
 
-- 자동 테스트는 도메인/migrations/migrate-claude-md 한정 (`npm test` — 66 tests). HTTP 라우트 / MCP / UI는 수동 E2E.
+- 자동 테스트는 도메인/migrations/migrate-claude-md 한정 (`npm test` — 103 tests). HTTP 라우트 / MCP / UI는 수동 E2E.
 - 큰 monorepo에서 chokidar 파일 워처 성능 미검증.
-- AI 파일 설명은 Claude Code MCP 호출(`pm_get_file_content` + `pm_save_file_explanation`)로 처리 — vibemate가 직접 LLM API를 호출하지 않으므로 별도 API 키 불필요.
-- 검색의 `file` 카인드는 `file_explanations`이 채워진 파일에 한정 (트리 전체에 자동 인덱싱은 안 함).
 - 한국어 검색은 어절 시작 매칭만 가능 (어절 중간 매칭은 미지원, ADR-0009).
-- tasks는 검색 인덱싱 대상 아님 (ADR-0005/0010 — noise 우려).
+- 검색 인덱싱은 feature/decision/session 3종 (ADR-0005/0010/0016 — tasks/file 모두 미인덱싱).
 - 양방향 spec.md 파일 동기화 미구현.
+- AI 파일 설명 / Code Map은 Sprint 16(ADR-0016)에서 제거됨. `sessions.files`와 `feature_files` 매핑은 유지 (Sprint 4-5).

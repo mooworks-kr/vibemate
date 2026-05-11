@@ -15,12 +15,14 @@ describe('migrations runner — fresh DB', () => {
       .prepare('SELECT version FROM schema_migrations ORDER BY version')
       .all() as { version: number }[];
     const versions = rows.map((r) => r.version);
-    // 0001_init + 0002_search_fts + 0003_imported_commits + 0004_extracted_features.
+    // 0001_init + 0002_search_fts + 0003_imported_commits +
+    // 0004_extracted_features + 0005_drop_file_explanations.
     // Bump as new migrations land.
     expect(versions).toContain(1);
     expect(versions).toContain(2);
     expect(versions).toContain(3);
     expect(versions).toContain(4);
+    expect(versions).toContain(5);
   });
 
   it('creates the expected tables', () => {
@@ -36,13 +38,16 @@ describe('migrations runner — fresh DB', () => {
       'sessions',
       'session_files',
       'feature_files',
-      'file_explanations',
+      // file_explanations: created by 0001, dropped by 0005 — should NOT exist
+      // on a fresh DB.
       'imported_commits',
       'extracted_features',
       'schema_migrations',
     ]) {
       expect(names.has(expected), `missing table: ${expected}`).toBe(true);
     }
+    // Negative assertion: 0005 retired this one. Fresh installs must not see it.
+    expect(names.has('file_explanations'), 'file_explanations should be dropped by 0005').toBe(false);
   });
 
   it('search_fts virtual table exists (from 0002)', () => {
@@ -54,10 +59,10 @@ describe('migrations runner — fresh DB', () => {
     expect(row).toBeDefined();
   });
 
-  it('all four entity tables have INSERT/UPDATE/DELETE triggers feeding search_fts', () => {
-    // 4 entities × 3 trigger types = 12. The naming convention is
-    // `<table>_a{i,u,d}`. If we ever add a new indexed entity, the trigger
-    // count is the canonical place to assert against.
+  it('three entity tables have INSERT/UPDATE/DELETE triggers feeding search_fts', () => {
+    // After 0005: file_explanations triggers retired. 3 entities × 3 trigger
+    // types = 9. If we ever add a new indexed entity, the trigger count is
+    // the canonical place to assert against.
     const triggers = t.db
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name",
@@ -68,9 +73,12 @@ describe('migrations runner — fresh DB', () => {
       'features_ai', 'features_au', 'features_ad',
       'decisions_ai', 'decisions_au', 'decisions_ad',
       'sessions_ai', 'sessions_au', 'sessions_ad',
-      'file_explanations_ai', 'file_explanations_au', 'file_explanations_ad',
     ]) {
       expect(names.has(expected), `missing trigger: ${expected}`).toBe(true);
+    }
+    // Negative assertion: file_explanations_* dropped by 0005.
+    for (const dropped of ['file_explanations_ai', 'file_explanations_au', 'file_explanations_ad']) {
+      expect(names.has(dropped), `${dropped} should be dropped by 0005`).toBe(false);
     }
   });
 });
@@ -133,8 +141,8 @@ describe('migrations runner — legacy baseline', () => {
         .prepare('SELECT version FROM schema_migrations ORDER BY version')
         .all() as { version: number }[];
       const versions = rows.map((r) => r.version);
-      // Baseline marker for v1, plus newly-applied v2 / v3 / v4.
-      expect(versions).toEqual([1, 2, 3, 4]);
+      // Baseline marker for v1, plus newly-applied v2 / v3 / v4 / v5.
+      expect(versions).toEqual([1, 2, 3, 4, 5]);
     } finally {
       closeDb();
       try { fs.rmSync(legacy.dir, { recursive: true, force: true }); } catch {}

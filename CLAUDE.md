@@ -9,7 +9,7 @@ src/
 ├── server/          # Node.js 백엔드 (MCP + HTTP + DB + CLI)
 │   ├── cli.ts            # commander 진입점
 │   ├── daemon.ts         # HTTP + 워처 백그라운드 데몬
-│   ├── mcp.ts            # Claude Code가 stdio로 호출 (22개 툴)
+│   ├── mcp.ts            # Claude Code가 stdio로 호출 (18개 툴)
 │   ├── http.ts           # Hono REST API + 정적 파일 서빙
 │   ├── watcher.ts        # chokidar 파일 감시
 │   ├── domain.ts         # 비즈니스 로직 단일 소스
@@ -68,7 +68,7 @@ npm run typecheck  # 서버 + 웹 둘 다
 
 ### 스키마 변경
 
-`src/server/migrations/` 디렉토리에 SQL 파일 추가 (`000N_<name>.sql`). `migrations.ts`가 `schema_migrations` 테이블로 적용 이력 추적. 현재 0001(init), 0002(search_fts FTS5 + 트리거 12개) 적용됨. 새 마이그레이션 추가 시 `migrations.test.ts`에 인덱스/트리거 존재 검증 추가 권장.
+`src/server/migrations/` 디렉토리에 SQL 파일 추가 (`000N_<name>.sql`). `migrations.ts`가 `schema_migrations` 테이블로 적용 이력 추적. 현재 0001(init), 0002(search_fts FTS5 + 트리거 12개 → Sprint 16 후 9개), 0003(imported_commits), 0004(extracted_features), 0005(drop file_explanations) 적용됨. 새 마이그레이션 추가 시 `migrations.test.ts`에 인덱스/트리거 존재 검증 추가 권장.
 
 ### 웹 ↔ 서버 타입 공유
 
@@ -85,7 +85,7 @@ npm run typecheck  # 서버 + 웹 둘 다
 vitest. 도메인 + migrations 커버, HTTP 라우트/MCP/UI는 미커버 (수동 E2E로 검증).
 
 ```bash
-npm test                # 119 tests — projects/features/sanitizer/searchProject/migrations/endSession/getFileContent/saveFileExplanation/migrate-claude-md/tasks/decisions/feature_files/import-git-history/extract-features (+pattern)/workspace
+npm test                # 103 tests — projects/features/sanitizer/searchProject/migrations/endSession/migrate-claude-md/tasks/decisions/feature_files/import-git-history/extract-features (+pattern)/workspace
 npm run test:watch
 npm run test:coverage   # v8 reporter
 ```
@@ -131,10 +131,10 @@ HOME=/tmp/vibemate-test node dist/server/cli.js stop
 ## 알려진 제약
 
 - 큰 monorepo에서 chokidar 파일 워처 성능 미검증.
-- AI 파일 설명은 Claude Code MCP 호출(`pm_get_file_content` + `pm_save_file_explanation`)로 처리 — vibemate가 직접 LLM API를 호출하지 않으므로 별도 API 키 불필요.
-- 검색의 `file` 카인드는 `file_explanations`이 채워진 파일에만 매칭.
+- 검색 인덱싱은 feature/decision/session 3종 (file/task 미인덱싱 — ADR-0005/0009/0010).
 - 자동 테스트는 도메인/migrations 한정 — HTTP 라우트 / MCP / UI 는 수동 E2E.
 - 양방향 spec.md 파일 동기화 미구현.
+- **AI 파일 설명 / Code Map은 Sprint 16(ADR-0016)에서 제거됨.** `sessions.files`와 `feature_files` 매핑은 유지 (Sprint 4-5의 핵심).
 
 
 <!-- Vibemate section — added by 'pm init'. Edit freely. -->

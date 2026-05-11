@@ -167,90 +167,8 @@ describe('tasks', () => {
   });
 });
 
-describe('listFilesNeedingExplanation', () => {
-  // Helper: insert a synthetic session_files row so we don't need to spin up
-  // a real session lifecycle (start/record/end) for every queue test.
-  function recordEdit(projectId: string, filePath: string, editType: 'modified' | 'created' | 'read', startedAt: number) {
-    const db = getDb();
-    const sessionId = `s-${Math.random().toString(36).slice(2, 10)}`;
-    db.prepare('INSERT INTO sessions (id, project_id, started_at) VALUES (?, ?, ?)').run(
-      sessionId, projectId, startedAt,
-    );
-    db.prepare('INSERT INTO session_files (session_id, file_path, edit_type) VALUES (?, ?, ?)').run(
-      sessionId, filePath, editType,
-    );
-  }
-
-  it('surfaces files touched without an explanation, sorted by recency', () => {
-    const proj = domain.createProject({ name: 'Q', rootPath: t.dir });
-    fs.writeFileSync(path.join(t.dir, 'a.ts'), 'a');
-    fs.writeFileSync(path.join(t.dir, 'b.ts'), 'b');
-
-    recordEdit(proj.id, 'a.ts', 'modified', Date.now() - 60_000);
-    recordEdit(proj.id, 'b.ts', 'created', Date.now() - 1_000); // more recent
-
-    const queue = domain.listFilesNeedingExplanation(proj.id);
-    expect(queue.map((q) => q.file_path)).toEqual(['b.ts', 'a.ts']);
-    expect(queue[0]!.has_explanation).toBe(false);
-    expect(queue[0]!.explanation_stale).toBe(false);
-  });
-
-  it('marks an explanation stale when file mtime > generated_at', () => {
-    const proj = domain.createProject({ name: 'Q', rootPath: t.dir });
-    const fp = 'x.ts';
-    fs.writeFileSync(path.join(t.dir, fp), 'old');
-
-    recordEdit(proj.id, fp, 'modified', Date.now() - 10_000);
-    const saved = domain.saveFileExplanation(proj.id, fp, '오래된 설명.');
-    // Bump file mtime to AFTER generated_at.
-    const futureMtime = new Date(saved.generated_at + 5_000);
-    fs.utimesSync(path.join(t.dir, fp), futureMtime, futureMtime);
-
-    const queue = domain.listFilesNeedingExplanation(proj.id);
-    expect(queue).toHaveLength(1);
-    expect(queue[0]!.has_explanation).toBe(true);
-    expect(queue[0]!.explanation_stale).toBe(true);
-  });
-
-  it('hides fresh-explanation files when staleOnly=true (default)', () => {
-    const proj = domain.createProject({ name: 'Q', rootPath: t.dir });
-    const fp = 'fresh.ts';
-    fs.writeFileSync(path.join(t.dir, fp), 'fresh');
-
-    recordEdit(proj.id, fp, 'modified', Date.now() - 10_000);
-    domain.saveFileExplanation(proj.id, fp, '바로 만든 설명.');
-    // No mtime bump — explanation is fresher than file.
-
-    expect(domain.listFilesNeedingExplanation(proj.id)).toHaveLength(0);
-    // staleOnly=false includes everything in the recent-edit set.
-    expect(
-      domain.listFilesNeedingExplanation(proj.id, { staleOnly: false }),
-    ).toHaveLength(1);
-  });
-
-  it('skips read-only edits and ignored paths and missing files', () => {
-    const proj = domain.createProject({ name: 'Q', rootPath: t.dir });
-    fs.writeFileSync(path.join(t.dir, 'real.ts'), 'r');
-    // Read-only edit — not a candidate.
-    recordEdit(proj.id, 'real.ts', 'read', Date.now() - 1_000);
-    // node_modules path — ignored.
-    recordEdit(proj.id, 'node_modules/dep.js', 'modified', Date.now() - 1_000);
-    // File no longer exists on disk.
-    recordEdit(proj.id, 'gone.ts', 'modified', Date.now() - 1_000);
-
-    expect(domain.listFilesNeedingExplanation(proj.id)).toHaveLength(0);
-  });
-
-  it('respects recentDays cutoff', () => {
-    const proj = domain.createProject({ name: 'Q', rootPath: t.dir });
-    fs.writeFileSync(path.join(t.dir, 'old.ts'), 'old');
-    // 100 days ago
-    recordEdit(proj.id, 'old.ts', 'modified', Date.now() - 100 * 86_400_000);
-
-    expect(domain.listFilesNeedingExplanation(proj.id, { recentDays: 30 })).toHaveLength(0);
-    expect(domain.listFilesNeedingExplanation(proj.id, { recentDays: 365 })).toHaveLength(1);
-  });
-});
+// (Removed in ADR-0016: describe block for listFilesNeedingExplanation — 5 tests.
+// Code Map / AI file-explanation workflow retired.)
 
 describe('sanitizeFtsQuery', () => {
   it('strips FTS5 metacharacters', () => {
@@ -385,5 +303,24 @@ describe('searchProject', () => {
     expect(order.indexOf('feature')).toBeLessThan(order.indexOf('decision'));
     expect(order.indexOf('decision')).toBeLessThan(order.indexOf('session'));
     void f; // silence unused
+  });
+
+  // Regression for ADR-0016: even if a stray kind='file' row sneaks into
+  // search_fts (e.g. a future bug re-adds the trigger), searchProject must
+  // not surface it — the web client navigateToResult('file') is a no-op now,
+  // and we'd rather catch the leak server-side.
+  it("does not return kind='file' rows even when one is injected directly", () => {
+    const proj = domain.createProject({ name: 'P', rootPath: t.dir });
+    domain.createFeature({ projectId: proj.id, name: '인증 모듈' });
+    const db = getDb();
+    // Direct injection: bypass the (now-dropped) triggers entirely.
+    db.prepare(
+      `INSERT INTO search_fts (kind, ref_id, project_id, title, body)
+       VALUES ('file', 'src/auth.ts', ?, '인증', 'auth module')`,
+    ).run(proj.id);
+    const hits = domain.searchProject(proj.id, '인증');
+    expect(hits.every((h) => h.kind !== 'file')).toBe(true);
+    // Sanity: the legitimate feature still surfaces.
+    expect(hits.some((h) => h.kind === 'feature')).toBe(true);
   });
 });

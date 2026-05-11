@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
 import { getDb, transact } from './db.js';
 import { runGitLog, type ParsedCommit } from './git-import.js';
 import {
@@ -19,9 +18,6 @@ import type {
   FeatureContext,
   FeatureFile,
   FeatureStatus,
-  FileExplanation,
-  FileNeedingExplanation,
-  FileNode,
   Project,
   ProjectStats,
   SearchResult,
@@ -648,353 +644,11 @@ export function recordFileEdit(
 // File tree
 // ============================================================
 
-/**
- * Walk the project root directory and return a recursive file tree.
- * Skips entries matched by lib.ts ignore patterns.
- * Folders are sorted before files; both groups alphabetically.
- */
-export function getFileTree(projectId: string): FileNode[] {
-  const project = getProject(projectId);
-  if (!project) throw new Error(`Project not found: ${projectId}`);
-
-  const root = project.root_path;
-  if (!fs.existsSync(root)) return [];
-
-  function walk(dir: string, relPrefix: string): FileNode[] {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return [];
-    }
-    const nodes: FileNode[] = [];
-    for (const entry of entries) {
-      // Build a posix-style relative path for ignore-matching and the response
-      const relPath = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
-      // shouldIgnoreFile checks patterns like "(^|/)node_modules/" — append "/" for dirs
-      const matchPath = entry.isDirectory() ? `${relPath}/` : relPath;
-      if (shouldIgnoreFile(matchPath)) continue;
-
-      if (entry.isDirectory()) {
-        nodes.push({
-          name: entry.name,
-          path: relPath,
-          type: 'dir',
-          children: walk(path.join(dir, entry.name), relPath),
-        });
-      } else if (entry.isFile()) {
-        nodes.push({
-          name: entry.name,
-          path: relPath,
-          type: 'file',
-        });
-      }
-    }
-    nodes.sort((a, b) => {
-      if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
-    return nodes;
-  }
-
-  return walk(root, '');
-}
-
-// ============================================================
-// File content access + explanation storage
-//
-// vibemate doesn't call any LLM directly. Claude Code (the user's IDE
-// session) plays the LLM role through MCP — it reads file content via
-// `pm_get_file_content`, summarizes locally, and stores the result via
-// `pm_save_file_explanation`. That keeps the user's existing Claude
-// subscription doing the work and avoids requiring a separate API key.
-// ============================================================
-
-const MAX_EXPLAIN_BYTES = 32 * 1024;
-const MAX_EXPLAIN_LINES = 600;
-
-// Lightweight binary heuristic: if any of the first 8KB is a null byte, treat
-// as binary. Plenty of "binary by accident" types (compiled .class, .png,
-// .pdf) trip this; legitimate UTF-8 / UTF-16 source code does not.
-function isLikelyBinary(buf: Buffer): boolean {
-  const sample = buf.subarray(0, Math.min(buf.length, 8192));
-  for (let i = 0; i < sample.length; i++) {
-    if (sample[i] === 0) return true;
-  }
-  return false;
-}
-
-// Clamp content to MAX_EXPLAIN_BYTES bytes AND MAX_EXPLAIN_LINES lines, taking
-// the smaller. Returns the clamped string + a `truncated` flag we surface to
-// the model so it knows the view is partial.
-function clampForExplain(text: string): { content: string; truncated: boolean } {
-  let truncated = false;
-  let result = text;
-
-  // Byte clamp: walk char-by-char accumulating UTF-8 bytes. Slicing by string
-  // index alone could leave us short or long; multi-byte chars (e.g. Korean)
-  // average ~3 bytes each.
-  if (Buffer.byteLength(result, 'utf8') > MAX_EXPLAIN_BYTES) {
-    let bytes = 0;
-    let cut = 0;
-    for (let i = 0; i < result.length; i++) {
-      const charBytes = Buffer.byteLength(result[i]!, 'utf8');
-      if (bytes + charBytes > MAX_EXPLAIN_BYTES) break;
-      bytes += charBytes;
-      cut = i + 1;
-    }
-    result = result.slice(0, cut);
-    truncated = true;
-  }
-
-  // Line clamp.
-  const lines = result.split('\n');
-  if (lines.length > MAX_EXPLAIN_LINES) {
-    result = lines.slice(0, MAX_EXPLAIN_LINES).join('\n');
-    truncated = true;
-  }
-
-  return { content: result, truncated };
-}
-
-// Sentinel error codes thrown by the file-access pipeline. The MCP/HTTP
-// wrappers map these to user-visible messages. Errors not in this set
-// surface as raw 500s.
-export const FILE_EXPLAIN_ERRORS = {
-  IGNORED: 'FILE_PATH_IGNORED',
-  OUTSIDE_ROOT: 'FILE_OUTSIDE_PROJECT_ROOT',
-  NOT_FOUND: 'FILE_NOT_FOUND',
-  BINARY: 'FILE_BINARY',
-  EMPTY_TEXT: 'EXPLANATION_TEXT_EMPTY',
-} as const;
-
-/**
- * Surface the "files that should get an AI explanation" queue. Inputs that go
- * into the result:
- *   - Recent active edits: session_files with edit_type modified/created in the
- *     last `recentDays` (default 30) days.
- *   - Existing explanations: file_explanations row, if any.
- *   - File mtime on disk: when an explanation exists, we mark it stale if the
- *     file has been modified after the explanation was generated.
- *
- * Default behavior (`staleOnly=true`) returns only files that need work — no
- * explanation, or stale explanation. With `staleOnly=false` everything in the
- * recent-edit set comes back so a Claude Code session can do a force-regenerate
- * pass (paired with #16).
- *
- * Sorted by `last_touched_at` descending so the most recently edited files
- * surface first. `limit` is clamped to [1, 200] after parsing.
- */
-export function listFilesNeedingExplanation(
-  projectId: string,
-  opts: { limit?: number; staleOnly?: boolean; recentDays?: number } = {},
-): FileNeedingExplanation[] {
-  const project = getProject(projectId);
-  if (!project) throw new Error(`Project not found: ${projectId}`);
-
-  const limit = Math.min(200, Math.max(1, Math.floor(opts.limit ?? 50)));
-  const staleOnly = opts.staleOnly !== false; // default true
-  const recentDays = Math.max(1, Math.floor(opts.recentDays ?? 30));
-  const cutoff = now() - recentDays * 86_400_000;
-
-  const db = getDb();
-  // Aggregate per file_path: max started_at among write-edits, plus explanation
-  // metadata via LEFT JOIN. We pull more rows than `limit` here because the
-  // mtime-stale filter can drop entries — we slice after filtering.
-  const rows = db
-    .prepare(
-      `SELECT sf.file_path AS file_path,
-              MAX(s.started_at) AS last_touched_at,
-              fe.generated_at AS generated_at
-         FROM session_files sf
-         JOIN sessions s ON s.id = sf.session_id
-         LEFT JOIN file_explanations fe
-           ON fe.project_id = s.project_id AND fe.file_path = sf.file_path
-        WHERE s.project_id = ?
-          AND sf.edit_type IN ('modified','created')
-          AND s.started_at >= ?
-        GROUP BY sf.file_path
-        ORDER BY last_touched_at DESC`,
-    )
-    .all(projectId, cutoff) as Array<{
-      file_path: string;
-      last_touched_at: number;
-      generated_at: number | null;
-    }>;
-
-  const result: FileNeedingExplanation[] = [];
-  for (const r of rows) {
-    if (shouldIgnoreFile(r.file_path)) continue;
-
-    const hasExplanation = r.generated_at != null;
-    let stale = false;
-    if (hasExplanation) {
-      // Compare the file's mtime on disk to generated_at. If the file vanished
-      // (rename/delete), drop it from the queue — no point asking for an
-      // explanation of something that's gone.
-      const absPath = path.resolve(project.root_path, r.file_path);
-      let mtimeMs: number;
-      try {
-        const st = fs.statSync(absPath);
-        if (!st.isFile()) continue;
-        mtimeMs = st.mtimeMs;
-      } catch {
-        continue;
-      }
-      // Truncate to whole ms so we don't false-positive on sub-ms filesystem
-      // resolution colliding with `Date.now()`'s integer ms (a write at
-      // 1234.567 ms compared to a Date.now() of 1234 looks "stale" without
-      // this normalization).
-      stale = Math.floor(mtimeMs) > (r.generated_at as number);
-    } else {
-      // Without an explanation we still want the file to exist on disk —
-      // otherwise Claude Code's get_file_content will just throw NOT_FOUND.
-      const absPath = path.resolve(project.root_path, r.file_path);
-      try {
-        const st = fs.statSync(absPath);
-        if (!st.isFile()) continue;
-      } catch {
-        continue;
-      }
-    }
-
-    if (staleOnly && hasExplanation && !stale) continue;
-
-    result.push({
-      file_path: r.file_path,
-      last_touched_at: r.last_touched_at,
-      has_explanation: hasExplanation,
-      explanation_stale: stale,
-    });
-
-    if (result.length >= limit) break;
-  }
-
-  return result;
-}
-
-/**
- * Read existing cached explanation for a file. Returns null if not generated.
- * Used by `/files/detail` to surface AI explanations alongside other metadata.
- */
-export function getFileExplanation(
-  projectId: string,
-  filePath: string,
-): FileExplanation | null {
-  const db = getDb();
-  const row = db
-    .prepare('SELECT * FROM file_explanations WHERE project_id = ? AND file_path = ?')
-    .get(projectId, filePath) as FileExplanation | undefined;
-  return row ?? null;
-}
-
-// Read + validate + clamp + hash. Throws sentinel codes (see FILE_EXPLAIN_ERRORS)
-// for expected failure modes. Used by both `getFileContent` (Claude Code reads
-// the result) and `saveFileExplanation` (we re-hash to keep the cache marker
-// in sync with current file content).
-function prepareFileForExplanation(
-  projectId: string,
-  filePath: string,
-): { project: Project; content: string; truncated: boolean; contentHash: string } {
-  const project = getProject(projectId);
-  if (!project) throw new Error(`Project not found: ${projectId}`);
-
-  if (shouldIgnoreFile(filePath)) {
-    throw new Error(FILE_EXPLAIN_ERRORS.IGNORED);
-  }
-
-  const absPath = path.resolve(project.root_path, filePath);
-  const rel = path.relative(project.root_path, absPath);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error(FILE_EXPLAIN_ERRORS.OUTSIDE_ROOT);
-  }
-  if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
-    throw new Error(FILE_EXPLAIN_ERRORS.NOT_FOUND);
-  }
-
-  const buf = fs.readFileSync(absPath);
-  if (isLikelyBinary(buf)) {
-    throw new Error(FILE_EXPLAIN_ERRORS.BINARY);
-  }
-
-  const { content, truncated } = clampForExplain(buf.toString('utf-8'));
-  // Hash on the *clamped* content so the cache stays warm even when a
-  // tail-only edit happened beyond MAX_EXPLAIN_BYTES/MAX_EXPLAIN_LINES.
-  const contentHash = createHash('sha256').update(content).digest('hex');
-
-  return { project, content, truncated, contentHash };
-}
-
-/**
- * Read clamped file content for Claude Code (via the `pm_get_file_content`
- * MCP tool) to summarize. Validation rejects binaries / ignore-patterns /
- * paths outside the project root with sentinel error codes.
- */
-export function getFileContent(
-  projectId: string,
-  filePath: string,
-): { content: string; truncated: boolean; content_hash: string } {
-  const prep = prepareFileForExplanation(projectId, filePath);
-  return {
-    content: prep.content,
-    truncated: prep.truncated,
-    content_hash: prep.contentHash,
-  };
-}
-
-/**
- * Drop a cached explanation. Used by the "regenerate" button in the codemap
- * panel and by `pm_clear_file_explanation`. The 0002 FTS5 trigger
- * (`file_explanations_ad`) also clears the matching `search_fts` row, so the
- * file stops matching `kind='file'` searches automatically.
- *
- * Returns true if a row was actually deleted (so the HTTP wrapper can 404
- * cleanly when called against an uncached file).
- */
-export function clearFileExplanation(projectId: string, filePath: string): boolean {
-  const db = getDb();
-  const result = db
-    .prepare('DELETE FROM file_explanations WHERE project_id = ? AND file_path = ?')
-    .run(projectId, filePath);
-  return result.changes > 0;
-}
-
-/**
- * Persist an explanation produced by Claude Code into `file_explanations`.
- * We re-read the file to compute `content_hash` against the current content
- * — keeps the cache marker honest even if the file changed slightly between
- * read and save. The FTS5 trigger from 0002 picks up the upsert and indexes
- * the explanation automatically.
- */
-export function saveFileExplanation(
-  projectId: string,
-  filePath: string,
-  text: string,
-): FileExplanation {
-  const trimmed = (text ?? '').trim();
-  if (!trimmed) throw new Error(FILE_EXPLAIN_ERRORS.EMPTY_TEXT);
-
-  const prep = prepareFileForExplanation(projectId, filePath);
-
-  const t = now();
-  const db = getDb();
-  db.prepare(
-    `INSERT INTO file_explanations (project_id, file_path, content_hash, explanation, generated_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(project_id, file_path) DO UPDATE SET
-       content_hash = excluded.content_hash,
-       explanation  = excluded.explanation,
-       generated_at = excluded.generated_at`,
-  ).run(projectId, filePath, prep.contentHash, trimmed, t);
-
-  return {
-    project_id: projectId,
-    file_path: filePath,
-    content_hash: prep.contentHash,
-    explanation: trimmed,
-    generated_at: t,
-  };
-}
+// (Removed in ADR-0016: getFileTree, listFilesNeedingExplanation,
+// getFileExplanation, getFileContent, saveFileExplanation, clearFileExplanation,
+// plus their private helpers (prepareFileForExplanation, clampForExplain,
+// isLikelyBinary) and the FILE_EXPLAIN_ERRORS sentinel. Code Map / AI file
+// explanation workflow retired. file_explanations table dropped in 0005.)
 
 // ============================================================
 // Search (FTS5)
@@ -1044,10 +698,10 @@ const BODY_WEIGHT = 1.0;
 // with a much better content match (bm25 = -10) outranks a feature with a
 // weak match (bm25 = -5) even after the boost — the kind tier only swings
 // ties or near-ties.
+// ADR-0016: 'file' kind retired (no longer indexed; filtered out in searchProject).
 const KIND_WEIGHT: Record<string, number> = {
   feature: 1.0,
   decision: 0.9,
-  file: 0.7,
   session: 0.6,
 };
 
@@ -1095,6 +749,10 @@ export function searchProject(
     // (title, body — kind/ref_id/project_id are UNINDEXED). Per-kind boost
     // is folded in via CASE WHEN: kinds with a higher KIND_WEIGHT see a more
     // negative score (= ranks higher), with the multiplier preserving sign.
+    // ADR-0016: the 'file' kind is retired. Migration 0005 swept search_fts
+    // of file rows and dropped the feeding triggers, but we filter here too
+    // as a defensive guard — a stale client or a hand-injected row must
+    // never surface in results.
     rows = db
       .prepare(
         `SELECT kind, ref_id, project_id, title,
@@ -1103,13 +761,12 @@ export function searchProject(
                   CASE kind
                     WHEN 'feature'  THEN ?
                     WHEN 'decision' THEN ?
-                    WHEN 'file'     THEN ?
                     WHEN 'session'  THEN ?
                     ELSE 1.0
                   END
                 ) AS score
          FROM search_fts
-         WHERE project_id = ? AND search_fts MATCH ?
+         WHERE project_id = ? AND kind != 'file' AND search_fts MATCH ?
          ORDER BY score
          LIMIT ?`,
       )
@@ -1120,7 +777,6 @@ export function searchProject(
         BODY_WEIGHT,
         KIND_WEIGHT.feature,
         KIND_WEIGHT.decision,
-        KIND_WEIGHT.file,
         KIND_WEIGHT.session,
         projectId,
         ftsQuery,
@@ -1567,15 +1223,6 @@ export function claudeMdTemplate(projectId: string): string {
 세션 종료 직전:
 - \`pm_session_end\` 호출 (session_id, 한 줄 요약, primary_feature_id)
 - summary는 한국어 권장. 어떤 기능을 어떻게 진행했는지 명확하게.
-
-세션 종료 직후 (사용자가 "세션 정리해줘" 또는 "파일 설명 채워줘"라고 명시할 때만):
-- \`pm_session_end\` 호출 후, \`pm_list_files_needing_explanation\` 호출
-- 큐의 길이가 **5개 이상이면** "총 N개 파일에 설명 채울게요. 진행할까요?" 라고 사용자에게 먼저 확인
-- 결과 파일들 각각에 대해:
-  - \`pm_get_file_content(file_path)\` 로 클램프된 내용 받기 (32KB / 600라인 한도 내)
-  - 그 내용을 직접 읽어 2-3문장의 한국어 설명 작성
-  - \`pm_save_file_explanation(file_path, summary)\` 으로 저장
-- **자동 트리거가 아님** — 매 세션마다 자동으로 돌리지 말 것. 사용자가 명시적으로 요청할 때만.
 
 태스크 / 기능 변경:
 - 태스크 시작: \`pm_update_task\` (status=in_progress)

@@ -76,13 +76,7 @@ export interface FeatureFile {
   created_at: number;
 }
 
-export interface FileExplanation {
-  project_id: string;
-  file_path: string;
-  content_hash: string;
-  explanation: string;
-  generated_at: number;
-}
+// (Removed in ADR-0016: FileExplanation. AI file-explanation workflow retired.)
 
 /**
  * One row in the cross-project "내 작업" / workspace view. Combines feature
@@ -106,20 +100,7 @@ export interface WorkspaceFeature {
   last_activity_at: number | null;
 }
 
-/**
- * One row in the "needs explanation" queue surfaced via
- * `pm_list_files_needing_explanation` / GET /files/needs-explanation.
- *
- * `last_touched_at` is the most-recent session.started_at where this file was
- * created or modified. `explanation_stale` is true when an explanation row
- * exists but the file's mtime is newer than `generated_at`.
- */
-export interface FileNeedingExplanation {
-  file_path: string;
-  last_touched_at: number;
-  has_explanation: boolean;
-  explanation_stale: boolean;
-}
+// (Removed in ADR-0016: FileNeedingExplanation. Code Map workflow retired.)
 
 export interface ProjectStats {
   active_features: number;
@@ -149,13 +130,12 @@ export interface SessionStartContext {
   spec_md?: string | null;
 }
 
-export interface FileNode {
-  name: string;
-  path: string;
-  type: 'file' | 'dir';
-  children?: FileNode[];
-}
+// (Removed in ADR-0016: FileNode. File-tree API retired.)
 
+// SearchKind still includes 'file' for type-system stability, but on a
+// post-0005 DB no row of kind='file' can be returned — migration purged
+// the search_fts table of those rows and dropped the triggers that fed
+// them. The web client treats incoming 'file' results as a no-op.
 export type SearchKind = 'feature' | 'decision' | 'session' | 'file';
 
 export interface SearchResult {
