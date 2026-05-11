@@ -14,6 +14,7 @@ import type {
   SearchResult,
   Task,
   TaskStatus,
+  WorkspaceFeature,
 } from '../server/types';
 import type {
   AdrCard,
@@ -37,6 +38,7 @@ import type {
   SessionSummaryRow,
   Tab,
   TaskRow,
+  WorkspaceFeatureRow,
 } from './types';
 
 // In-memory cache populated by API calls. Keyed by project id.
@@ -52,7 +54,9 @@ const DATA: DataCache = {
 // State — singleton, mutated in place. Every render*() reads from here.
 const state: AppState = {
   currentProject: null,        // set after projects load
-  currentTab: 'features',
+  // Workspace is the default landing tab — gives a cross-project overview
+  // for new users (or users with several projects) before they pick one.
+  currentTab: 'workspace',
   currentFeature: null,
   currentFile: null,
   loading: true,               // initial fetch in flight
@@ -71,6 +75,12 @@ const state: AppState = {
   errorMsg: null,              // last toast banner text
   toastKind: 'error',          // tint for the transient banner
   fileDetailLoading: false,
+
+  // Workspace tab
+  workspaceStatuses: ['in_progress'],
+  workspaceFeatures: null,
+  workspaceLoading: false,
+  workspaceError: null,
 };
 
 // Per-(project,path) cache for `/files/detail`, populated lazily from codemap.
@@ -577,6 +587,38 @@ async function loadProjectList(): Promise<void> {
   }));
 }
 
+/**
+ * Pull the cross-project workspace view. Cached on `state.workspaceFeatures`;
+ * caller invalidates by setting it to null (e.g. when the status filter
+ * changes). loading / error flags drive the render() spinner / banner.
+ */
+async function loadWorkspaceFeatures(): Promise<void> {
+  state.workspaceLoading = true;
+  state.workspaceError = null;
+  render();
+  try {
+    const qs = state.workspaceStatuses.map((s) => `status=${encodeURIComponent(s)}`).join('&');
+    const rows = await fetchJSON<WorkspaceFeatureRow[]>(`/api/workspace/active-features?${qs}`);
+    state.workspaceFeatures = rows;
+  } catch (e) {
+    state.workspaceError = (e as Error).message ?? '워크스페이스 로드 실패';
+  } finally {
+    state.workspaceLoading = false;
+    render();
+  }
+}
+
+/**
+ * Switch into a project's feature detail view from anywhere (workspace card,
+ * search palette, future cross-project entry points). Reuses `setActiveProject`
+ * so the project's detail is lazily loaded the first time.
+ */
+async function navigateToFeature(projectId: string, featureId: string): Promise<void> {
+  state.currentTab = 'features';
+  state.currentFeature = featureId;
+  await setActiveProject(projectId);
+}
+
 async function loadProjectDetail(projectId: string): Promise<void> {
   if (state.loadedProjects.has(projectId)) return;
 
@@ -979,6 +1021,7 @@ document.addEventListener('click', () => $('#projectDropdown')!.classList.remove
 // Tabs
 // =================================================
 const TABS: ReadonlyArray<{ id: Tab; label: string }> = [
+  { id: 'workspace', label: '📋 내 작업' },
   { id: 'dashboard', label: '대시보드' },
   { id: 'features', label: '기능' },
   { id: 'codemap', label: '코드 맵' },
@@ -1830,6 +1873,132 @@ function renderSessions(): void {
 }
 
 // =================================================
+// Main: Workspace (cross-project "내 작업")
+// =================================================
+function renderWorkspace(): void {
+  const main = $('#main')!;
+  main.innerHTML = '';
+
+  // Lazy fire — first entry to the tab kicks off the fetch, status-toggle
+  // also clears `workspaceFeatures` so this branch refetches.
+  if (state.workspaceFeatures === null && !state.workspaceLoading && !state.workspaceError) {
+    loadWorkspaceFeatures();
+  }
+
+  const header = el('div', { class: 'page-header' }, [
+    el('div', { class: 'breadcrumb', text: '워크스페이스' }),
+    el('h1', { class: 'page-title', text: '내 작업' }),
+    el('p', { class: 'page-tagline', text: '등록된 모든 프로젝트의 진행 중인 기능을 한 곳에서.' }),
+  ]);
+  main.appendChild(header);
+
+  // Status filter toggle. Two segmented buttons for now; checking 'todo' adds
+  // todo features to the list.
+  const filterRow = el('div');
+  filterRow.style.cssText = 'display: flex; gap: 8px; margin-bottom: 16px; align-items: center;';
+  filterRow.appendChild(el('span', { text: '필터:', style: 'color: var(--text-3); font-size: 12px;' }));
+  const STATUS_OPTS: ReadonlyArray<{ key: FeatureStatus; label: string }> = [
+    { key: 'in_progress', label: '진행 중' },
+    { key: 'todo', label: '할 일' },
+    { key: 'done', label: '완료' },
+  ];
+  STATUS_OPTS.forEach(({ key, label }) => {
+    const active = state.workspaceStatuses.includes(key);
+    const btn = el('button', {
+      text: label,
+      onClick: () => {
+        // Toggle membership but always keep at least one — empty selection
+        // would render confusingly with "0건". Re-select the only remaining
+        // tag if user tries to drop it.
+        const isOn = state.workspaceStatuses.includes(key);
+        if (isOn && state.workspaceStatuses.length === 1) return;
+        state.workspaceStatuses = isOn
+          ? state.workspaceStatuses.filter((s) => s !== key)
+          : [...state.workspaceStatuses, key];
+        state.workspaceFeatures = null;
+        loadWorkspaceFeatures();
+      },
+    });
+    btn.style.cssText = [
+      'padding: 4px 10px',
+      'border-radius: 999px',
+      'border: 1px solid ' + (active ? 'var(--accent)' : 'var(--border)'),
+      'background: ' + (active ? 'var(--accent)' : 'transparent'),
+      'color: ' + (active ? 'var(--text)' : 'var(--text-2)'),
+      'font-size: 12px',
+      'cursor: pointer',
+    ].join('; ');
+    filterRow.appendChild(btn);
+  });
+  main.appendChild(filterRow);
+
+  // Loading / error / empty / data branches.
+  if (state.workspaceError) {
+    main.appendChild(el('div', { class: 'empty-state' }, [
+      el('div', { class: 'empty-state-title', text: '워크스페이스를 불러오지 못했습니다' }),
+      el('div', { class: 'empty-state-text', text: state.workspaceError }),
+    ]));
+    return;
+  }
+  if (state.workspaceLoading || state.workspaceFeatures === null) {
+    main.appendChild(el('div', { class: 'empty-state' }, [
+      el('div', { class: 'empty-state-title', text: '불러오는 중…' }),
+    ]));
+    return;
+  }
+  const rows = state.workspaceFeatures;
+  if (rows.length === 0) {
+    main.appendChild(el('div', { class: 'empty-state' }, [
+      el('div', { class: 'empty-state-title', text: '진행 중인 기능이 없습니다' }),
+      el('div', {
+        class: 'empty-state-text',
+        text:
+          '`pm import-history`로 git history를 sessions로 가져오거나, '
+          + '`pm extract-features`로 commit prefix에서 feature를 추출하거나, '
+          + '사이드바에서 프로젝트를 선택해 수동으로 기능을 추가하세요.',
+      }),
+    ]));
+    return;
+  }
+
+  // Cards grid — one per workspace feature row.
+  const list = el('div', { class: 'feature-card-list' });
+  for (const r of rows) {
+    const card = el('div', {
+      class: 'feature-card',
+      onClick: () => { navigateToFeature(r.project_id, r.feature_id); },
+    });
+    // Header line: project mark + project label + feature name pill.
+    const projColor = makeMarkColor(r.project_id);
+    const projMark = makeMark(r.project_name);
+    const headerLine = el('div', { class: 'feature-card-header' }, [
+      (() => {
+        const m = el('span', { class: 'project-mark', text: projMark });
+        m.style.cssText = `background: ${projColor}; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;`;
+        return m;
+      })(),
+      el('span', { class: 'feature-card-project', text: r.project_name, style: 'color: var(--text-3); font-size: 11px;' }),
+      el('span', { class: 'feature-card-name', text: r.feature_name, style: 'font-weight: 600; flex: 1;' }),
+      pillEl(r.status, statusLabel(r.status)),
+    ]);
+    card.appendChild(headerLine);
+    const meta = el('div', { class: 'feature-card-meta' }, [
+      el('div', { class: 'feature-card-progress' }, [
+        el('div', { class: 'progress-bar' }, [el('div', { class: 'progress-fill', style: 'width:' + r.progress + '%' })]),
+        el('span', { class: 'feature-card-progress-text', text: `${r.tasks_done}/${r.tasks_done + r.tasks_todo} · ${r.progress}%` }),
+      ]),
+      el('span', {
+        text: r.last_activity_at ? (relTime(r.last_activity_at) ?? '활동 없음') : '활동 없음',
+        style: 'color: var(--text-3); font-size: 11px; margin-left: auto;',
+      }),
+    ]);
+    card.appendChild(meta);
+    list.appendChild(card);
+  }
+  main.appendChild(list);
+}
+
+// =================================================
 // Render
 // =================================================
 function render() {
@@ -1861,7 +2030,8 @@ function render() {
     return;
   }
 
-  if (state.currentTab === 'dashboard') renderDashboard();
+  if (state.currentTab === 'workspace') renderWorkspace();
+  else if (state.currentTab === 'dashboard') renderDashboard();
   else if (state.currentTab === 'features') renderFeatureDetail();
   else if (state.currentTab === 'codemap') renderCodeMap();
   else if (state.currentTab === 'decisions') renderDecisions();

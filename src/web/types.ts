@@ -185,7 +185,24 @@ export interface FeatureDetailResponse extends Feature {
 // App state
 // ============================================================
 
-export type Tab = 'dashboard' | 'features' | 'codemap' | 'decisions' | 'sessions';
+export type Tab = 'workspace' | 'dashboard' | 'features' | 'codemap' | 'decisions' | 'sessions';
+
+/**
+ * Mirror of the server's `WorkspaceFeature` row (types.ts on the server).
+ * Re-declared here because Vite cannot follow `import type` past the bundle
+ * boundary cleanly when we also want runtime-free type ids.
+ */
+export interface WorkspaceFeatureRow {
+  project_id: string;
+  project_name: string;
+  feature_id: string;
+  feature_name: string;
+  status: FeatureStatus;
+  progress: number;
+  tasks_todo: number;
+  tasks_done: number;
+  last_activity_at: number | null;
+}
 export type ToastKind = 'error' | 'success' | 'info';
 
 /**
@@ -223,6 +240,16 @@ export interface AppState {
   toastKind: ToastKind;
   /** True while `/files/detail` fetch is in flight for the current file. */
   fileDetailLoading: boolean;
+
+  // Workspace tab --------------------------------------------------------
+  /** Active filter for the cross-project view. Default `['in_progress']`. */
+  workspaceStatuses: FeatureStatus[];
+  /** Cached rows for the workspace view. null = not loaded yet. */
+  workspaceFeatures: WorkspaceFeatureRow[] | null;
+  /** Inflight guard so a status-toggle doesn't race with the initial load. */
+  workspaceLoading: boolean;
+  /** Last fetch error message; null when last load succeeded. */
+  workspaceError: string | null;
 }
 
 // ============================================================

@@ -85,6 +85,28 @@ export interface FileExplanation {
 }
 
 /**
+ * One row in the cross-project "내 작업" / workspace view. Combines feature
+ * metadata with its parent project's name + a derived last_activity_at so
+ * the client can sort by recency without an extra join.
+ *
+ * Returned by `domain.listWorkspaceFeatures` / GET /api/workspace/active-features
+ * / `pm_list_workspace_features`.
+ */
+export interface WorkspaceFeature {
+  project_id: string;
+  project_name: string;
+  feature_id: string;
+  feature_name: string;
+  status: FeatureStatus;
+  /** 0–100, rounded. (tasks_done / (tasks_todo + tasks_done)) × 100. */
+  progress: number;
+  tasks_todo: number;
+  tasks_done: number;
+  /** ms since epoch of most recent session.started_at for this feature, or null. */
+  last_activity_at: number | null;
+}
+
+/**
  * One row in the "needs explanation" queue surfaced via
  * `pm_list_files_needing_explanation` / GET /files/needs-explanation.
  *

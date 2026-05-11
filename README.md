@@ -107,7 +107,13 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 - named group `(?<scope>...)` 우선, fallback group 1
 - conventional과 namespace 분리 (`milestone:M37` vs `feat:auth` 공존)
 - ADR-0013 정책 그대로 적용 (min-count, 머지, IS NULL 가드)
-- 단위 테스트 38 → **110** (도메인/migrations/migrate-claude-md/import-git-history/extract-features +pattern)
+
+**Sprint 15 — Cross-project 워크스페이스**
+- 사이드바 최상단 `📋 내 작업` 탭 + `GET /api/workspace/active-features?status=&limit=` + `pm_list_workspace_features` MCP 툴
+- 모든 프로젝트의 진행 중 features 통합 view (single endpoint, N+1 회피)
+- 카드 클릭 → 해당 프로젝트 + feature로 navigate
+- `currentTab` default `'features'` → `'workspace'` (멀티 프로젝트 사용자 진입 흐름 개선)
+- 단위 테스트 38 → **119** (도메인/migrations/migrate-claude-md/import-git-history/extract-features/workspace)
 
 ### 다음 백로그 후보
 
@@ -150,6 +156,7 @@ Sprint 4-11 ADR (vibemate DB에 ADR-0001~0011 기록, 웹 대시보드 또는 `p
 - 0012 git import: imported_commits 테이블(옵션 B) + spawn array + edit_type 매핑(D 스킵)
 - 0013 commit prefix → feature: type whitelist + scope 필수 + case-insensitive 머지 + min-count 3
 - 0014 사용자 정의 regex 추출: named scope 우선 + custom 모드 분리 + 그룹 0 reject + 패턴 길이 200
+- 0015 Workspace view: 단일 endpoint + Tab union 확장 + 사이드바 dual-mode + mark 클라 계산
 
 ## 알려진 제약
 

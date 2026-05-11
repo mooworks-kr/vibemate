@@ -214,6 +214,28 @@ export function createApp() {
     }
   });
 
+  // ----- Workspace (cross-project active-features view) -----
+
+  app.get('/api/workspace/active-features', (c) => {
+    const queryStatuses = c.req.queries('status') ?? [];
+    // Accept both `?status=in_progress&status=todo` (Hono's queries() returns
+    // the array) and CSV `?status=in_progress,todo`. Flatten + dedupe.
+    const flat = queryStatuses.flatMap((s) => s.split(',')).map((s) => s.trim()).filter(Boolean);
+    const statuses = flat.length > 0 ? (flat as FeatureStatus[]) : undefined;
+
+    const limitRaw = c.req.query('limit');
+    let limit: number | undefined;
+    if (limitRaw !== undefined) {
+      const n = Number(limitRaw);
+      if (!Number.isFinite(n) || n <= 0) {
+        return c.json({ error: 'limit must be a positive number' }, 400);
+      }
+      limit = n;
+    }
+
+    return c.json(domain.listWorkspaceFeatures({ statuses, limit }));
+  });
+
   // ----- Files needing explanation (queue surfaced for Claude Code) -----
 
   app.get('/api/projects/:id/files/needs-explanation', (c) => {

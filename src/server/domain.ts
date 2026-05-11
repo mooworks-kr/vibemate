@@ -29,6 +29,7 @@ import type {
   SessionStartContext,
   Task,
   TaskStatus,
+  WorkspaceFeature,
 } from './types.js';
 
 // ============================================================
@@ -1390,6 +1391,100 @@ export async function importGitHistory(
   }
 
   return result;
+}
+
+// ============================================================
+// Workspace (cross-project "내 작업" view)
+//
+// Single endpoint backing the workspace UI. Hands back a flat feature list
+// joined with its parent project's name plus tasks counts and last-activity
+// timestamp — everything renderWorkspace() needs without N+1.
+// ============================================================
+
+const WORKSPACE_LIMIT_DEFAULT = 50;
+const WORKSPACE_LIMIT_MAX = 200;
+const ALL_FEATURE_STATUSES: ReadonlyArray<FeatureStatus> = ['todo', 'in_progress', 'done', 'archived'];
+
+export interface ListWorkspaceFeaturesOpts {
+  /** Feature statuses to include. Defaults to `['in_progress']`. */
+  statuses?: FeatureStatus[];
+  /** Hard cap on returned rows. Default 50, max 200. */
+  limit?: number;
+}
+
+/**
+ * Cross-project active-features view. The SQL keeps it in one round-trip:
+ * scalar subqueries pull tasks counts + max session timestamp per feature
+ * rather than separate batches.
+ *
+ * Ordering: most-recently-active feature first; ties (or feature with no
+ * sessions yet) fall back to `features.updated_at` so freshly-edited
+ * features still surface near the top.
+ */
+export function listWorkspaceFeatures(opts: ListWorkspaceFeaturesOpts = {}): WorkspaceFeature[] {
+  // Default to in_progress; explicit empty array → no filter (caller has to
+  // pass something deliberate to get the no-op result).
+  const requested = opts.statuses ?? ['in_progress'];
+  // Sanitize: drop anything we don't recognise so a stray query param can't
+  // poison the IN-clause. Fall back to default when nothing survives.
+  const sanitized = requested.filter((s): s is FeatureStatus =>
+    (ALL_FEATURE_STATUSES as ReadonlyArray<string>).includes(s));
+  const statuses = sanitized.length > 0 ? sanitized : (['in_progress'] as FeatureStatus[]);
+
+  const limit = Math.min(
+    WORKSPACE_LIMIT_MAX,
+    Math.max(1, Math.floor(opts.limit ?? WORKSPACE_LIMIT_DEFAULT)),
+  );
+
+  const db = getDb();
+  const placeholders = statuses.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT
+         f.project_id                                                       AS project_id,
+         p.name                                                             AS project_name,
+         f.id                                                               AS feature_id,
+         f.name                                                             AS feature_name,
+         f.status                                                           AS status,
+         f.updated_at                                                       AS updated_at,
+         (SELECT MAX(started_at) FROM sessions WHERE feature_id = f.id)     AS last_activity_at,
+         (SELECT COUNT(*) FROM tasks
+            WHERE feature_id = f.id AND status IN ('todo','in_progress'))   AS tasks_todo,
+         (SELECT COUNT(*) FROM tasks
+            WHERE feature_id = f.id AND status = 'done')                    AS tasks_done
+       FROM features f
+       JOIN projects p ON p.id = f.project_id
+       WHERE f.status IN (${placeholders})
+       ORDER BY (last_activity_at IS NULL), last_activity_at DESC, f.updated_at DESC
+       LIMIT ?`,
+    )
+    .all(...statuses, limit) as Array<{
+      project_id: string;
+      project_name: string;
+      feature_id: string;
+      feature_name: string;
+      status: FeatureStatus;
+      updated_at: number;
+      last_activity_at: number | null;
+      tasks_todo: number;
+      tasks_done: number;
+    }>;
+
+  return rows.map((r) => {
+    const totalTasks = r.tasks_todo + r.tasks_done;
+    const progress = totalTasks === 0 ? 0 : Math.round((r.tasks_done / totalTasks) * 100);
+    return {
+      project_id: r.project_id,
+      project_name: r.project_name,
+      feature_id: r.feature_id,
+      feature_name: r.feature_name,
+      status: r.status,
+      progress,
+      tasks_todo: r.tasks_todo,
+      tasks_done: r.tasks_done,
+      last_activity_at: r.last_activity_at,
+    };
+  });
 }
 
 export { relativizeToProject };

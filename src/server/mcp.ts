@@ -317,6 +317,40 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     },
   );
 
+  // ----- Workspace (cross-project active-features view) -----
+
+  server.tool(
+    'pm_list_workspace_features',
+    {
+      statuses: z.array(z.enum(['todo', 'in_progress', 'done', 'archived'])).optional()
+        .describe("포함할 feature status. 기본 ['in_progress']."),
+      limit: z.number().optional()
+        .describe('최대 결과 수 (기본 50, 최대 200)'),
+    },
+    async ({ statuses, limit }) => {
+      const rows = domain.listWorkspaceFeatures({ statuses, limit });
+      if (rows.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: '진행 중인 기능이 없습니다.' }],
+        };
+      }
+      const formatted = rows
+        .map((r) => {
+          const when = r.last_activity_at
+            ? new Date(r.last_activity_at).toISOString()
+            : '활동 없음';
+          return `[${r.project_name}] ${r.feature_name}  (${r.tasks_done}/${r.tasks_todo + r.tasks_done} · ${r.progress}% · ${when})`;
+        })
+        .join('\n');
+      return {
+        content: [
+          { type: 'text' as const, text: `${rows.length}건:\n\n${formatted}` },
+          { type: 'text' as const, text: JSON.stringify(rows, null, 2) },
+        ],
+      };
+    },
+  );
+
   // ----- Conventional-commit feature extraction -----
 
   server.tool(

@@ -9,7 +9,7 @@ src/
 ├── server/          # Node.js 백엔드 (MCP + HTTP + DB + CLI)
 │   ├── cli.ts            # commander 진입점
 │   ├── daemon.ts         # HTTP + 워처 백그라운드 데몬
-│   ├── mcp.ts            # Claude Code가 stdio로 호출 (21개 툴)
+│   ├── mcp.ts            # Claude Code가 stdio로 호출 (22개 툴)
 │   ├── http.ts           # Hono REST API + 정적 파일 서빙
 │   ├── watcher.ts        # chokidar 파일 감시
 │   ├── domain.ts         # 비즈니스 로직 단일 소스
@@ -85,7 +85,7 @@ npm run typecheck  # 서버 + 웹 둘 다
 vitest. 도메인 + migrations 커버, HTTP 라우트/MCP/UI는 미커버 (수동 E2E로 검증).
 
 ```bash
-npm test                # 110 tests — projects/features/sanitizer/searchProject/migrations/endSession/getFileContent/saveFileExplanation/migrate-claude-md/tasks/decisions/feature_files/import-git-history/extract-features (+pattern)
+npm test                # 119 tests — projects/features/sanitizer/searchProject/migrations/endSession/getFileContent/saveFileExplanation/migrate-claude-md/tasks/decisions/feature_files/import-git-history/extract-features (+pattern)/workspace
 npm run test:watch
 npm run test:coverage   # v8 reporter
 ```
