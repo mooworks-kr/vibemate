@@ -69,9 +69,12 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
       session_id: z.string(),
       feature_id: z.string(),
     },
+    // ADR-0017: response includes `feature` (FeatureContext) + `spec_md` so
+    // switching features mid-session hands Claude Code the same scope/non-scope
+    // payload it would have gotten from pm_get_context({feature_id}). Old
+    // callers that only checked `.ok` are unaffected — purely additive.
     async ({ session_id, feature_id }) => {
-      domain.setActiveFeature(session_id, feature_id);
-      return ok({ ok: true });
+      return ok(domain.setActiveFeature(session_id, feature_id));
     },
   );
 

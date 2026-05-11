@@ -205,7 +205,7 @@ async function createFeatureUI(name: string): Promise<void> {
   });
   if (!f) return;
   const enriched: EnrichedFeature = {
-    id: f.id, name: f.name, goal: f.goal, status: f.status,
+    id: f.id, name: f.name, goal: f.goal, spec_md: f.spec_md, status: f.status,
     progress: 0, tasks: [], files: [], sessions: [],
   };
   DATA.features[projectId] = [...(DATA.features[projectId] || []), enriched];
@@ -534,6 +534,7 @@ async function loadProjectDetail(projectId: string): Promise<void> {
       id: fd.id,
       name: fd.name,
       goal: fd.goal,
+      spec_md: fd.spec_md,
       status: fd.status,
       progress: fd.progress,
       tasks: (fd.tasks || []).map((t): TaskRow => ({
@@ -1207,6 +1208,15 @@ function renderFeatureDetail() {
   header.appendChild(titleRow);
   header.appendChild(el('p', { class: 'page-tagline', text: f.goal ?? '' }));
   main.appendChild(header);
+
+  if (f.spec_md && f.spec_md.trim()) {
+    const spec = el('div', { class: 'detail-section feature-spec-section' });
+    spec.appendChild(el('div', { class: 'detail-section-title' }, [
+      el('span', { text: '스펙' }),
+    ]));
+    spec.appendChild(el('pre', { class: 'feature-spec-body', text: f.spec_md.trim() }));
+    main.appendChild(spec);
+  }
 
   const progRow = el('div', { class: 'progress-row' }, [
     el('div', { class: 'progress-bar' }, [el('div', { class: 'progress-fill', style: 'width:' + f.progress + '%' })]),

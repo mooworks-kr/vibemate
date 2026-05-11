@@ -6,6 +6,7 @@ import {
   VIBEMATE_LEGACY_MARKER,
   VIBEMATE_SECTION_BEGIN,
   VIBEMATE_SECTION_END,
+  VIBEMATE_TEMPLATE_VERSION,
   claudeMdTemplate,
   lineDiff,
   migrateClaudeMd,
@@ -27,6 +28,29 @@ describe('claudeMdTemplate', () => {
     expect(t.startsWith(VIBEMATE_SECTION_BEGIN)).toBe(true);
     expect(t.endsWith(VIBEMATE_SECTION_END)).toBe(true);
     expect(t).toContain('**Project ID**: `myproj`');
+  });
+
+  it('is stamped with the current VIBEMATE_TEMPLATE_VERSION', () => {
+    // The number lives in two places (the constant + the rendered comment).
+    // Asserting both prevents an accidental skew where the body says one
+    // vintage and the constant says another — that would make
+    // `migrateClaudeMd` think it's up-to-date when it isn't.
+    expect(VIBEMATE_TEMPLATE_VERSION).toBe(3);
+    expect(claudeMdTemplate('p')).toContain(
+      `<!-- vibemate-template-version: ${VIBEMATE_TEMPLATE_VERSION} -->`,
+    );
+  });
+
+  it('includes the v3 spec_md workflow guidance (ADR-0017)', () => {
+    // The whole point of Sprint 17: every freshly-rendered template must
+    // tell Claude Code to consult spec_md before working on a feature.
+    // These exact strings are the ones the model is steered by, so we pin
+    // them down to catch accidental rewording during future edits.
+    const t = claudeMdTemplate('myproj');
+    expect(t).toContain('Feature 작업 시작 시');
+    expect(t).toContain('`pm_set_active_feature`');
+    expect(t).toContain('`spec_md`');
+    expect(t).toContain('범위 / 비범위 / 의존');
   });
 });
 
@@ -171,6 +195,50 @@ describe('migrateClaudeMd', () => {
   it('embeds the template version meta-line so future migrations can detect vintage', () => {
     const target = path.join(tmpDir, 'CLAUDE.md');
     const r = migrateClaudeMd(target, { projectId: 'p8' });
-    expect(r.result).toContain('<!-- vibemate-template-version: 2 -->');
+    // Bumped 2→3 in Sprint 17 (ADR-0017) when spec_md workflow was added.
+    expect(r.result).toContain('<!-- vibemate-template-version: 3 -->');
+  });
+
+  it('migrates a v2 paired section to v3 in place, preserving prefix/suffix and Project ID', () => {
+    // Synthesise a realistic vintage-v2 CLAUDE.md: same section markers we
+    // ship today (they're stable identifiers — `VIBEMATE_SECTION_BEGIN`
+    // intentionally still says `:v2` per the comment in domain.ts), with the
+    // old `template-version: 2` stamp inside. Prefix/suffix simulate the
+    // typical "user added some prose around the section" shape.
+    const v2Body = [
+      VIBEMATE_SECTION_BEGIN,
+      '<!-- vibemate-template-version: 2 -->',
+      '',
+      '## 이 프로젝트는 Vibemate가 활성화되어 있습니다',
+      '',
+      '**Project ID**: `vintage-v2`',
+      '',
+      '세션 시작 시:',
+      '1. `pm_session_start` 호출',
+      '',
+      VIBEMATE_SECTION_END,
+    ].join('\n');
+    const before = '# My Doc\n\nIntro paragraph.\n\n';
+    const after = '\n\n## Notes the user wrote after the section\n\nKeep me.\n';
+    const target = file('CLAUDE.md', `${before}${v2Body}${after}`);
+
+    const r = migrateClaudeMd(target, { projectId: 'caller-ignored' });
+
+    expect(r.changed).toBe(true);
+    expect(r.detected).toBe('paired');
+    // Version stamp swapped.
+    expect(r.result).not.toContain('vibemate-template-version: 2');
+    expect(r.result).toContain('vibemate-template-version: 3');
+    // v3 workflow lines spliced in.
+    expect(r.result).toContain('Feature 작업 시작 시');
+    expect(r.result).toContain('`spec_md`');
+    // User-edited Project ID preserved (caller's id is NOT injected).
+    expect(r.result).toContain('**Project ID**: `vintage-v2`');
+    expect(r.result).not.toContain('caller-ignored');
+    // Suffix kept — this is the migration guarantee for paired markers.
+    expect(r.result).toContain('## Notes the user wrote after the section');
+    expect(r.result).toContain('Keep me.');
+    // Prefix kept.
+    expect(r.result).toContain('Intro paragraph.');
   });
 });

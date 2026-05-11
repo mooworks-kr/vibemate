@@ -441,9 +441,40 @@ export function getContext(
   };
 }
 
-export function setActiveFeature(sessionId: string, featureId: string): void {
+/**
+ * Re-point an in-flight session at a different feature.
+ *
+ * Returns the FeatureContext (id/name/goal/status/progress/next_task) plus the
+ * feature's spec_md so the caller — typically Claude Code via
+ * `pm_set_active_feature` — has the same "what should I work on next" payload
+ * it would have gotten from `pm_get_context({feature_id})`. Added in Sprint 17
+ * (ADR-0017) to close the gap where switching features mid-session silently
+ * dropped the spec_md hand-off.
+ *
+ * Validation: both session and feature must exist. Previously this was a
+ * silent UPDATE with no row-count check, so a typo in either id would
+ * succeed-on-paper but leave the session pinned to whatever it was before.
+ */
+export function setActiveFeature(
+  sessionId: string,
+  featureId: string,
+): { ok: true; feature: FeatureContext; spec_md: string | null } {
   const db = getDb();
+  const session = db
+    .prepare('SELECT id FROM sessions WHERE id = ?')
+    .get(sessionId) as { id: string } | undefined;
+  if (!session) throw new Error(`Session not found: ${sessionId}`);
+
+  const feature = getFeature(featureId);
+  if (!feature) throw new Error(`Feature not found: ${featureId}`);
+
   db.prepare('UPDATE sessions SET feature_id = ? WHERE id = ?').run(featureId, sessionId);
+
+  return {
+    ok: true,
+    feature: featureToContext(feature),
+    spec_md: feature.spec_md ?? null,
+  };
 }
 
 export function endSession(args: {
@@ -1185,9 +1216,18 @@ export type {
 //     `testft → vibemate` rename survive.
 // ============================================================
 
+// NB: the section BEGIN marker keeps the `:v2` suffix on purpose. It's a
+// section *identifier* (used by `migrateClaudeMd` to locate the block), not a
+// content-version stamp — bumping it to `:v3` would make the migrator fail to
+// find existing v2 sections and silently fall through to "no marker → append",
+// which loses user content after the block. Content version is tracked
+// separately by the inline `<!-- vibemate-template-version: N -->` line below.
 export const VIBEMATE_SECTION_BEGIN = '<!-- vibemate-section:v2 -->';
 export const VIBEMATE_SECTION_END = '<!-- /vibemate-section -->';
-export const VIBEMATE_TEMPLATE_VERSION = 2;
+// Bumped 2 → 3 in Sprint 17 (ADR-0017) when the spec_md hand-off workflow
+// was added to the template body. Existing v2 sections migrate cleanly
+// because the section markers are unchanged.
+export const VIBEMATE_TEMPLATE_VERSION = 3;
 // Legacy single-line marker emitted by Sprint ≤8 templates. Single-shot,
 // no closing marker. Detected for backward-compat; first migration pass
 // rewrites these to the v2 pair.
@@ -1216,6 +1256,13 @@ export function claudeMdTemplate(projectId: string): string {
 세션 시작 시:
 1. \`pm_session_start\` 호출 → session_id 저장
 2. \`pm_get_context\` 호출 → 진행 상태 / 최근 결정 / 다음 태스크 확인
+3. 응답의 \`spec_md\` 가 있으면 **작업 시작 전 반드시 읽기** — 범위 / 비범위 / 의존 / 결정 항목 확인
+
+Feature 작업 시작 시 (다른 기능으로 전환할 때 포함):
+1. \`pm_set_active_feature\` 호출 → 응답의 \`spec_md\` / \`feature.goal\` / \`feature.next_task\` 확인
+2. 또는 \`pm_get_context(feature_id=X)\` 로 명시 조회
+3. **\`spec_md\` 의 "범위 / 비범위 / 의존" 섹션을 작업 결정 전 검토**
+4. 검토 중 새로 정한 정책은 \`pm_log_decision\` 으로 ADR 기록
 
 세션 중 의미있는 결정이 있으면:
 - \`pm_log_decision\` 으로 ADR 기록 제안 (사용자 confirm 후 호출)

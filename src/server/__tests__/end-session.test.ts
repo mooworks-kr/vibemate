@@ -60,3 +60,59 @@ describe('endSession', () => {
 
 // (Removed in ADR-0016: describe blocks for getFileContent / saveFileExplanation /
 // clearFileExplanation — 13 tests. Code Map / AI file-explanation workflow retired.)
+
+describe('setActiveFeature', () => {
+  it('returns FeatureContext + spec_md on success and re-points the session', () => {
+    const project = domain.createProject({ name: 'P', rootPath: t.dir });
+    const f = domain.createFeature({
+      projectId: project.id,
+      name: '인증 모듈',
+      goal: '로그인/회원가입 흐름 정리',
+      spec_md: '## 범위\n- email/pw 로그인\n## 비범위\n- OAuth',
+    });
+    const startCtx = domain.startSession({ projectId: project.id });
+    const sessionId = startCtx.session_id;
+
+    const out = domain.setActiveFeature(sessionId, f.id);
+
+    expect(out.ok).toBe(true);
+    expect(out.feature.id).toBe(f.id);
+    expect(out.feature.name).toBe('인증 모듈');
+    expect(out.feature.goal).toBe('로그인/회원가입 흐름 정리');
+    // FeatureContext exposes status/progress/next_task — covered by
+    // featureToContext; we just check the spec_md hand-off here.
+    expect(out.spec_md).toContain('## 범위');
+    expect(out.spec_md).toContain('## 비범위');
+
+    // Session row actually re-pointed.
+    const row = getDb()
+      .prepare('SELECT feature_id FROM sessions WHERE id = ?')
+      .get(sessionId) as { feature_id: string };
+    expect(row.feature_id).toBe(f.id);
+  });
+
+  it('returns spec_md=null for a feature with no spec written yet', () => {
+    const project = domain.createProject({ name: 'P', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: project.id, name: '백오피스' });
+    const startCtx = domain.startSession({ projectId: project.id });
+
+    const out = domain.setActiveFeature(startCtx.session_id, f.id);
+    expect(out.spec_md).toBeNull();
+  });
+
+  it('throws when the feature_id does not exist', () => {
+    const project = domain.createProject({ name: 'P', rootPath: t.dir });
+    const startCtx = domain.startSession({ projectId: project.id });
+    expect(() =>
+      domain.setActiveFeature(startCtx.session_id, 'no-such-feature'),
+    ).toThrow(/Feature not found/);
+  });
+
+  it('throws when the session_id does not exist (typo guard)', () => {
+    const project = domain.createProject({ name: 'P', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: project.id, name: 'X' });
+    expect(() => domain.setActiveFeature('no-such-session', f.id)).toThrow(
+      /Session not found/,
+    );
+  });
+});

@@ -69,6 +69,7 @@ export interface EnrichedFeature {
   id: string;
   name: string;
   goal: string | null;
+  spec_md: string | null;
   status: FeatureStatus;
   progress: number;
   tasks: TaskRow[];
