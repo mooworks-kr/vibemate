@@ -37,6 +37,12 @@ import type {
   TaskRow,
   WorkspaceFeatureRow,
 } from './types';
+import { readPersistedFlag, writePersistedFlag } from './persist.js';
+
+// Sprint 18 (y8pr): localStorage key for the features-sidebar
+// "hide completed" toggle. New keys use dot.camel namespacing — the older
+// `vibemate_theme` key keeps its underscore form for backward compat.
+const HIDE_COMPLETED_FEATURES_KEY = 'vibemate.hideCompletedFeatures';
 
 // In-memory cache populated by API calls. Keyed by project id.
 const DATA: DataCache = {
@@ -73,6 +79,9 @@ const state: AppState = {
   workspaceFeatures: null,
   workspaceLoading: false,
   workspaceError: null,
+
+  // Features sidebar — Sprint 18 (y8pr)
+  hideCompletedFeatures: readPersistedFlag(HIDE_COMPLETED_FEATURES_KEY, true),
 };
 
 // (Removed in ADR-0016: FILE_DETAIL cache + fdKey helper. Code Map retired.)
@@ -974,12 +983,59 @@ function renderSidebar() {
       { key: 'done', label: '완료' },
     ];
 
+    // Sprint 18 (y8pr): the "완료" group is collapsible behind a single hint
+    // row. Two visual states depending on `state.hideCompletedFeatures`:
+    //   * true  + done > 0 → "완료 N개 (숨김 · 보이기)" hint only (no items)
+    //   * false + done > 0 → full group, heading carries a "숨기기" affordance
+    //   * done = 0         → nothing rendered (same as before)
+    const toggleHideCompleted = (): void => {
+      state.hideCompletedFeatures = !state.hideCompletedFeatures;
+      writePersistedFlag(HIDE_COMPLETED_FEATURES_KEY, state.hideCompletedFeatures);
+      render();
+    };
+
     order.forEach(({ key, label }) => {
       if (grouped[key].length === 0) return;
+
+      // Collapsed-hint branch for the done group.
+      if (key === 'done' && state.hideCompletedFeatures) {
+        const hint = el('div', {
+          class: 'sb-heading sb-collapsed-hint',
+          onClick: toggleHideCompleted,
+          title: '완료된 기능 보이기',
+        });
+        hint.style.cssText = [
+          'margin-top: 10px',
+          'font-size: 10.5px',
+          'cursor: pointer',
+          'color: var(--text-3)',
+        ].join('; ');
+        hint.appendChild(el('span', { text: `완료 ${grouped[key].length}개 (숨김 · 보이기)` }));
+        sec.appendChild(hint);
+        return; // skip rendering the items themselves
+      }
+
       const subHeading = el('div', { class: 'sb-heading' });
       subHeading.style.marginTop = '10px';
       subHeading.style.fontSize = '10.5px';
       subHeading.appendChild(el('span', { text: label + ' · ' + grouped[key].length }));
+      // Inverse affordance: when done is currently expanded, offer a quick
+      // "숨기기" link inside its heading so the user can collapse it back
+      // without hunting for a setting elsewhere.
+      if (key === 'done') {
+        const hideBtn = el('span', {
+          text: '숨기기',
+          title: '완료된 기능 숨기기',
+          onClick: (e: MouseEvent) => { e.stopPropagation(); toggleHideCompleted(); },
+        });
+        hideBtn.style.cssText = [
+          'margin-left: 6px',
+          'cursor: pointer',
+          'color: var(--text-3)',
+          'text-decoration: underline',
+        ].join('; ');
+        subHeading.appendChild(hideBtn);
+      }
       sec.appendChild(subHeading);
 
       grouped[key].forEach((f) => {

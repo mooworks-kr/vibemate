@@ -136,8 +136,8 @@ HOME=/tmp/vibemate-test node dist/server/cli.js stop
 - 양방향 spec.md 파일 동기화 미구현.
 - **AI 파일 설명 / Code Map은 Sprint 16(ADR-0016)에서 제거됨.** `sessions.files`와 `feature_files` 매핑은 유지 (Sprint 4-5의 핵심).
 
-<!-- vibemate-section:v2 -->
-<!-- vibemate-template-version: 3 -->
+
+<!-- Vibemate section — added by 'pm init'. Edit freely. -->
 
 ## 이 프로젝트는 Vibemate가 활성화되어 있습니다
 
@@ -146,13 +146,6 @@ HOME=/tmp/vibemate-test node dist/server/cli.js stop
 세션 시작 시:
 1. `pm_session_start` 호출 → session_id 저장
 2. `pm_get_context` 호출 → 진행 상태 / 최근 결정 / 다음 태스크 확인
-3. 응답의 `spec_md` 가 있으면 **작업 시작 전 반드시 읽기** — 범위 / 비범위 / 의존 / 결정 항목 확인
-
-Feature 작업 시작 시 (다른 기능으로 전환할 때 포함):
-1. `pm_set_active_feature` 호출 → 응답의 `spec_md` / `feature.goal` / `feature.next_task` 확인
-2. 또는 `pm_get_context(feature_id=X)` 로 명시 조회
-3. **`spec_md` 의 "범위 / 비범위 / 의존" 섹션을 작업 결정 전 검토**
-4. 검토 중 새로 정한 정책은 `pm_log_decision` 으로 ADR 기록
 
 세션 중 의미있는 결정이 있으면:
 - `pm_log_decision` 으로 ADR 기록 제안 (사용자 confirm 후 호출)
@@ -165,5 +158,3 @@ Feature 작업 시작 시 (다른 기능으로 전환할 때 포함):
 - 태스크 시작: `pm_update_task` (status=in_progress)
 - 태스크 완료: `pm_update_task` (status=done)
 - 새 기능: `pm_create_feature`
-
-<!-- /vibemate-section -->

@@ -391,11 +391,31 @@ export function getContext(
   if (!project) throw new Error(`Project not found: ${projectId}`);
 
   const features = listFeatures(projectId);
+  // Sprint 19 (iljn): `active_features` now surfaces `todo` too, not just
+  // `in_progress`. Rationale: most users keep features in `todo` until they
+  // pick one up — gating the context on `in_progress` made todo-heavy
+  // projects (arkham_like, streamshub) look empty at session start. We sort
+  // so `in_progress` always comes first; within a status, higher priority
+  // wins; ties broken by most-recently-touched. The auto-picked
+  // `active_feature` (when no explicit feature_id is passed) falls out of
+  // the same ordering — `activeFeatures[0]` naturally prefers in_progress.
+  const STATUS_PRIORITY: Record<string, number> = {
+    in_progress: 0, todo: 1, done: 2, archived: 3,
+  };
   const activeFeatures = features
-    .filter((f) => f.status === 'in_progress')
+    .filter((f) => f.status === 'in_progress' || f.status === 'todo')
+    .sort((a, b) => {
+      const sa = STATUS_PRIORITY[a.status] ?? 99;
+      const sb = STATUS_PRIORITY[b.status] ?? 99;
+      if (sa !== sb) return sa - sb;
+      if ((a.priority ?? 0) !== (b.priority ?? 0)) {
+        return (b.priority ?? 0) - (a.priority ?? 0);
+      }
+      return b.updated_at - a.updated_at;
+    })
     .map((f) => featureToContext(f));
 
-  // Pick the active feature: explicit > most-recently-touched in_progress > first in_progress
+  // Pick the active feature: explicit > first of the sorted activeFeatures.
   let activeFeature: FeatureContext | null = null;
   let activeFeatureSpec: string | null | undefined;
   if (featureId) {

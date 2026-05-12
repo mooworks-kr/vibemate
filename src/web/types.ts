@@ -219,6 +219,14 @@ export interface AppState {
   workspaceLoading: boolean;
   /** Last fetch error message; null when last load succeeded. */
   workspaceError: string | null;
+
+  // Features sidebar -----------------------------------------------------
+  /** Sprint 18 (y8pr): hide the "완료" group from the features sidebar.
+   *  `archived` is always hidden (Sprint 5 policy); this flag covers `done`.
+   *  Persisted to localStorage as `vibemate.hideCompletedFeatures`. Default
+   *  `true` — a long backlog of completed features clutters the sidebar
+   *  more than it informs. */
+  hideCompletedFeatures: boolean;
 }
 
 // ============================================================
