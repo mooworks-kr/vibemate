@@ -15,3 +15,6 @@ dist/
 
 # test coverage
 coverage/
+
+# migrate-claude-md backups
+*.bak
