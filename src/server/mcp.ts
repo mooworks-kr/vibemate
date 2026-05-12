@@ -92,6 +92,21 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     },
   );
 
+  // Sprint 20 (u3zu): same payload as `GET /api/projects/:id/overview`.
+  // Sibling to pm_get_context: getContext is the *session-time* view
+  // (active feature + spec_md for Claude Code to read), Overview is the
+  // *cross-feature* view (status / recent activity, for human review).
+  server.tool(
+    'pm_get_project_overview',
+    {
+      project_id: z.string().optional(),
+    },
+    async ({ project_id }) => {
+      const pid = resolveProject(project_id);
+      return ok(domain.getProjectOverview(pid));
+    },
+  );
+
   // ----- Features -----
 
   server.tool(

@@ -9,6 +9,7 @@ import type {
   FeatureFile,
   FeatureStatus,
   Project,
+  ProjectOverview,
   SearchKind,
   SearchResult,
   Task,
@@ -49,6 +50,7 @@ const DATA: DataCache = {
   projects: [],
   features: {},
   decisions: {},
+  overviews: {},
 };
 
 
@@ -220,6 +222,7 @@ async function createFeatureUI(name: string): Promise<void> {
   DATA.features[projectId] = [...(DATA.features[projectId] || []), enriched];
   state.currentFeature = f.id;
   state.addingFeature = false;
+  invalidateOverview(projectId);
   render();
 }
 
@@ -282,6 +285,9 @@ async function toggleTaskUI(taskId: number, currentStatus: TaskStatus): Promise<
       break;
     }
   }
+  // Sprint 20 (u3zu): overview's next_task depends on task status, so a
+  // toggle must invalidate the cached overview for this project.
+  invalidateOverview(state.currentProject);
   render();
 }
 
@@ -368,6 +374,8 @@ async function createDecisionUI(payload: {
   };
   DATA.decisions[state.currentProject!] = [enriched, ...(DATA.decisions[state.currentProject!] || [])];
   state.addingDecision = false;
+  // Sprint 20 (u3zu): overview's recent_decisions list reflects this new row.
+  invalidateOverview(state.currentProject);
   render();
 }
 
@@ -395,6 +403,9 @@ async function updateFeatureUI(
     };
   }
   state.editingFeatureName = null;
+  // Sprint 20 (u3zu): a feature status change (todo→in_progress→done) reorders
+  // the overview's active_features and can flip the health label.
+  invalidateOverview(state.currentProject);
   render();
 }
 
@@ -518,6 +529,19 @@ async function navigateToFeature(projectId: string, featureId: string): Promise<
   await setActiveProject(projectId);
 }
 
+/**
+ * Sprint 20 (u3zu): land on a project's Overview tab.
+ *
+ * Used as the "go look at this project" gesture from workspace cards
+ * (project-mark / project-name click) — distinct from `navigateToFeature`
+ * which drills into a specific feature. The renderOverview() side handles
+ * the lazy /overview fetch on first view.
+ */
+async function navigateToOverview(projectId: string): Promise<void> {
+  state.currentTab = 'overview';
+  await setActiveProject(projectId);
+}
+
 async function loadProjectDetail(projectId: string): Promise<void> {
   if (state.loadedProjects.has(projectId)) return;
 
@@ -581,9 +605,39 @@ async function loadProjectDetail(projectId: string): Promise<void> {
   state.loadedProjects.add(projectId);
 }
 
+// Sprint 20 (u3zu): fetch + cache the project overview payload. Separate
+// from loadProjectDetail because the overview is a derived aggregate the
+// server computes — re-fetching after any feature/task/decision mutation
+// is cheaper than mirroring the derivation client-side.
+async function loadProjectOverview(projectId: string): Promise<ProjectOverview> {
+  const ov = await fetchJSON<ProjectOverview>(`/api/projects/${projectId}/overview`);
+  DATA.overviews = DATA.overviews ?? {};
+  DATA.overviews[projectId] = ov;
+  return ov;
+}
+
+/**
+ * Drop the cached overview for `projectId` so the next render refetches.
+ * Called from mutation paths (task toggle, feature add, decision log) — the
+ * overview's status / next_task / recent_* fields depend on those rows.
+ *
+ * MVP strategy: aggressive invalidation, no diff. The endpoint is cheap.
+ */
+function invalidateOverview(projectId: string | null): void {
+  if (!projectId) return;
+  if (DATA.overviews) delete DATA.overviews[projectId];
+}
+
 async function setActiveProject(projectId: string): Promise<void> {
   state.currentProject = projectId;
   state.error = null;
+  // ADR-0018: when switching into a project from the cross-project workspace
+  // view, drop the user on the project's Overview first — that's the "what
+  // is this project doing?" first screen. Other tabs (features/decisions/
+  // sessions) carry over so deep-link / drill-down flows stay intact.
+  if (state.currentTab === 'workspace') {
+    state.currentTab = 'overview';
+  }
   if (!state.loadedProjects.has(projectId)) {
     state.loading = true;
     render();
@@ -910,7 +964,9 @@ document.addEventListener('click', () => $('#projectDropdown')!.classList.remove
 // =================================================
 const TABS: ReadonlyArray<{ id: Tab; label: string }> = [
   { id: 'workspace', label: '📋 내 작업' },
-  { id: 'dashboard', label: '대시보드' },
+  // Sprint 20 (u3zu): 'dashboard' → 'overview'. Single project-detail
+  // first screen; consumes /api/projects/:id/overview directly.
+  { id: 'overview', label: '오버뷰' },
   { id: 'features', label: '기능' },
   { id: 'decisions', label: '결정 기록' },
   { id: 'sessions', label: '세션 로그' },
@@ -1056,110 +1112,193 @@ function renderSidebar() {
 // (Removed in ADR-0016: renderFileTree. File-tree sidebar retired.)
 
 // =================================================
-// Main: Dashboard
+// Main: Overview (Sprint 20, u3zu — replaces the old dashboard)
 // =================================================
-function renderDashboard(): void {
+
+// Human-readable health label + pill class. Kept here so the renderer is
+// the only place that needs to think about strings — domain side just
+// emits the discriminator.
+const HEALTH_LABEL: Record<ProjectOverview['status'], string> = {
+  active:    '진행 중',
+  todo_only: '시작 대기',
+  stale:     '정체',
+  empty:     '비어 있음',
+};
+const HEALTH_PILL_CLASS: Record<ProjectOverview['status'], string> = {
+  active:    'in-progress',
+  todo_only: 'todo',
+  stale:     'archived',
+  empty:     'archived',
+};
+
+function renderOverview(): void {
   const main = $('#main')!;
   main.innerHTML = '';
-  const p = getProject()!;
-  const stats = statsFor(state.currentProject);
-  const fs = getFeatures();
-  const inProgFeature = fs.find((f) => f.status === 'in_progress');
+  const projectId = state.currentProject;
+  if (!projectId) {
+    main.appendChild(el('div', { class: 'empty-state' }, [
+      el('div', { class: 'empty-state-title', text: '프로젝트를 선택해주세요' }),
+    ]));
+    return;
+  }
 
-  const header = el('div', { class: 'page-header' }, [
-    el('div', { class: 'breadcrumb', text: p.tagline ?? '' }),
-    el('h1', { class: 'page-title', text: p.name }),
-    el('p', { class: 'page-tagline', text: p.goal ?? '' }),
-  ]);
+  const ov = (DATA.overviews ?? {})[projectId];
+
+  // Lazy fetch on first view. Triggers a render() once the response lands —
+  // the page paints with a placeholder until then to avoid layout jank.
+  if (!ov) {
+    loadProjectOverview(projectId).then(() => render()).catch((e) => {
+      state.error = e instanceof Error ? e.message : '오버뷰 로드 실패';
+      render();
+    });
+    main.appendChild(el('div', { class: 'page-header' }, [
+      el('h1', { class: 'page-title', text: '오버뷰 불러오는 중…' }),
+    ]));
+    return;
+  }
+
+  // Header — project name + goal + health pill on the right.
+  const header = el('div', { class: 'page-header' });
+  if (ov.project.tagline) {
+    header.appendChild(el('div', { class: 'breadcrumb', text: ov.project.tagline }));
+  }
+  const titleRow = el('div');
+  titleRow.style.cssText = 'display: flex; align-items: center; gap: 12px;';
+  titleRow.appendChild(el('h1', { class: 'page-title', text: ov.project.name }));
+  titleRow.appendChild(pillEl(HEALTH_PILL_CLASS[ov.status], HEALTH_LABEL[ov.status]));
+  header.appendChild(titleRow);
+  if (ov.project.goal) {
+    header.appendChild(el('p', { class: 'page-tagline', text: ov.project.goal }));
+  }
   main.appendChild(header);
 
+  // Stat grid — driven by server `stats`. No mock trend strings.
   const grid = el('div', { class: 'stat-grid' });
-  const stats_ = [
-    { label: '진행 중인 기능', value: stats.inProg, trend: '/ ' + fs.length + ' 전체' },
-    { label: '미완료 태스크', value: stats.todo, trend: stats.done + '개 완료' },
-    { label: '이번 주 세션', value: stats.sessions, trend: '+3 vs 지난주', up: true },
-    { label: '결정 기록', value: stats.decisions, trend: '최근 ADR-' + (1000 + stats.decisions).toString().slice(1) }
-  ];
-  stats_.forEach((s) => {
+  const lastActivityText = ov.last_activity_at
+    ? '최근 활동 ' + (relTime(ov.last_activity_at) ?? '')
+    : '활동 기록 없음';
+  ([
+    { label: '진행 중인 기능', value: ov.project.stats.active_features, trend: '/ ' + ov.project.stats.total_features + ' 전체' },
+    { label: '미완료 태스크', value: ov.project.stats.todo_tasks, trend: ov.project.stats.done_tasks + '개 완료' },
+    { label: '이번 주 세션', value: ov.project.stats.sessions_this_week, trend: lastActivityText },
+    { label: '결정 기록', value: ov.project.stats.decisions, trend: '' },
+  ]).forEach((s) => {
     grid.appendChild(el('div', { class: 'stat-card' }, [
       el('div', { class: 'stat-label', text: s.label }),
       el('div', { class: 'stat-value', text: String(s.value) }),
-      el('div', { class: 'stat-trend' + (s.up ? ' up' : ''), text: s.trend }),
+      el('div', { class: 'stat-trend', text: s.trend }),
     ]));
   });
   main.appendChild(grid);
 
-  if (inProgFeature) {
-    main.appendChild(el('div', { class: 'section-title' }, [
-      el('span', { text: '지금 작업 중' }),
-      el('a', { class: 'section-link', text: '전체 기능 →', onClick: () => { state.currentTab = 'features'; render(); } })
+  // Empty-state guidance — Sprint 14/15 onboarding pattern.
+  if (ov.status === 'empty') {
+    main.appendChild(el('div', { class: 'empty-state' }, [
+      el('div', { class: 'empty-state-title', text: '아직 기능이 없습니다' }),
+      el('div', {
+        class: 'empty-state-text',
+        text:
+          'CLI 에서 시작하기:'
+          + '\n  • `pm import-history` — git history 로 sessions 가져오기'
+          + '\n  • `pm extract-features` — commit prefix 로 feature 추출'
+          + '\n또는 사이드바에서 기능을 직접 추가하세요.',
+      }),
     ]));
-    const card = el('div', { class: 'now-card', onClick: () => { state.currentTab = 'features'; state.currentFeature = inProgFeature.id; render(); } });
+    return;
+  }
+
+  // Next action — single most-likely "what should I do?" prompt.
+  if (ov.next_task) {
+    const next = ov.next_task;
+    const card = el('div', {
+      class: 'now-card',
+      onClick: () => { state.currentTab = 'features'; state.currentFeature = next.feature_id; render(); },
+    });
     card.style.cursor = 'pointer';
     card.appendChild(el('div', { class: 'now-header' }, [
       el('div', { class: 'now-meta' }, [
-        el('div', { class: 'now-eyebrow', text: 'IN PROGRESS' }),
-        el('h2', { class: 'now-title', text: inProgFeature.name })
+        el('div', { class: 'now-eyebrow', text: '다음 액션' }),
+        el('h2', { class: 'now-title', text: next.task_name }),
       ]),
-      pillEl(inProgFeature.status, '진행 중')
     ]));
-    card.appendChild(el('p', { class: 'now-goal', text: inProgFeature.goal ?? '' }));
-    const progRow = el('div', { class: 'progress-row' }, [
-      el('div', { class: 'progress-bar' }, [el('div', { class: 'progress-fill', style: 'width:' + inProgFeature.progress + '%' })]),
-      el('div', { class: 'progress-text', text: inProgFeature.progress + '%' })
-    ]);
-    card.appendChild(progRow);
-
-    const nextTask = inProgFeature.tasks.find(t => t.status === 'in_progress') || inProgFeature.tasks.find(t => t.status === 'todo');
-    if (nextTask) {
-      const ntDiv = el('div', { class: 'next-task' }, [
-        el('span', { class: 'next-task-label', text: '다음' }),
-        el('span', { text: nextTask.name })
-      ]);
-      card.appendChild(ntDiv);
-    }
+    card.appendChild(el('p', { class: 'now-goal', text: next.feature_name }));
     main.appendChild(card);
   }
 
   const cols = el('div', { class: 'two-col' });
 
+  // Left: active features (in_progress + todo, Sprint 19 sort).
   const left = el('div', {});
-  left.appendChild(el('div', { class: 'section-title', text: '모든 기능' }));
+  left.appendChild(el('div', { class: 'section-title' }, [
+    el('span', { text: '활성 기능 · ' + ov.active_features.length }),
+    el('a', { class: 'section-link', text: '전체 기능 →', onClick: () => { state.currentTab = 'features'; render(); } }),
+  ]));
   const flist = el('div', { class: 'feature-card-list' });
-  fs.forEach(f => {
-    const fcard = el('div', { class: 'feature-card', onClick: () => { state.currentTab = 'features'; state.currentFeature = f.id; render(); } });
-    fcard.appendChild(el('div', { class: 'feature-card-header' }, [
-      el('span', { class: 'sb-status-dot ' + f.status.replace('_', '-') }),
-      el('span', { class: 'feature-card-name', text: f.name }),
-      pillEl(f.status, statusLabel(f.status))
-    ]));
-    fcard.appendChild(el('div', { class: 'feature-card-meta' }, [
-      el('div', { class: 'feature-card-progress' }, [
-        el('div', { class: 'progress-bar' }, [el('div', { class: 'progress-fill', style: 'width:' + f.progress + '%' })]),
-        el('span', { class: 'feature-card-progress-text', text: f.progress + '%' })
-      ])
-    ]));
-    flist.appendChild(fcard);
-  });
+  if (ov.active_features.length === 0) {
+    flist.appendChild(el('div', { class: 'empty-state-text', text: '진행 중이거나 todo 인 기능이 없습니다.', style: 'padding: 8px 0; color: var(--text-3);' }));
+  } else {
+    ov.active_features.forEach((f) => {
+      const fcard = el('div', {
+        class: 'feature-card',
+        onClick: () => { state.currentTab = 'features'; state.currentFeature = f.id; render(); },
+      });
+      fcard.appendChild(el('div', { class: 'feature-card-header' }, [
+        el('span', { class: 'sb-status-dot ' + f.status.replace('_', '-') }),
+        el('span', { class: 'feature-card-name', text: f.name }),
+        pillEl(f.status, statusLabel(f.status)),
+      ]));
+      fcard.appendChild(el('div', { class: 'feature-card-meta' }, [
+        el('div', { class: 'feature-card-progress' }, [
+          el('div', { class: 'progress-bar' }, [el('div', { class: 'progress-fill', style: 'width:' + f.progress + '%' })]),
+          el('span', { class: 'feature-card-progress-text', text: f.progress + '%' }),
+        ]),
+      ]));
+      flist.appendChild(fcard);
+    });
+  }
   left.appendChild(flist);
 
+  // Right: stacked recent sessions + recent decisions.
   const right = el('div', {});
   right.appendChild(el('div', { class: 'section-title' }, [
-    el('span', { text: '최근 활동' }),
-    el('a', { class: 'section-link', text: '세션 전체 →', onClick: () => { state.currentTab = 'sessions'; render(); } })
+    el('span', { text: '최근 세션' }),
+    el('a', { class: 'section-link', text: '세션 전체 →', onClick: () => { state.currentTab = 'sessions'; render(); } }),
   ]));
-  const acts = getAllSessions().slice(0, 8);
-  const actList = el('div', { class: 'activity-list' });
-  acts.forEach(a => {
-    actList.appendChild(el('div', { class: 'activity-item' }, [
-      el('div', { class: 'activity-time', text: a.time }),
-      el('div', { class: 'activity-content' }, [
-        el('div', { class: 'activity-summary', text: a.summary }),
-        el('span', { class: 'activity-feature', text: a.feature })
-      ])
-    ]));
-  });
-  right.appendChild(actList);
+  const sList = el('div', { class: 'activity-list' });
+  if (ov.recent_sessions.length === 0) {
+    sList.appendChild(el('div', { class: 'empty-state-text', text: '아직 세션 기록이 없습니다.', style: 'padding: 8px 0; color: var(--text-3);' }));
+  } else {
+    ov.recent_sessions.forEach((s) => {
+      sList.appendChild(el('div', { class: 'activity-item' }, [
+        el('div', { class: 'activity-time', text: s.time }),
+        el('div', { class: 'activity-content' }, [
+          el('div', { class: 'activity-summary', text: s.summary }),
+          el('span', { class: 'activity-feature', text: s.feature_name ?? '' }),
+        ]),
+      ]));
+    });
+  }
+  right.appendChild(sList);
+
+  right.appendChild(el('div', { class: 'section-title', style: 'margin-top: 16px;' }, [
+    el('span', { text: '최근 결정' }),
+    el('a', { class: 'section-link', text: '결정 전체 →', onClick: () => { state.currentTab = 'decisions'; render(); } }),
+  ]));
+  const dList = el('div', { class: 'activity-list' });
+  if (ov.recent_decisions.length === 0) {
+    dList.appendChild(el('div', { class: 'empty-state-text', text: '아직 결정 기록이 없습니다.', style: 'padding: 8px 0; color: var(--text-3);' }));
+  } else {
+    ov.recent_decisions.forEach((d) => {
+      dList.appendChild(el('div', { class: 'activity-item' }, [
+        el('div', { class: 'activity-time', text: d.date }),
+        el('div', { class: 'activity-content' }, [
+          el('div', { class: 'activity-summary', text: d.id + ' — ' + d.title }),
+          el('span', { class: 'activity-feature', text: d.feature_name ?? '' }),
+        ]),
+      ]));
+    });
+  }
+  right.appendChild(dList);
 
   cols.appendChild(left);
   cols.appendChild(right);
@@ -1668,15 +1807,24 @@ function renderWorkspace(): void {
       onClick: () => { navigateToFeature(r.project_id, r.feature_id); },
     });
     // Header line: project mark + project label + feature name pill.
+    // Sprint 20 (u3zu): the project mark + name pair is clickable on its own,
+    // navigating to the project's Overview tab (instead of the feature
+    // detail the rest of the card triggers). stopPropagation keeps the two
+    // gestures distinct so users get the "go look at the project" vs
+    // "drill into this feature" affordances side by side.
     const projColor = makeMarkColor(r.project_id);
     const projMark = makeMark(r.project_name);
+    const projGroup = el('span', {
+      onClick: (e: MouseEvent) => { e.stopPropagation(); navigateToOverview(r.project_id); },
+      title: '프로젝트 오버뷰로 이동',
+    });
+    projGroup.style.cssText = 'display: inline-flex; align-items: center; gap: 6px; cursor: pointer;';
+    const m = el('span', { class: 'project-mark', text: projMark });
+    m.style.cssText = `background: ${projColor}; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;`;
+    projGroup.appendChild(m);
+    projGroup.appendChild(el('span', { class: 'feature-card-project', text: r.project_name, style: 'color: var(--text-3); font-size: 11px;' }));
     const headerLine = el('div', { class: 'feature-card-header' }, [
-      (() => {
-        const m = el('span', { class: 'project-mark', text: projMark });
-        m.style.cssText = `background: ${projColor}; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;`;
-        return m;
-      })(),
-      el('span', { class: 'feature-card-project', text: r.project_name, style: 'color: var(--text-3); font-size: 11px;' }),
+      projGroup,
       el('span', { class: 'feature-card-name', text: r.feature_name, style: 'font-weight: 600; flex: 1;' }),
       pillEl(r.status, statusLabel(r.status)),
     ]);
@@ -1730,7 +1878,7 @@ function render() {
   }
 
   if (state.currentTab === 'workspace') renderWorkspace();
-  else if (state.currentTab === 'dashboard') renderDashboard();
+  else if (state.currentTab === 'overview') renderOverview();
   else if (state.currentTab === 'features') renderFeatureDetail();
   // ADR-0016: 'codemap' tab retired.
   else if (state.currentTab === 'decisions') renderDecisions();

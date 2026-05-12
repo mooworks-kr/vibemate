@@ -100,6 +100,19 @@ export function createApp() {
     return c.json({ ...project, stats: domain.getProjectStats(id) });
   });
 
+  // Sprint 20 (u3zu): aggregate "Project Overview" — first screen when
+  // entering a project. See domain.getProjectOverview / types.ProjectOverview.
+  // Follows the same single-endpoint pattern as Sprint 15's workspace view.
+  app.get('/api/projects/:id/overview', (c) => {
+    const id = c.req.param('id');
+    try {
+      return c.json(domain.getProjectOverview(id));
+    } catch (e) {
+      const msg = (e as Error).message ?? 'Project not found';
+      return c.json({ error: msg }, 404);
+    }
+  });
+
   // ----- Features -----
 
   app.get('/api/projects/:id/features', (c) => {

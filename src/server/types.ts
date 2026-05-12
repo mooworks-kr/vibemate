@@ -111,6 +111,70 @@ export interface ProjectStats {
   decisions: number;
 }
 
+// Sprint 20 (u3zu) — ADR-0018. Project Overview tab. Derived from existing
+// project / feature / session / decision data — no new model.
+//
+// Priority tier (best → worst): active > todo_only > stale > empty.
+//
+//   empty:     no features at all (fresh project).
+//   stale:     last session > 14 days ago (or none ever) — the project is
+//              gathering dust. Wins over the positive labels because even
+//              an in_progress feature is misleading when no one's working
+//              on it. Also the bucket for "all features done, no follow-up"
+//              (no actionable work AND not literally fresh).
+//   todo_only: recent activity AND ≥1 todo feature AND 0 in_progress.
+//              Signals "pick something up and start it."
+//   active:    recent activity AND ≥1 in_progress feature. The healthy state.
+export type ProjectHealth = 'active' | 'todo_only' | 'stale' | 'empty';
+
+export interface ProjectOverviewNextTask {
+  feature_id: string;
+  feature_name: string;
+  task_id: number;
+  task_name: string;
+}
+
+export interface ProjectOverviewSession {
+  id: string;
+  /** Pre-formatted relative-time (e.g. "3시간 전"). */
+  time: string;
+  summary: string;
+  feature_name: string | null;
+}
+
+export interface ProjectOverviewDecision {
+  id: string;
+  title: string;
+  /** Pre-formatted relative-time. */
+  date: string;
+  feature_name: string | null;
+}
+
+/**
+ * Server response for `GET /api/projects/:id/overview` (Sprint 20, u3zu).
+ *
+ * Read-only aggregate. Combines `getProject`, `getProjectStats`, the same
+ * `active_features` sort as `getContext` (Sprint 19), plus a derived health
+ * label and a next-task pointer. Client renders the entire shape directly —
+ * no further stitching needed.
+ */
+export interface ProjectOverview {
+  project: Project & { stats: ProjectStats };
+  status: ProjectHealth;
+  /** Most recent `sessions.started_at` for the project, or null when no
+   *  sessions exist. Drives the `stale` health decision client-side too. */
+  last_activity_at: number | null;
+  /** Same ordering rules as `getContext.active_features` — in_progress first,
+   *  then todo; within each, priority DESC then updated_at DESC. */
+  active_features: FeatureContext[];
+  /** First actionable task: prefer an in_progress feature's first
+   *  todo/in_progress task; fall back to the top todo feature's first task.
+   *  null when neither has any tasks. */
+  next_task: ProjectOverviewNextTask | null;
+  recent_sessions: ProjectOverviewSession[];
+  recent_decisions: ProjectOverviewDecision[];
+}
+
 export interface FeatureContext {
   id: string;
   name: string;

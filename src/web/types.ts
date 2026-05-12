@@ -15,12 +15,17 @@ import type {
   Feature,
   FeatureFile,
   FeatureStatus,
+  ProjectOverview,
   ProjectStats,
   Project,
   SearchResult,
   Task,
   TaskStatus,
 } from '../server/types.js';
+
+// Re-export ProjectOverview as the canonical web-side name so import sites
+// don't need to reach into ../server/types directly.
+export type ProjectOverviewResponse = ProjectOverview;
 
 // (Removed in ADR-0016: FileTreeNode + FileDetailResponse + DataCache.fileTree
 // + AppState.currentFile + AppState.linkingFile + AppState.fileDetailLoading.
@@ -94,6 +99,12 @@ export interface DataCache {
   decisions: Record<string, AdrCard[]>;
   /** Raw `/sessions` response, used only by hot-file affordances elsewhere. */
   sessions?: Record<string, RawSessionResponse[]>;
+  /** Sprint 20 (u3zu): cached GET /api/projects/:id/overview response, keyed
+   *  by project id. Populated by `loadProjectOverview()` and invalidated by
+   *  mutations that touch sessions / decisions / feature status. For MVP we
+   *  invalidate aggressively (clear the entry on any feature/task mutation
+   *  in the project) — see `invalidateOverview()` in main.ts. */
+  overviews?: Record<string, ProjectOverview>;
 }
 
 /**
@@ -159,7 +170,11 @@ export interface FeatureDetailResponse extends Feature {
 // App state
 // ============================================================
 
-export type Tab = 'workspace' | 'dashboard' | 'features' | 'decisions' | 'sessions';
+// Sprint 20 (u3zu): 'dashboard' was renamed to 'overview' — the tab now
+// drives renderOverview() and consumes the GET /api/projects/:id/overview
+// payload. Tab union changes are caught by the dispatch switch in render(),
+// so any stale reference would fail typecheck.
+export type Tab = 'workspace' | 'overview' | 'features' | 'decisions' | 'sessions';
 
 /**
  * Mirror of the server's `WorkspaceFeature` row (types.ts on the server).

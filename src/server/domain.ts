@@ -19,6 +19,11 @@ import type {
   FeatureFile,
   FeatureStatus,
   Project,
+  ProjectHealth,
+  ProjectOverview,
+  ProjectOverviewDecision,
+  ProjectOverviewNextTask,
+  ProjectOverviewSession,
   ProjectStats,
   SearchResult,
   Session,
@@ -494,6 +499,149 @@ export function setActiveFeature(
     ok: true,
     feature: featureToContext(feature),
     spec_md: feature.spec_md ?? null,
+  };
+}
+
+// Sprint 20 (u3zu): cutoff for the `stale` health label. A project whose
+// most recent session is older than this gets the "you haven't touched
+// this in a while" treatment. Two weeks balances "I went on vacation" (not
+// stale yet) against "this project is gathering dust" (stale).
+const STALE_AFTER_MS = 14 * 24 * 60 * 60 * 1000;
+
+/**
+ * Build the Project Overview payload — the first screen a user lands on
+ * when entering a project from the workspace tab.
+ *
+ * Pure read-only aggregate over existing tables. No new model. The shape
+ * matches `ProjectOverview` in types.ts; see that file for field-by-field
+ * semantics.
+ *
+ * Throws when `projectId` doesn't exist (matches getContext / setActiveFeature
+ * conventions — silent empties would hide typos in tools / URLs).
+ */
+export function getProjectOverview(projectId: string): ProjectOverview {
+  const project = getProject(projectId);
+  if (!project) throw new Error(`Project not found: ${projectId}`);
+  const stats = getProjectStats(projectId);
+
+  // Active features: same filter + sort rules as Sprint 19 getContext.
+  // Reuse the constant locally so future tweaks to the order stay aligned.
+  const features = listFeatures(projectId);
+  const STATUS_PRIORITY: Record<string, number> = {
+    in_progress: 0, todo: 1, done: 2, archived: 3,
+  };
+  const sortedActive = features
+    .filter((f) => f.status === 'in_progress' || f.status === 'todo')
+    .sort((a, b) => {
+      const sa = STATUS_PRIORITY[a.status] ?? 99;
+      const sb = STATUS_PRIORITY[b.status] ?? 99;
+      if (sa !== sb) return sa - sb;
+      if ((a.priority ?? 0) !== (b.priority ?? 0)) {
+        return (b.priority ?? 0) - (a.priority ?? 0);
+      }
+      return b.updated_at - a.updated_at;
+    });
+  const activeFeatures = sortedActive.map((f) => featureToContext(f));
+
+  // next_task: prefer the auto-picked active_feature's next_task (which
+  // featureToContext already computes — first in_progress / then first todo
+  // task). When the picked feature has no open tasks, fall through to the
+  // next active feature; if none has any task, null.
+  let nextTask: ProjectOverviewNextTask | null = null;
+  for (const fc of activeFeatures) {
+    if (fc.next_task) {
+      nextTask = {
+        feature_id: fc.id,
+        feature_name: fc.name,
+        task_id: fc.next_task.id,
+        task_name: fc.next_task.name,
+      };
+      break;
+    }
+  }
+
+  // last_activity_at: most recent session.started_at across the whole
+  // project. Returns null when the project has no sessions yet (fresh /
+  // imported-history-only flow).
+  const db = getDb();
+  const lastRow = db
+    .prepare('SELECT MAX(started_at) AS last FROM sessions WHERE project_id = ?')
+    .get(projectId) as { last: number | null };
+  const last_activity_at: number | null = lastRow.last ?? null;
+
+  // Health derivation — ADR-0018. Priority tier (best → worst):
+  //   active > todo_only > stale > empty.
+  //
+  // Evaluation order is empty → stale → active → todo_only. `stale` checks
+  // the 14-day cutoff first so a long-untouched project gets the "gathering
+  // dust" treatment even if it has in_progress features. Within the not-stale
+  // bucket, active outranks todo_only. The final `stale` fall-through covers
+  // the "every feature is done, no follow-up planned" corner case (real
+  // example: arkham_like at Sprint 20 dogfood — 27 done, 0 actionable).
+  let status: ProjectHealth;
+  if (features.length === 0) {
+    status = 'empty';
+  } else {
+    const inProgressCount = features.filter((f) => f.status === 'in_progress').length;
+    const todoCount = features.filter((f) => f.status === 'todo').length;
+    const isStale =
+      last_activity_at === null || (now() - last_activity_at) > STALE_AFTER_MS;
+    if (isStale) status = 'stale';
+    else if (inProgressCount >= 1) status = 'active';
+    else if (todoCount >= 1) status = 'todo_only';
+    else status = 'stale';
+  }
+
+  // Recent sessions: 5 most recent (with feature_name pre-joined).
+  const sessionRows = db
+    .prepare(
+      `SELECT s.id, s.started_at, s.summary, f.name AS feature_name
+       FROM sessions s LEFT JOIN features f ON f.id = s.feature_id
+       WHERE s.project_id = ? AND s.summary IS NOT NULL
+       ORDER BY s.started_at DESC LIMIT 5`,
+    )
+    .all(projectId) as Array<{
+      id: string;
+      started_at: number;
+      summary: string;
+      feature_name: string | null;
+    }>;
+  const recent_sessions: ProjectOverviewSession[] = sessionRows.map((r) => ({
+    id: r.id,
+    time: relativeTime(r.started_at),
+    summary: r.summary,
+    feature_name: r.feature_name,
+  }));
+
+  // Recent decisions: 5 most recent, also with feature_name joined.
+  const decisionRows = db
+    .prepare(
+      `SELECT d.id, d.title, d.created_at, f.name AS feature_name
+       FROM decisions d LEFT JOIN features f ON f.id = d.feature_id
+       WHERE d.project_id = ?
+       ORDER BY d.created_at DESC LIMIT 5`,
+    )
+    .all(projectId) as Array<{
+      id: string;
+      title: string;
+      created_at: number;
+      feature_name: string | null;
+    }>;
+  const recent_decisions: ProjectOverviewDecision[] = decisionRows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    date: relativeTime(r.created_at),
+    feature_name: r.feature_name,
+  }));
+
+  return {
+    project: { ...project, stats },
+    status,
+    last_activity_at,
+    active_features: activeFeatures,
+    next_task: nextTask,
+    recent_sessions,
+    recent_decisions,
   };
 }
 
