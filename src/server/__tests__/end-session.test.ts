@@ -142,6 +142,35 @@ describe('getContext', () => {
     // list — the explicit hint only overrides the single auto-pick.
     expect(ctx.active_features.map((f) => f.name)).toContain('Default');
     expect(ctx.active_features.map((f) => f.name)).toContain('Asked');
+    void inProg;
+  });
+
+  // Sprint 22 / ADR-0019 #6: getContext surfaces the active feature's linked
+  // documents alongside spec_md so Claude Code gets PRD / planning context.
+  it('populates active_documents from the active feature\'s linked docs', () => {
+    const project = domain.createProject({ name: 'P', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: project.id, name: 'F', status: 'in_progress' });
+    const d = domain.createDocument({
+      projectId: project.id,
+      kind: 'prd',
+      title: '결제 PRD',
+      content_md: '## 범위\n- 결제 흐름 정리',
+    });
+    domain.linkDocumentToFeature(d.id, f.id);
+
+    const ctx = domain.getContext(project.id);
+    expect(ctx.active_documents).toHaveLength(1);
+    expect(ctx.active_documents[0]!.id).toBe(d.id);
+    expect(ctx.active_documents[0]!.kind).toBe('prd');
+    expect(ctx.active_documents[0]!.excerpt).toContain('## 범위');
+  });
+
+  it('returns empty active_documents when there is no active feature', () => {
+    const project = domain.createProject({ name: 'P', rootPath: t.dir });
+    // No features at all → activeFeature stays null → no docs to surface.
+    const ctx = domain.getContext(project.id);
+    expect(ctx.active_feature).toBeNull();
+    expect(ctx.active_documents).toEqual([]);
   });
 });
 
@@ -198,6 +227,45 @@ describe('setActiveFeature', () => {
     expect(() => domain.setActiveFeature('no-such-session', f.id)).toThrow(
       /Session not found/,
     );
+  });
+
+  // Sprint 22 / ADR-0019 #6: setActiveFeature also ships the active feature's
+  // linked documents (up to 5, body trimmed to 200 chars) so Claude Code can
+  // pick up PRD/planning context in a single MCP round-trip.
+  it('returns active_documents for the picked feature (limit + excerpt)', () => {
+    const project = domain.createProject({ name: 'P', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: project.id, name: 'F' });
+    // 7 docs total: limit is 5, so we expect the 5 most recently linked.
+    const docs = [];
+    for (let i = 0; i < 7; i++) {
+      const d = domain.createDocument({
+        projectId: project.id,
+        kind: 'planning',
+        title: `doc-${i}`,
+        // 250 chars — over the 200-char excerpt budget, so we can check truncation.
+        content_md: 'x'.repeat(250),
+      });
+      docs.push(d);
+      domain.linkDocumentToFeature(d.id, f.id);
+    }
+    const startCtx = domain.startSession({ projectId: project.id });
+    const out = domain.setActiveFeature(startCtx.session_id, f.id);
+
+    expect(out.active_documents).toHaveLength(5);
+    // Excerpt budget enforced: original 250-char body → 200-char + '…'.
+    for (const summary of out.active_documents) {
+      expect(summary.excerpt.length).toBeLessThanOrEqual(201);
+      expect(summary.excerpt.endsWith('…')).toBe(true);
+      expect(summary.kind).toBe('planning');
+    }
+  });
+
+  it('returns empty active_documents when the feature has no linked docs', () => {
+    const project = domain.createProject({ name: 'P', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: project.id, name: 'F' });
+    const startCtx = domain.startSession({ projectId: project.id });
+    const out = domain.setActiveFeature(startCtx.session_id, f.id);
+    expect(out.active_documents).toEqual([]);
   });
 });
 

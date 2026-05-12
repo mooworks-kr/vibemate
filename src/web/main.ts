@@ -5,6 +5,8 @@
 
 import type {
   Decision,
+  Document,
+  DocumentKind,
   Feature,
   FeatureFile,
   FeatureStatus,
@@ -51,6 +53,8 @@ const DATA: DataCache = {
   features: {},
   decisions: {},
   overviews: {},
+  documents: {},
+  documentsByFeature: {},
 };
 
 
@@ -84,6 +88,12 @@ const state: AppState = {
 
   // Features sidebar — Sprint 18 (y8pr)
   hideCompletedFeatures: readPersistedFlag(HIDE_COMPLETED_FEATURES_KEY, true),
+
+  // Docs tab — Sprint 22 (3wtr)
+  currentDocument: null,
+  addingDocument: false,
+  editingDocumentId: null,
+  documentPreview: false,
 };
 
 // (Removed in ADR-0016: FILE_DETAIL cache + fdKey helper. Code Map retired.)
@@ -628,6 +638,520 @@ function invalidateOverview(projectId: string | null): void {
   if (DATA.overviews) delete DATA.overviews[projectId];
 }
 
+// =================================================
+// Documents (Sprint 22, 3wtr — Spec Hub)
+// =================================================
+
+const DOCUMENT_KIND_LABEL: Record<DocumentKind, string> = {
+  prd:          'PRD',
+  planning:     '기획서',
+  architecture: '아키텍처',
+  retro:        '회고',
+  feature_spec: 'Feature Spec',
+  other:        '기타',
+};
+/** Render order for the kind-grouped Docs list. Mirrors the label map order
+ *  except 'other' is last (catch-all sinks to bottom). */
+const DOCUMENT_KIND_ORDER: ReadonlyArray<DocumentKind> = [
+  'prd', 'planning', 'architecture', 'feature_spec', 'retro', 'other',
+];
+
+async function loadDocuments(projectId: string): Promise<Document[]> {
+  const docs = await fetchJSON<Document[]>(`/api/projects/${projectId}/documents`);
+  DATA.documents = DATA.documents ?? {};
+  DATA.documents[projectId] = docs;
+  return docs;
+}
+
+async function loadDocumentsForFeature(featureId: string): Promise<Document[]> {
+  const docs = await fetchJSON<Document[]>(`/api/features/${featureId}/documents`);
+  DATA.documentsByFeature = DATA.documentsByFeature ?? {};
+  DATA.documentsByFeature[featureId] = docs;
+  return docs;
+}
+
+function invalidateDocuments(projectId: string | null): void {
+  if (!projectId) return;
+  if (DATA.documents) delete DATA.documents[projectId];
+  // Overview surfaces "recent docs" implicitly via stats; just drop it too
+  // so the Overview tab can reflect new doc counts on next paint.
+  invalidateOverview(projectId);
+}
+
+async function createDocumentUI(payload: {
+  kind: DocumentKind;
+  title: string;
+  content_md?: string;
+}): Promise<void> {
+  const pid = state.currentProject;
+  if (!pid) return;
+  const doc = await mutate<Document>({
+    method: 'POST',
+    url: `/api/projects/${pid}/documents`,
+    body: payload,
+    successToast: '문서 추가됨',
+  });
+  if (!doc) return;
+  // Prepend so the new row shows up at the top of its kind group.
+  DATA.documents = DATA.documents ?? {};
+  DATA.documents[pid] = [doc, ...(DATA.documents[pid] ?? [])];
+  state.addingDocument = false;
+  state.currentDocument = doc.id;
+  invalidateOverview(pid);
+  render();
+}
+
+async function updateDocumentUI(docId: string, patch: Partial<Pick<Document, 'kind' | 'title' | 'content_md'>>): Promise<void> {
+  const pid = state.currentProject;
+  if (!pid) return;
+  const updated = await mutate<Document>({
+    method: 'PATCH',
+    url: `/api/documents/${docId}`,
+    body: patch,
+  });
+  if (!updated) return;
+  const list = (DATA.documents ?? {})[pid] ?? [];
+  const idx = list.findIndex((d) => d.id === docId);
+  if (idx >= 0) list[idx] = updated;
+  // updated_at moved the row to the front; keep the cached list sorted.
+  list.sort((a, b) => b.updated_at - a.updated_at);
+  state.editingDocumentId = null;
+  state.documentPreview = false;
+  invalidateOverview(pid);
+  render();
+}
+
+async function deleteDocumentUI(docId: string): Promise<void> {
+  const pid = state.currentProject;
+  if (!pid) return;
+  const ok = await mutate({
+    method: 'DELETE',
+    url: `/api/documents/${docId}`,
+    confirm: '이 문서를 삭제할까요?',
+    successToast: '문서 삭제됨',
+  });
+  if (!ok) return;
+  DATA.documents = DATA.documents ?? {};
+  DATA.documents[pid] = (DATA.documents[pid] ?? []).filter((d) => d.id !== docId);
+  if (state.currentDocument === docId) state.currentDocument = null;
+  if (state.editingDocumentId === docId) state.editingDocumentId = null;
+  invalidateOverview(pid);
+  render();
+}
+
+async function linkDocumentToFeatureUI(docId: string, featureId: string): Promise<void> {
+  const ok = await mutate({
+    method: 'POST',
+    url: '/api/document-features',
+    body: { document_id: docId, feature_id: featureId },
+    successToast: '연결됨',
+  });
+  if (!ok) return;
+  // Drop the feature-side cache so next paint refetches with the new row.
+  if (DATA.documentsByFeature) delete DATA.documentsByFeature[featureId];
+  render();
+}
+
+async function unlinkDocumentFromFeatureUI(docId: string, featureId: string): Promise<void> {
+  const ok = await mutate({
+    method: 'DELETE',
+    url: '/api/document-features',
+    body: { document_id: docId, feature_id: featureId },
+    confirm: '이 연결을 해제할까요?',
+    successToast: '연결 해제됨',
+  });
+  if (!ok) return;
+  if (DATA.documentsByFeature) delete DATA.documentsByFeature[featureId];
+  render();
+}
+
+/**
+ * Minimal Markdown → HTML for the preview toggle. Intentionally tiny — no
+ * external library (Sprint 22 design constraint, see #102 inventory). Covers
+ * the formatting we actually use: headings, bullets, numbered lists, inline
+ * `code`, `**bold**`, and code fences. Everything else falls through as a
+ * paragraph. User-supplied text is HTML-escaped first so this is safe to
+ * stick into innerHTML.
+ */
+function renderMarkdownLite(src: string): string {
+  const escape = (s: string): string =>
+    s.replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+
+  const lines = src.split('\n');
+  const out: string[] = [];
+  let inCodeBlock = false;
+  let listKind: 'ul' | 'ol' | null = null;
+  let paragraphBuf: string[] = [];
+
+  const flushParagraph = (): void => {
+    if (paragraphBuf.length === 0) return;
+    const joined = paragraphBuf.join(' ');
+    out.push(`<p>${inlineFormat(joined)}</p>`);
+    paragraphBuf = [];
+  };
+  const flushList = (): void => {
+    if (listKind) {
+      out.push(`</${listKind}>`);
+      listKind = null;
+    }
+  };
+  const inlineFormat = (s: string): string =>
+    escape(s)
+      .replace(/`([^`]+?)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>');
+
+  for (const raw of lines) {
+    const line = raw;
+    if (line.startsWith('```')) {
+      flushParagraph(); flushList();
+      if (inCodeBlock) {
+        out.push('</code></pre>');
+        inCodeBlock = false;
+      } else {
+        out.push('<pre><code>');
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      out.push(escape(line));
+      continue;
+    }
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      flushParagraph(); flushList();
+      const level = heading[1]!.length;
+      out.push(`<h${level}>${inlineFormat(heading[2]!)}</h${level}>`);
+      continue;
+    }
+    const bullet = /^\s*[-*]\s+(.*)$/.exec(line);
+    if (bullet) {
+      flushParagraph();
+      if (listKind !== 'ul') { flushList(); out.push('<ul>'); listKind = 'ul'; }
+      out.push(`<li>${inlineFormat(bullet[1]!)}</li>`);
+      continue;
+    }
+    const numbered = /^\s*\d+\.\s+(.*)$/.exec(line);
+    if (numbered) {
+      flushParagraph();
+      if (listKind !== 'ol') { flushList(); out.push('<ol>'); listKind = 'ol'; }
+      out.push(`<li>${inlineFormat(numbered[1]!)}</li>`);
+      continue;
+    }
+    if (line.trim() === '') {
+      flushParagraph(); flushList();
+      continue;
+    }
+    flushList();
+    paragraphBuf.push(line);
+  }
+  flushParagraph(); flushList();
+  if (inCodeBlock) out.push('</code></pre>');
+  return out.join('\n');
+}
+
+function renderDocs(): void {
+  const main = $('#main')!;
+  main.innerHTML = '';
+  const projectId = state.currentProject;
+  if (!projectId) {
+    main.appendChild(el('div', { class: 'empty-state' }, [
+      el('div', { class: 'empty-state-title', text: '프로젝트를 선택해주세요' }),
+    ]));
+    return;
+  }
+
+  // Detail view? Drill into a single document.
+  if (state.currentDocument) {
+    renderDocumentDetail(state.currentDocument);
+    return;
+  }
+
+  // Lazy fetch on first view.
+  if (!(DATA.documents ?? {})[projectId]) {
+    loadDocuments(projectId).then(() => render()).catch((e) => {
+      state.error = e instanceof Error ? e.message : '문서 로드 실패';
+      render();
+    });
+    main.appendChild(el('div', { class: 'page-header' }, [
+      el('h1', { class: 'page-title', text: '문서 불러오는 중…' }),
+    ]));
+    return;
+  }
+  const docs = DATA.documents![projectId]!;
+  const p = getProject()!;
+
+  // Page header + "+ 문서 추가" toolbar.
+  main.appendChild(el('div', { class: 'page-header' }, [
+    el('div', { class: 'breadcrumb', text: p.name + ' / 문서' }),
+    el('h1', { class: 'page-title', text: '문서 (Spec Hub)' }),
+    el('p', { class: 'page-tagline', text: 'PRD / 기획서 / 아키텍처 노트 / 회고 / feature spec — feature 와 연결해 작업 컨텍스트를 보존합니다.' }),
+  ]));
+
+  const toolbar = el('div');
+  toolbar.style.cssText = 'display: flex; justify-content: flex-end; margin-bottom: 12px;';
+  const addBtn = el('button', {
+    text: state.addingDocument ? '취소' : '+ 문서 추가',
+    onClick: () => { state.addingDocument = !state.addingDocument; render(); },
+  });
+  addBtn.style.cssText = 'padding: 6px 12px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text); border-radius: 4px; font: inherit; cursor: pointer;';
+  toolbar.appendChild(addBtn);
+  main.appendChild(toolbar);
+
+  if (state.addingDocument) {
+    main.appendChild(renderDocumentForm(null));
+  }
+
+  if (docs.length === 0 && !state.addingDocument) {
+    main.appendChild(el('div', { class: 'empty-state' }, [
+      el('div', { class: 'empty-state-title', text: '아직 문서가 없습니다' }),
+      el('div', { class: 'empty-state-text', text: '`+ 문서 추가` 로 PRD / 기획서 / 아키텍처 메모를 등록할 수 있어요. 작성한 문서는 검색(Cmd+K) 에서도 잡힙니다.' }),
+    ]));
+    return;
+  }
+
+  // kind 별 그룹.
+  const grouped: Record<DocumentKind, Document[]> = {
+    prd: [], planning: [], architecture: [], retro: [], feature_spec: [], other: [],
+  };
+  for (const d of docs) grouped[d.kind].push(d);
+
+  DOCUMENT_KIND_ORDER.forEach((kind) => {
+    const list = grouped[kind];
+    if (list.length === 0) return;
+    main.appendChild(el('div', { class: 'section-title' }, [
+      el('span', { text: `${DOCUMENT_KIND_LABEL[kind]} · ${list.length}` }),
+    ]));
+    const cards = el('div', { class: 'feature-card-list' });
+    list.forEach((d) => {
+      const card = el('div', {
+        class: 'feature-card',
+        onClick: () => { state.currentDocument = d.id; render(); },
+      });
+      card.appendChild(el('div', { class: 'feature-card-header' }, [
+        el('span', { class: 'feature-card-name', text: d.title, style: 'flex: 1;' }),
+        el('span', {
+          text: relTime(d.updated_at) ?? '',
+          style: 'color: var(--text-3); font-size: 11px;',
+        }),
+      ]));
+      // Preview snippet — first non-empty line, trimmed to 140 chars.
+      const preview = (d.content_md || '').split('\n').find((l) => l.trim()) ?? '';
+      if (preview) {
+        card.appendChild(el('div', { class: 'feature-card-meta' }, [
+          el('span', {
+            text: preview.length > 140 ? preview.slice(0, 140) + '…' : preview,
+            style: 'color: var(--text-2); font-size: 12px;',
+          }),
+        ]));
+      }
+      cards.appendChild(card);
+    });
+    main.appendChild(cards);
+  });
+}
+
+function renderDocumentDetail(docId: string): void {
+  const main = $('#main')!;
+  main.innerHTML = '';
+  const projectId = state.currentProject!;
+  const docs = (DATA.documents ?? {})[projectId] ?? [];
+  const doc = docs.find((d) => d.id === docId);
+  if (!doc) {
+    main.appendChild(el('div', { class: 'empty-state' }, [
+      el('div', { class: 'empty-state-title', text: '문서를 찾지 못했습니다' }),
+      el('button', {
+        text: '← 문서 목록',
+        onClick: () => { state.currentDocument = null; render(); },
+      }),
+    ]));
+    return;
+  }
+
+  // Back-link header.
+  const header = el('div', { class: 'page-header' });
+  const back = el('a', {
+    class: 'breadcrumb',
+    text: '← 문서 목록',
+    onClick: () => {
+      state.currentDocument = null;
+      state.editingDocumentId = null;
+      render();
+    },
+  });
+  back.style.cursor = 'pointer';
+  header.appendChild(back);
+
+  const titleRow = el('div');
+  titleRow.style.cssText = 'display: flex; align-items: center; gap: 12px;';
+  titleRow.appendChild(el('h1', { class: 'page-title', text: doc.title }));
+  titleRow.appendChild(pillEl('todo', DOCUMENT_KIND_LABEL[doc.kind]));
+  header.appendChild(titleRow);
+  header.appendChild(el('p', {
+    class: 'page-tagline',
+    text: '업데이트 ' + (relTime(doc.updated_at) ?? '방금'),
+  }));
+  main.appendChild(header);
+
+  // Edit / delete affordances.
+  const actions = el('div');
+  actions.style.cssText = 'display: flex; gap: 8px; margin-bottom: 16px;';
+  if (state.editingDocumentId === doc.id) {
+    actions.appendChild(el('button', {
+      text: state.documentPreview ? '편집' : '미리보기',
+      onClick: () => { state.documentPreview = !state.documentPreview; render(); },
+    }));
+  } else {
+    actions.appendChild(el('button', {
+      text: '수정',
+      onClick: () => {
+        state.editingDocumentId = doc.id;
+        state.documentPreview = false;
+        render();
+      },
+    }));
+  }
+  actions.appendChild(el('button', {
+    text: '삭제',
+    onClick: () => deleteDocumentUI(doc.id),
+  }));
+  for (const btn of Array.from(actions.children)) {
+    (btn as HTMLElement).style.cssText = 'padding: 4px 10px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-2); border-radius: 4px; font: inherit; font-size: 12px; cursor: pointer;';
+  }
+  main.appendChild(actions);
+
+  // Body — read-only or edit-mode.
+  if (state.editingDocumentId === doc.id && !state.documentPreview) {
+    main.appendChild(renderDocumentForm(doc));
+  } else if (state.documentPreview && state.editingDocumentId === doc.id) {
+    const previewBox = el('div', { class: 'feature-spec-section' });
+    previewBox.appendChild(el('div', { class: 'detail-section-title' }, [el('span', { text: '미리보기' })]));
+    const body = el('div', { class: 'feature-spec-body markdown-preview' });
+    body.style.cssText = 'background: var(--bg-elevated); padding: 12px 16px; border-radius: 6px;';
+    body.innerHTML = renderMarkdownLite(doc.content_md);
+    previewBox.appendChild(body);
+    main.appendChild(previewBox);
+  } else {
+    const readBox = el('div', { class: 'feature-spec-section' });
+    if (doc.content_md.trim()) {
+      readBox.appendChild(el('pre', { class: 'feature-spec-body', text: doc.content_md }));
+    } else {
+      readBox.appendChild(el('div', { class: 'empty-state-text', text: '본문이 비어있습니다. "수정" 으로 작성하세요.' }));
+    }
+    main.appendChild(readBox);
+  }
+}
+
+/**
+ * Reusable form for create + edit. When `doc` is null we're creating; the
+ * submit handler routes to createDocumentUI vs updateDocumentUI accordingly.
+ */
+function renderDocumentForm(doc: Document | null): HTMLElement {
+  const wrap = el('div');
+  wrap.style.cssText = [
+    'background: var(--bg-elevated)',
+    'border: 1px solid var(--border)',
+    'border-radius: 6px',
+    'padding: 16px',
+    'margin-bottom: 16px',
+    'display: flex',
+    'flex-direction: column',
+    'gap: 10px',
+  ].join('; ');
+
+  const fieldStyle = [
+    'width: 100%', 'padding: 8px 10px', 'background: var(--bg)',
+    'border: 1px solid var(--border)', 'color: var(--text)', 'border-radius: 4px',
+    'font: inherit', 'box-sizing: border-box',
+  ].join('; ');
+  const labelStyle = 'font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em;';
+
+  // title
+  wrap.appendChild(el('label', { text: '제목', style: labelStyle }));
+  const titleInput = document.createElement('input');
+  titleInput.type = 'text';
+  titleInput.value = doc?.title ?? '';
+  titleInput.placeholder = '문서 제목 (필수)';
+  titleInput.style.cssText = fieldStyle;
+  wrap.appendChild(titleInput);
+
+  // kind
+  wrap.appendChild(el('label', { text: '종류', style: labelStyle }));
+  const kindSel = document.createElement('select');
+  kindSel.style.cssText = fieldStyle;
+  DOCUMENT_KIND_ORDER.forEach((k) => {
+    const opt = new Option(DOCUMENT_KIND_LABEL[k], k);
+    if ((doc?.kind ?? 'planning') === k) opt.selected = true;
+    kindSel.appendChild(opt);
+  });
+  wrap.appendChild(kindSel);
+
+  // content_md
+  wrap.appendChild(el('label', { text: 'Markdown 본문', style: labelStyle }));
+  const textarea = document.createElement('textarea');
+  textarea.rows = 16;
+  textarea.value = doc?.content_md ?? '';
+  textarea.placeholder = '## 배경\n...\n## 비범위\n...';
+  textarea.style.cssText = fieldStyle + '; resize: vertical; min-height: 240px; font-family: var(--font-mono, monospace);';
+  wrap.appendChild(textarea);
+
+  const actions = el('div');
+  actions.style.cssText = 'display: flex; gap: 8px; margin-top: 4px;';
+  const submit = el('button', {
+    text: doc ? '저장' : '생성',
+    onClick: () => {
+      const title = titleInput.value.trim();
+      const err = validateRequired([['제목', title]]);
+      if (err) { showError(err); titleInput.focus(); return; }
+      const kind = kindSel.value as DocumentKind;
+      const content_md = textarea.value;
+      if (doc) {
+        updateDocumentUI(doc.id, { title, kind, content_md });
+      } else {
+        createDocumentUI({ title, kind, content_md });
+      }
+    },
+  });
+  submit.style.cssText = 'padding: 6px 14px; background: var(--accent); border: 1px solid var(--accent); color: var(--text); border-radius: 4px; font: inherit; cursor: pointer;';
+  const cancel = el('button', {
+    text: '취소',
+    onClick: () => {
+      if (doc) {
+        state.editingDocumentId = null;
+        state.documentPreview = false;
+      } else {
+        state.addingDocument = false;
+      }
+      render();
+    },
+  });
+  cancel.style.cssText = 'padding: 6px 14px; background: transparent; border: 1px solid var(--border); color: var(--text-2); border-radius: 4px; font: inherit; cursor: pointer;';
+  actions.appendChild(submit);
+  actions.appendChild(cancel);
+  wrap.appendChild(actions);
+
+  // Cmd/Ctrl+Enter to submit, ESC to cancel.
+  wrap.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      if (doc) {
+        state.editingDocumentId = null;
+        state.documentPreview = false;
+      } else {
+        state.addingDocument = false;
+      }
+      render();
+    } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      (submit as HTMLButtonElement).click();
+    }
+  });
+  queueMicrotask(() => titleInput.focus());
+  return wrap;
+}
+
 async function setActiveProject(projectId: string): Promise<void> {
   state.currentProject = projectId;
   state.error = null;
@@ -967,6 +1491,8 @@ const TABS: ReadonlyArray<{ id: Tab; label: string }> = [
   // Sprint 20 (u3zu): 'dashboard' → 'overview'. Single project-detail
   // first screen; consumes /api/projects/:id/overview directly.
   { id: 'overview', label: '오버뷰' },
+  // Sprint 22 (3wtr): Spec Hub. Free-form per-project documents.
+  { id: 'docs', label: '문서' },
   { id: 'features', label: '기능' },
   { id: 'decisions', label: '결정 기록' },
   { id: 'sessions', label: '세션 로그' },
@@ -1499,6 +2025,87 @@ function renderFeatureDetail() {
     main.appendChild(files);
   }
 
+  // Sprint 22 (3wtr): "관련 문서" — documents linked to this feature via
+  // the document_features junction. Lazy-fetched on first paint; renders
+  // a placeholder line until the response lands. Clicking a row jumps to
+  // the Docs tab focused on that doc.
+  const linkedDocs = (DATA.documentsByFeature ?? {})[f.id];
+  if (!linkedDocs) {
+    loadDocumentsForFeature(f.id).then(() => render()).catch(() => { /* swallow */ });
+  } else if (linkedDocs.length > 0 || DATA.documents?.[state.currentProject!]?.length) {
+    // Always show the section if either: there are links, or there's at
+    // least one document in the project (so the "+ 문서 연결" affordance
+    // shows up and the user can attach without leaving feature detail).
+    const docsSec = el('div', { class: 'detail-section' });
+    docsSec.appendChild(el('div', { class: 'detail-section-title' }, [
+      el('span', { text: '관련 문서' }),
+      el('span', { class: 'detail-section-count', text: String(linkedDocs.length) }),
+    ]));
+    if (linkedDocs.length === 0) {
+      docsSec.appendChild(el('div', {
+        class: 'empty-state-text',
+        text: '연결된 문서가 없습니다. 문서 탭에서 작성한 PRD/기획서를 이 기능에 매핑할 수 있어요.',
+        style: 'padding: 8px 0; color: var(--text-3);',
+      }));
+    } else {
+      const dlist = el('div', { class: 'file-list' });
+      linkedDocs.forEach((d) => {
+        const row = el('div', {
+          class: 'file-row',
+          onClick: () => {
+            state.currentTab = 'docs';
+            state.currentDocument = d.id;
+            // ensure cached for renderDocumentDetail
+            if (state.currentProject && !(DATA.documents ?? {})[state.currentProject]) {
+              loadDocuments(state.currentProject).catch(() => { /* render handles */ });
+            }
+            render();
+          },
+        });
+        row.style.cursor = 'pointer';
+        row.appendChild(el('div', { class: 'file-path' }, [
+          el('span', { text: DOCUMENT_KIND_LABEL[d.kind], style: 'color: var(--text-3); font-size: 10px; margin-right: 8px;' }),
+          el('code', { text: d.title }),
+        ]));
+        const unlink = el('button', {
+          text: '연결 해제',
+          title: '이 문서와의 연결을 해제',
+          onClick: (e: MouseEvent) => { e.stopPropagation(); unlinkDocumentFromFeatureUI(d.id, f.id); },
+        });
+        unlink.style.cssText = 'margin-left: auto; padding: 4px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-3); border-radius: 4px; font-size: 11px; cursor: pointer;';
+        row.appendChild(unlink);
+        dlist.appendChild(row);
+      });
+      docsSec.appendChild(dlist);
+    }
+    // "+ 문서 연결" picker — drops down a select of remaining documents in
+    // the project, mirroring Sprint 6's file linkage pattern.
+    const linkedIds = new Set(linkedDocs.map((d) => d.id));
+    const availableDocs = ((DATA.documents ?? {})[state.currentProject!] ?? [])
+      .filter((d) => !linkedIds.has(d.id));
+    if (availableDocs.length > 0) {
+      const picker = el('div');
+      picker.style.cssText = 'display: flex; gap: 8px; margin-top: 8px; align-items: center;';
+      const sel = document.createElement('select');
+      sel.style.cssText = 'padding: 6px 8px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text); border-radius: 4px; font: inherit; min-width: 220px;';
+      sel.appendChild(new Option('— 문서 연결 —', ''));
+      availableDocs.forEach((d) => sel.appendChild(new Option(`[${DOCUMENT_KIND_LABEL[d.kind]}] ${d.title}`, d.id)));
+      const submit = el('button', {
+        text: '+ 연결',
+        onClick: () => {
+          const did = sel.value;
+          if (!did) return;
+          linkDocumentToFeatureUI(did, f.id);
+        },
+      });
+      submit.style.cssText = 'padding: 6px 12px; background: var(--accent); border: 1px solid var(--accent); color: var(--text); border-radius: 4px; font: inherit; font-size: 12px; cursor: pointer;';
+      picker.appendChild(sel);
+      picker.appendChild(submit);
+      docsSec.appendChild(picker);
+    }
+    main.appendChild(docsSec);
+  }
+
   if (f.sessions.length > 0) {
     const sessions = el('div', { class: 'detail-section' });
     sessions.appendChild(el('div', { class: 'detail-section-title' }, [
@@ -1879,6 +2486,7 @@ function render() {
 
   if (state.currentTab === 'workspace') renderWorkspace();
   else if (state.currentTab === 'overview') renderOverview();
+  else if (state.currentTab === 'docs') renderDocs();
   else if (state.currentTab === 'features') renderFeatureDetail();
   // ADR-0016: 'codemap' tab retired.
   else if (state.currentTab === 'decisions') renderDecisions();
@@ -1939,17 +2547,21 @@ const SEARCH_DEBOUNCE_MS = 280;
 // Display order for kind group headers. Matches the kind weight tier in the
 // domain layer (feature most boosted → session least). Within each group
 // rows preserve the server-provided score order.
-const KIND_GROUP_ORDER: ReadonlyArray<SearchKind> = ['feature', 'decision', 'file', 'session'];
+// Sprint 22 (3wtr): 'document' slots between decision and file, mirroring
+// the KIND_WEIGHT order in domain.ts.
+const KIND_GROUP_ORDER: ReadonlyArray<SearchKind> = ['feature', 'decision', 'document', 'file', 'session'];
 
 const KIND_LABEL: Record<SearchKind, string> = {
   feature: '기능',
   decision: '결정',
+  document: '문서',
   session: '세션',
   file: '파일',
 };
 const KIND_CLASS: Record<SearchKind, string> = {
   feature: 'kind-feature',
   decision: 'kind-decision',
+  document: 'kind-document',
   session: 'kind-session',
   file: 'kind-file',
 };
@@ -2221,6 +2833,17 @@ function navigateToResult(r: SearchResult): void {
       state.currentTab = 'sessions';
       render();
       flashRefId('session', r.ref_id);
+      break;
+    case 'document':
+      // Sprint 22 (3wtr): drop into Docs tab + detail view for the matched
+      // document. Background-load the project's docs cache so the detail
+      // resolves cleanly even on first hit from the search palette.
+      state.currentTab = 'docs';
+      state.currentDocument = r.ref_id;
+      if (state.currentProject && !(DATA.documents ?? {})[state.currentProject]) {
+        loadDocuments(state.currentProject).catch(() => { /* render handles */ });
+      }
+      render();
       break;
     case 'file':
       // ADR-0016: 'file' kind retired on the server (search_fts purged in

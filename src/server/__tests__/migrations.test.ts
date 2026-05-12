@@ -16,13 +16,14 @@ describe('migrations runner — fresh DB', () => {
       .all() as { version: number }[];
     const versions = rows.map((r) => r.version);
     // 0001_init + 0002_search_fts + 0003_imported_commits +
-    // 0004_extracted_features + 0005_drop_file_explanations.
-    // Bump as new migrations land.
+    // 0004_extracted_features + 0005_drop_file_explanations +
+    // 0006_documents. Bump as new migrations land.
     expect(versions).toContain(1);
     expect(versions).toContain(2);
     expect(versions).toContain(3);
     expect(versions).toContain(4);
     expect(versions).toContain(5);
+    expect(versions).toContain(6);
   });
 
   it('creates the expected tables', () => {
@@ -42,6 +43,9 @@ describe('migrations runner — fresh DB', () => {
       // on a fresh DB.
       'imported_commits',
       'extracted_features',
+      // 0006 (Sprint 22): Spec Hub documents + M:N feature link.
+      'documents',
+      'document_features',
       'schema_migrations',
     ]) {
       expect(names.has(expected), `missing table: ${expected}`).toBe(true);
@@ -59,10 +63,11 @@ describe('migrations runner — fresh DB', () => {
     expect(row).toBeDefined();
   });
 
-  it('three entity tables have INSERT/UPDATE/DELETE triggers feeding search_fts', () => {
-    // After 0005: file_explanations triggers retired. 3 entities × 3 trigger
-    // types = 9. If we ever add a new indexed entity, the trigger count is
-    // the canonical place to assert against.
+  it('four entity tables have INSERT/UPDATE/DELETE triggers feeding search_fts', () => {
+    // After 0005: file_explanations triggers retired.
+    // After 0006: documents triggers added. 4 entities × 3 trigger types = 12.
+    // If we ever add a new indexed entity, the trigger count is the canonical
+    // place to assert against.
     const triggers = t.db
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name",
@@ -73,6 +78,8 @@ describe('migrations runner — fresh DB', () => {
       'features_ai', 'features_au', 'features_ad',
       'decisions_ai', 'decisions_au', 'decisions_ad',
       'sessions_ai', 'sessions_au', 'sessions_ad',
+      // 0006 (Sprint 22, Spec Hub):
+      'documents_ai', 'documents_au', 'documents_ad',
     ]) {
       expect(names.has(expected), `missing trigger: ${expected}`).toBe(true);
     }
@@ -141,8 +148,8 @@ describe('migrations runner — legacy baseline', () => {
         .prepare('SELECT version FROM schema_migrations ORDER BY version')
         .all() as { version: number }[];
       const versions = rows.map((r) => r.version);
-      // Baseline marker for v1, plus newly-applied v2 / v3 / v4 / v5.
-      expect(versions).toEqual([1, 2, 3, 4, 5]);
+      // Baseline marker for v1, plus newly-applied v2..v6.
+      expect(versions).toEqual([1, 2, 3, 4, 5, 6]);
     } finally {
       closeDb();
       try { fs.rmSync(legacy.dir, { recursive: true, force: true }); } catch {}

@@ -192,15 +192,56 @@ export interface SessionStartContext {
   recent_decisions: Array<{ id: string; title: string; date: string }>;
   recent_sessions: Array<{ time: string; summary: string; feature: string | null }>;
   spec_md?: string | null;
+  /** Sprint 22 (3wtr) / ADR-0019: documents linked to `active_feature`,
+   *  up to 5, each carrying a 200-char excerpt so Claude Code has scope
+   *  context (PRD / planning / architecture notes) at session start.
+   *  Empty when no active feature OR no linked docs. */
+  active_documents: DocumentSummary[];
 }
 
 // (Removed in ADR-0016: FileNode. File-tree API retired.)
 
-// SearchKind still includes 'file' for type-system stability, but on a
-// post-0005 DB no row of kind='file' can be returned — migration purged
-// the search_fts table of those rows and dropped the triggers that fed
-// them. The web client treats incoming 'file' results as a no-op.
-export type SearchKind = 'feature' | 'decision' | 'session' | 'file';
+// Sprint 22 (3wtr) — Spec Hub: free-form project documents (PRDs, planning
+// memos, architecture notes, retros, external feature specs). Distinct from
+// `features.spec_md`: that field stays for the inline one-screen blurb that
+// `pm_set_active_feature` hands off (Sprint 17); `documents` is for longer
+// content the user wants to manage as standalone artifacts.
+export type DocumentKind =
+  | 'prd'
+  | 'planning'
+  | 'architecture'
+  | 'retro'
+  | 'feature_spec'
+  | 'other';
+
+export interface Document {
+  id: string;
+  project_id: string;
+  kind: DocumentKind;
+  title: string;
+  content_md: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/** Slim projection used by pm_get_context / pm_set_active_feature for
+ *  hand-off to Claude Code. ADR-0019: only the first 200 chars of body
+ *  travel — full content is fetched on demand if needed. */
+export interface DocumentSummary {
+  id: string;
+  kind: DocumentKind;
+  title: string;
+  /** content_md truncated to 200 chars + `…` when longer. Empty string when
+   *  the document has no body. */
+  excerpt: string;
+  /** Pre-formatted relative time. Same convention as AdrCard / SessionSummary. */
+  updated_at_label: string;
+}
+
+// SearchKind: 'file' is retired but kept for type-system stability (post-0005
+// migration purged all rows + dropped triggers). 'document' is added by
+// Sprint 22 (3wtr) — surfaces via global search at KIND_WEIGHT 0.8.
+export type SearchKind = 'feature' | 'decision' | 'session' | 'file' | 'document';
 
 export interface SearchResult {
   kind: SearchKind;

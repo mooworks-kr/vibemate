@@ -416,6 +416,102 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
 
   // (Removed in ADR-0016: pm_list_files_needing_explanation. Code Map retired.)
 
+  // ----- Documents (Sprint 22, 3wtr — Spec Hub) -----
+
+  const DOCUMENT_KIND_ENUM = z.enum([
+    'prd', 'planning', 'architecture', 'retro', 'feature_spec', 'other',
+  ]);
+
+  server.tool(
+    'pm_create_document',
+    {
+      project_id: z.string().optional().describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+      kind: DOCUMENT_KIND_ENUM.describe('문서 종류 (prd / planning / architecture / retro / feature_spec / other)'),
+      title: z.string().describe('문서 제목'),
+      content_md: z.string().optional().describe('Markdown 본문'),
+      feature_id: z.string().optional().describe('지정 시 생성 직후 해당 feature 와 link'),
+    },
+    async ({ project_id, kind, title, content_md, feature_id }) => {
+      const pid = resolveProject(project_id);
+      const doc = domain.createDocument({ projectId: pid, kind, title, content_md });
+      if (feature_id) {
+        domain.linkDocumentToFeature(doc.id, feature_id);
+      }
+      return ok({ document_id: doc.id, title: doc.title, kind: doc.kind });
+    },
+  );
+
+  server.tool(
+    'pm_update_document',
+    {
+      document_id: z.string(),
+      kind: DOCUMENT_KIND_ENUM.optional(),
+      title: z.string().optional(),
+      content_md: z.string().optional(),
+    },
+    async ({ document_id, ...patch }) => {
+      const updated = domain.updateDocument(document_id, patch);
+      if (!updated) throw new Error(`Document not found: ${document_id}`);
+      return ok({ ok: true, document: updated });
+    },
+  );
+
+  server.tool(
+    'pm_delete_document',
+    {
+      document_id: z.string(),
+    },
+    async ({ document_id }) => {
+      const removed = domain.deleteDocument(document_id);
+      if (!removed) throw new Error(`Document not found: ${document_id}`);
+      return ok({ ok: true });
+    },
+  );
+
+  server.tool(
+    'pm_list_documents',
+    {
+      project_id: z.string().optional(),
+      kind: DOCUMENT_KIND_ENUM.optional().describe('지정 시 해당 종류만'),
+      feature_id: z.string().optional().describe('지정 시 그 feature 에 linked 된 문서만 반환'),
+      limit: z.number().optional().describe('기본 100, 최대 500'),
+    },
+    async ({ project_id, kind, feature_id, limit }) => {
+      // `feature_id` is the more specific filter — when present, walk the
+      // junction table directly and ignore the kind/limit narrow (the result
+      // is already bounded by how many features the user manually linked).
+      if (feature_id) {
+        return ok(domain.listDocumentsForFeature(feature_id));
+      }
+      const pid = resolveProject(project_id);
+      return ok(domain.listDocuments(pid, { kind, limit }));
+    },
+  );
+
+  server.tool(
+    'pm_link_document_to_feature',
+    {
+      document_id: z.string(),
+      feature_id: z.string(),
+    },
+    async ({ document_id, feature_id }) => {
+      domain.linkDocumentToFeature(document_id, feature_id);
+      return ok({ ok: true });
+    },
+  );
+
+  server.tool(
+    'pm_unlink_document_from_feature',
+    {
+      document_id: z.string(),
+      feature_id: z.string(),
+    },
+    async ({ document_id, feature_id }) => {
+      const removed = domain.unlinkDocumentFromFeature(document_id, feature_id);
+      return ok({ ok: removed });
+    },
+  );
+
   // ----- Search (FTS5 across features/decisions/sessions/files) -----
 
   // The HTTP search response is HTML-escaped (`&lt;` etc.) plus literal
@@ -434,6 +530,7 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
   const KIND_LABEL_MCP: Record<string, string> = {
     feature: 'feature',
     decision: 'decision',
+    document: 'document',
     session: 'session',
     file: 'file',
   };

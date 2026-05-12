@@ -64,6 +64,29 @@ const updateDecisionSchema = z.object({
   feature_id: z.string().nullable().optional(),
 }).strict();
 
+// Sprint 22 (3wtr) — Spec Hub schemas. kind enum mirrors the CHECK
+// constraint in migrations/0006_documents.sql.
+const DOCUMENT_KIND = z.enum([
+  'prd', 'planning', 'architecture', 'retro', 'feature_spec', 'other',
+]);
+
+const createDocumentSchema = z.object({
+  kind: DOCUMENT_KIND,
+  title: z.string().min(1),
+  content_md: z.string().optional(),
+}).strict();
+
+const updateDocumentSchema = z.object({
+  kind: DOCUMENT_KIND.optional(),
+  title: z.string().min(1).optional(),
+  content_md: z.string().optional(),
+}).strict();
+
+const documentFeatureLinkSchema = z.object({
+  document_id: z.string().min(1),
+  feature_id: z.string().min(1),
+}).strict();
+
 function formatZodError(err: z.ZodError): string {
   return err.errors.map((e) => `${e.path.join('.') || '<root>'}: ${e.message}`).join('; ');
 }
@@ -216,6 +239,95 @@ export function createApp() {
   });
 
   // (Removed in ADR-0016: GET /api/projects/:id/file-tree)
+
+  // ----- Documents (Sprint 22, 3wtr — Spec Hub) -----
+
+  app.get('/api/projects/:id/documents', (c) => {
+    const projectId = c.req.param('id');
+    if (!domain.getProject(projectId)) {
+      return c.json({ error: `Project not found: ${projectId}` }, 404);
+    }
+    const kindRaw = c.req.query('kind');
+    let kind: z.infer<typeof DOCUMENT_KIND> | undefined;
+    if (kindRaw !== undefined) {
+      const parsed = DOCUMENT_KIND.safeParse(kindRaw);
+      if (!parsed.success) {
+        return c.json({ error: `invalid kind: ${kindRaw}` }, 400);
+      }
+      kind = parsed.data;
+    }
+    const limitRaw = c.req.query('limit');
+    let limit: number | undefined;
+    if (limitRaw !== undefined) {
+      const n = Number(limitRaw);
+      if (!Number.isFinite(n) || n <= 0) {
+        return c.json({ error: 'limit must be a positive number' }, 400);
+      }
+      limit = n;
+    }
+    return c.json(domain.listDocuments(projectId, { kind, limit }));
+  });
+
+  app.get('/api/documents/:id', (c) => {
+    const id = c.req.param('id');
+    const doc = domain.getDocument(id);
+    if (!doc) return c.json({ error: 'Document not found' }, 404);
+    return c.json(doc);
+  });
+
+  app.post('/api/projects/:id/documents', async (c) => {
+    const projectId = c.req.param('id');
+    if (!domain.getProject(projectId)) {
+      return c.json({ error: `Project not found: ${projectId}` }, 404);
+    }
+    const parsed = createDocumentSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return c.json({ error: formatZodError(parsed.error) }, 400);
+    const doc = domain.createDocument({ projectId, ...parsed.data });
+    return c.json(doc, 201);
+  });
+
+  app.patch('/api/documents/:id', async (c) => {
+    const id = c.req.param('id');
+    const parsed = updateDocumentSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return c.json({ error: formatZodError(parsed.error) }, 400);
+    const updated = domain.updateDocument(id, parsed.data);
+    if (!updated) return c.json({ error: 'Document not found' }, 404);
+    return c.json(updated);
+  });
+
+  app.delete('/api/documents/:id', (c) => {
+    const id = c.req.param('id');
+    const ok = domain.deleteDocument(id);
+    if (!ok) return c.json({ error: 'Document not found' }, 404);
+    return c.json({ ok: true });
+  });
+
+  // Document ↔ feature link/unlink. Sprint 5 feature_files pattern: body-based
+  // (rather than path-based) because both ids are first-class — neither is a
+  // sub-resource of the other.
+  app.post('/api/document-features', async (c) => {
+    const parsed = documentFeatureLinkSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return c.json({ error: formatZodError(parsed.error) }, 400);
+    try {
+      domain.linkDocumentToFeature(parsed.data.document_id, parsed.data.feature_id);
+      return c.json({ ok: true });
+    } catch (e) {
+      return c.json({ error: (e as Error).message }, 404);
+    }
+  });
+
+  app.delete('/api/document-features', async (c) => {
+    const parsed = documentFeatureLinkSchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return c.json({ error: formatZodError(parsed.error) }, 400);
+    const ok = domain.unlinkDocumentFromFeature(parsed.data.document_id, parsed.data.feature_id);
+    return c.json({ ok });
+  });
+
+  app.get('/api/features/:id/documents', (c) => {
+    const id = c.req.param('id');
+    if (!domain.getFeature(id)) return c.json({ error: 'Feature not found' }, 404);
+    return c.json(domain.listDocumentsForFeature(id));
+  });
 
   // ----- Workspace (cross-project active-features view) -----
 

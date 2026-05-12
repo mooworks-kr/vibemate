@@ -12,6 +12,8 @@
 
 import type {
   Decision,
+  Document,
+  DocumentKind,
   Feature,
   FeatureFile,
   FeatureStatus,
@@ -26,6 +28,10 @@ import type {
 // Re-export ProjectOverview as the canonical web-side name so import sites
 // don't need to reach into ../server/types directly.
 export type ProjectOverviewResponse = ProjectOverview;
+
+// Sprint 22 (3wtr) — re-export Document types so renderDocs and friends
+// don't have to reach across the boundary at every call site.
+export type { Document, DocumentKind };
 
 // (Removed in ADR-0016: FileTreeNode + FileDetailResponse + DataCache.fileTree
 // + AppState.currentFile + AppState.linkingFile + AppState.fileDetailLoading.
@@ -105,6 +111,13 @@ export interface DataCache {
    *  invalidate aggressively (clear the entry on any feature/task mutation
    *  in the project) — see `invalidateOverview()` in main.ts. */
   overviews?: Record<string, ProjectOverview>;
+  /** Sprint 22 (3wtr): cached GET /api/projects/:id/documents response per
+   *  project. Populated by `loadDocuments()` when the Docs tab first opens,
+   *  invalidated by document mutation paths. */
+  documents?: Record<string, Document[]>;
+  /** Per-feature documents list — fed by `/api/features/:id/documents`,
+   *  used by feature detail's "관련 문서" section. Keyed by feature id. */
+  documentsByFeature?: Record<string, Document[]>;
 }
 
 /**
@@ -174,7 +187,9 @@ export interface FeatureDetailResponse extends Feature {
 // drives renderOverview() and consumes the GET /api/projects/:id/overview
 // payload. Tab union changes are caught by the dispatch switch in render(),
 // so any stale reference would fail typecheck.
-export type Tab = 'workspace' | 'overview' | 'features' | 'decisions' | 'sessions';
+// Sprint 22 (3wtr): 'docs' added — Spec Hub. Slot after 'overview' so the
+// project's "what?" tab comes before "what to build?".
+export type Tab = 'workspace' | 'overview' | 'docs' | 'features' | 'decisions' | 'sessions';
 
 /**
  * Mirror of the server's `WorkspaceFeature` row (types.ts on the server).
@@ -242,6 +257,17 @@ export interface AppState {
    *  `true` — a long backlog of completed features clutters the sidebar
    *  more than it informs. */
   hideCompletedFeatures: boolean;
+
+  // Docs tab (Sprint 22, 3wtr) -------------------------------------------
+  /** Currently-selected document for the detail view. null = list view. */
+  currentDocument: string | null;
+  /** Inline "+ 문서 추가" form open. */
+  addingDocument: boolean;
+  /** Document id whose edit mode is open inside the detail view. */
+  editingDocumentId: string | null;
+  /** Toggle between raw textarea and a minimal markdown preview inside the
+   *  detail view's edit mode. Default false (text). */
+  documentPreview: boolean;
 }
 
 // ============================================================

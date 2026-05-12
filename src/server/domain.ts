@@ -13,6 +13,9 @@ import {
 } from './lib.js';
 import type {
   Decision,
+  Document,
+  DocumentKind,
+  DocumentSummary,
   EditType,
   Feature,
   FeatureContext,
@@ -369,6 +372,166 @@ export function logDecision(args: {
 }
 
 // ============================================================
+// Documents (Sprint 22, 3wtr — Spec Hub)
+//
+// Free-form per-project artifacts (PRDs, planning memos, architecture notes,
+// retros, external feature specs). M:N linked to features via the
+// `document_features` table. FTS triggers in migrations/0006 keep them in
+// the global search index under kind='document'.
+//
+// Distinction from `features.spec_md` (Sprint 17 hand-off):
+//   * spec_md is an inline blurb returned by pm_set_active_feature so
+//     Claude Code can read scope at session boundary. Short, single-shot.
+//   * documents are user-managed long-form content; users browse them in
+//     the Docs tab, edit them as needed, and link to relevant features.
+//   * `kind='feature_spec'` is the explicit external-document cousin to
+//     spec_md — both coexist by design.
+// ============================================================
+
+export function createDocument(args: {
+  projectId: string;
+  kind: DocumentKind;
+  title: string;
+  content_md?: string;
+}): Document {
+  const project = getProject(args.projectId);
+  if (!project) throw new Error(`Project not found: ${args.projectId}`);
+  const db = getDb();
+  // Reuse the slug-collision guard the rest of the codebase uses: derive an
+  // id from the title, fall back to nanoid suffix when colliding within
+  // this project's existing documents.
+  const taken = new Set(
+    (db.prepare('SELECT id FROM documents WHERE project_id = ?').all(args.projectId) as {
+      id: string;
+    }[]).map((r) => r.id),
+  );
+  const id = makeSlug(args.title, taken);
+  const t = now();
+  const content = args.content_md ?? '';
+  db.prepare(
+    `INSERT INTO documents (id, project_id, kind, title, content_md, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, args.projectId, args.kind, args.title, content, t, t);
+  return getDocument(id)!;
+}
+
+export function getDocument(id: string): Document | null {
+  const row = getDb()
+    .prepare('SELECT * FROM documents WHERE id = ?')
+    .get(id) as unknown as Document | undefined;
+  return row ?? null;
+}
+
+export function updateDocument(
+  id: string,
+  patch: Partial<Pick<Document, 'kind' | 'title' | 'content_md'>>,
+): Document | null {
+  const db = getDb();
+  const fields: string[] = [];
+  // Same pattern as updateFeature/updateDecision: parameters are typed as
+  // `any[]` so the spread into `.run(...)` matches node:sqlite's
+  // SQLInputValue union without needing per-call casts.
+  const params: any[] = [];
+  for (const [k, v] of Object.entries(patch)) {
+    if (v !== undefined) {
+      fields.push(`${k} = ?`);
+      params.push(v);
+    }
+  }
+  if (fields.length === 0) return getDocument(id);
+  fields.push('updated_at = ?');
+  params.push(now());
+  params.push(id);
+  db.prepare(`UPDATE documents SET ${fields.join(', ')} WHERE id = ?`).run(...params);
+  return getDocument(id);
+}
+
+export function deleteDocument(id: string): boolean {
+  const res = getDb().prepare('DELETE FROM documents WHERE id = ?').run(id);
+  return res.changes > 0;
+}
+
+export interface ListDocumentsOpts {
+  /** Narrow to a single kind. Omit for "all kinds". */
+  kind?: DocumentKind;
+  /** Default 100, capped at 500 — typical project has <50 docs total. */
+  limit?: number;
+}
+
+export function listDocuments(
+  projectId: string,
+  opts: ListDocumentsOpts = {},
+): Document[] {
+  const limit = Math.min(Math.max(1, Math.floor(opts.limit ?? 100) || 100), 500);
+  const db = getDb();
+  if (opts.kind) {
+    return db
+      .prepare(
+        `SELECT * FROM documents WHERE project_id = ? AND kind = ?
+         ORDER BY updated_at DESC LIMIT ?`,
+      )
+      .all(projectId, opts.kind, limit) as unknown as Document[];
+  }
+  return db
+    .prepare(
+      `SELECT * FROM documents WHERE project_id = ?
+       ORDER BY updated_at DESC LIMIT ?`,
+    )
+    .all(projectId, limit) as unknown as Document[];
+}
+
+/**
+ * Link a document to a feature. Idempotent: INSERT OR IGNORE skips on the
+ * composite-PK collision, so callers can call this without checking first.
+ * Throws when either id doesn't exist (the FK constraint surfaces it).
+ */
+export function linkDocumentToFeature(documentId: string, featureId: string): void {
+  // FK validation up front gives a cleaner error than SQLite's foreign-key
+  // failure message.
+  if (!getDocument(documentId)) throw new Error(`Document not found: ${documentId}`);
+  if (!getFeature(featureId)) throw new Error(`Feature not found: ${featureId}`);
+  getDb()
+    .prepare(
+      `INSERT OR IGNORE INTO document_features (document_id, feature_id, created_at)
+       VALUES (?, ?, ?)`,
+    )
+    .run(documentId, featureId, now());
+}
+
+export function unlinkDocumentFromFeature(documentId: string, featureId: string): boolean {
+  const res = getDb()
+    .prepare('DELETE FROM document_features WHERE document_id = ? AND feature_id = ?')
+    .run(documentId, featureId);
+  return res.changes > 0;
+}
+
+/** All documents linked to `featureId`, newest first. */
+export function listDocumentsForFeature(featureId: string): Document[] {
+  return getDb()
+    .prepare(
+      `SELECT d.* FROM documents d
+       JOIN document_features df ON df.document_id = d.id
+       WHERE df.feature_id = ?
+       ORDER BY d.updated_at DESC`,
+    )
+    .all(featureId) as unknown as Document[];
+}
+
+/** All features linked to `documentId`. Ordered by feature.updated_at DESC
+ *  so the UI can show "most recently touched" features first. */
+export function listFeaturesForDocument(documentId: string): Feature[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT f.* FROM features f
+       JOIN document_features df ON df.feature_id = f.id
+       WHERE df.document_id = ?
+       ORDER BY f.updated_at DESC`,
+    )
+    .all(documentId) as any[];
+  return rows.map(rowToFeature);
+}
+
+// ============================================================
 // Sessions
 // ============================================================
 
@@ -385,6 +548,40 @@ export function startSession(args: { projectId: string; featureId?: string }): S
   ).run(sessionId, args.projectId, args.featureId ?? null, t);
 
   return getContext(args.projectId, sessionId, args.featureId);
+}
+
+// Sprint 22 / ADR-0019 #6: budget for the per-doc body excerpt shipped to
+// Claude Code via pm_get_context / pm_set_active_feature. Keeps the payload
+// bounded — 5 docs × 200 chars ≈ 1KB of body before metadata.
+const ACTIVE_DOCUMENTS_LIMIT = 5;
+const ACTIVE_DOCUMENT_EXCERPT_CHARS = 200;
+
+function documentToSummary(doc: Document): DocumentSummary {
+  const body = doc.content_md.trim();
+  const excerpt =
+    body.length <= ACTIVE_DOCUMENT_EXCERPT_CHARS
+      ? body
+      : body.slice(0, ACTIVE_DOCUMENT_EXCERPT_CHARS) + '…';
+  return {
+    id: doc.id,
+    kind: doc.kind,
+    title: doc.title,
+    excerpt,
+    updated_at_label: relativeTime(doc.updated_at),
+  };
+}
+
+/**
+ * ADR-0019 #6: for a given feature id, list the first
+ * `ACTIVE_DOCUMENTS_LIMIT` linked documents as `DocumentSummary` rows so
+ * Claude Code receives PRD/planning/architecture context alongside the
+ * feature's `spec_md`. Empty array when no link exists or no feature given.
+ */
+function activeDocumentsFor(featureId: string | null | undefined): DocumentSummary[] {
+  if (!featureId) return [];
+  return listDocumentsForFeature(featureId)
+    .slice(0, ACTIVE_DOCUMENTS_LIMIT)
+    .map(documentToSummary);
 }
 
 export function getContext(
@@ -463,6 +660,10 @@ export function getContext(
     recent_decisions: recentDecisions,
     recent_sessions: recentSessions,
     spec_md: activeFeatureSpec,
+    // ADR-0019 #6: hand off linked-document context for the active feature
+    // so Claude Code can ground itself in PRD / planning / architecture
+    // memos at session boundary (mirrors spec_md surface area).
+    active_documents: activeDocumentsFor(activeFeature?.id),
   };
 }
 
@@ -483,7 +684,12 @@ export function getContext(
 export function setActiveFeature(
   sessionId: string,
   featureId: string,
-): { ok: true; feature: FeatureContext; spec_md: string | null } {
+): {
+  ok: true;
+  feature: FeatureContext;
+  spec_md: string | null;
+  active_documents: DocumentSummary[];
+} {
   const db = getDb();
   const session = db
     .prepare('SELECT id FROM sessions WHERE id = ?')
@@ -499,6 +705,10 @@ export function setActiveFeature(
     ok: true,
     feature: featureToContext(feature),
     spec_md: feature.spec_md ?? null,
+    // ADR-0019 #6: ship the same active_documents bundle as getContext so
+    // a mid-session feature switch hands Claude Code the new feature's
+    // PRD / planning / architecture memos in one round-trip.
+    active_documents: activeDocumentsFor(featureId),
   };
 }
 
@@ -961,10 +1171,13 @@ const BODY_WEIGHT = 1.0;
 // with a much better content match (bm25 = -10) outranks a feature with a
 // weak match (bm25 = -5) even after the boost — the kind tier only swings
 // ties or near-ties.
+// Sprint 22 (3wtr): 'document' added at 0.8 — slots between feature/decision
+// (action-bearing) and session (transcript). Documents are *context* surfaces.
 // ADR-0016: 'file' kind retired (no longer indexed; filtered out in searchProject).
 const KIND_WEIGHT: Record<string, number> = {
   feature: 1.0,
   decision: 0.9,
+  document: 0.8,
   session: 0.6,
 };
 
@@ -1024,6 +1237,7 @@ export function searchProject(
                   CASE kind
                     WHEN 'feature'  THEN ?
                     WHEN 'decision' THEN ?
+                    WHEN 'document' THEN ?
                     WHEN 'session'  THEN ?
                     ELSE 1.0
                   END
@@ -1040,6 +1254,7 @@ export function searchProject(
         BODY_WEIGHT,
         KIND_WEIGHT.feature,
         KIND_WEIGHT.decision,
+        KIND_WEIGHT.document,
         KIND_WEIGHT.session,
         projectId,
         ftsQuery,
