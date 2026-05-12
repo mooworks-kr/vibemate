@@ -8,17 +8,22 @@
 src/
 ├── server/          # Node.js 백엔드 (MCP + HTTP + DB + CLI)
 │   ├── cli.ts            # commander 진입점
-│   ├── daemon.ts         # HTTP + 워처 백그라운드 데몬
-│   ├── mcp.ts            # Claude Code가 stdio로 호출 (18개 툴)
-│   ├── http.ts           # Hono REST API + 정적 파일 서빙
-│   ├── watcher.ts        # chokidar 파일 감시
+│   ├── daemon.ts         # HTTP 백그라운드 데몬 (chokidar 제거됨, Sprint 21)
+│   ├── mcp.ts            # Claude Code가 stdio로 호출 (26개 툴)
+│   ├── http.ts           # Hono REST API + 정적 파일 서빙 (30 routes)
 │   ├── domain.ts         # 비즈니스 로직 단일 소스
 │   ├── db.ts             # SQLite (node:sqlite) + 스키마
+│   ├── migrations.ts     # migration runner + schema_migrations 테이블
+│   ├── migrations/       # 0001-0006 SQL
+│   ├── git-import.ts     # pm import-history (Sprint 12)
+│   ├── extract-features.ts  # pm extract-features (Sprint 13/14)
 │   ├── lib.ts            # 슬러그/시간/ignore 패턴
 │   └── types.ts          # ★ 웹에서도 import 가능 (pure type)
-└── web/             # 대시보드 UI (현재 mockup 단계)
+└── web/             # 대시보드 UI
     ├── index.html
-    └── main.ts           # 인라인 스크립트에서 추출됨, 현재 @ts-nocheck
+    ├── types.ts          # 웹 인터페이스 정의 (Sprint 8)
+    ├── persist.ts        # localStorage 헬퍼 (Sprint 18)
+    └── main.ts           # vanilla TS — strict 타입화 완료
 ```
 
 **의존 방향**: cli/daemon/mcp/http → domain → db → (lib, types)
@@ -68,7 +73,7 @@ npm run typecheck  # 서버 + 웹 둘 다
 
 ### 스키마 변경
 
-`src/server/migrations/` 디렉토리에 SQL 파일 추가 (`000N_<name>.sql`). `migrations.ts`가 `schema_migrations` 테이블로 적용 이력 추적. 현재 0001(init), 0002(search_fts FTS5 + 트리거 12개 → Sprint 16 후 9개), 0003(imported_commits), 0004(extracted_features), 0005(drop file_explanations) 적용됨. 새 마이그레이션 추가 시 `migrations.test.ts`에 인덱스/트리거 존재 검증 추가 권장.
+`src/server/migrations/` 디렉토리에 SQL 파일 추가 (`000N_<name>.sql`). `migrations.ts`가 `schema_migrations` 테이블로 적용 이력 추적. 현재 0001(init), 0002(search_fts FTS5 + 트리거), 0003(imported_commits), 0004(extracted_features), 0005(drop file_explanations), 0006(documents + document_features + FTS 트리거 3) 적용됨. 새 마이그레이션 추가 시 `migrations.test.ts`에 인덱스/트리거 존재 검증 추가 권장.
 
 ### 웹 ↔ 서버 타입 공유
 
@@ -85,7 +90,7 @@ npm run typecheck  # 서버 + 웹 둘 다
 vitest. 도메인 + migrations 커버, HTTP 라우트/MCP/UI는 미커버 (수동 E2E로 검증).
 
 ```bash
-npm test                # 110 tests — projects/features/sanitizer/searchProject/migrations/endSession/migrate-claude-md/tasks/decisions/feature_files/import-git-history/extract-features (+pattern)/workspace/setActiveFeature
+npm test                # 183 tests — domain/migrations/HTTP-스모크/migrate-claude-md/import/extract/workspace/setActiveFeature/documents/session-detail (Sprint 23)
 npm run test:watch
 npm run test:coverage   # v8 reporter
 ```
@@ -102,17 +107,12 @@ curl -s http://localhost:7333/api/projects | jq
 HOME=/tmp/vibemate-test node dist/server/cli.js stop
 ```
 
-## 프론트엔드 마이그레이션 메모
+## 프론트엔드
 
-`src/web/main.ts`는 현재 `// @ts-nocheck` 상태. 1100라인 vanilla JS를 그대로 옮긴 것이므로 다음 작업 시 점진적으로 타입 입혀갈 것:
-
-1. `DATA` mock 객체부터 `fetch()` 호출로 교체 — 이때 `import type { Project, Feature } from '../server/types'` 사용
-2. `state` 객체 타입 정의
-3. DOM 헬퍼(`el()`)에 제너릭 타입 추가
-4. 점진적으로 `@ts-nocheck` 제거
+Sprint 8 에서 `@ts-nocheck` 제거 완료. `src/web/types.ts` 가 모든 인터페이스 정의 (Sprint 22/23 에서 Document/SessionDetail/LastSessionSummary 등 추가). 신규 view는 Sprint 22 documents 패턴(`currentDocument` state → `renderDocumentDetail` dispatch)을 따른다. Sprint 23 sessions sub-view 도 동일.
 
 프레임워크(Svelte/React) 도입은 다음 조건이 동시에 충족될 때만:
-- 라우팅이 진짜 필요해짐 (단순 탭 state로 부족)
+- 라우팅이 진짜 필요해짐 (단순 탭 + sub-view state로 부족)
 - 컴포넌트 재사용이 많아짐
 - 글로벌 store가 필요해짐
 
@@ -130,14 +130,15 @@ HOME=/tmp/vibemate-test node dist/server/cli.js stop
 
 ## 알려진 제약
 
-- 큰 monorepo에서 chokidar 파일 워처 성능 미검증.
-- 검색 인덱싱은 feature/decision/session 3종 (file/task 미인덱싱 — ADR-0005/0009/0010).
-- 자동 테스트는 도메인/migrations 한정 — HTTP 라우트 / MCP / UI 는 수동 E2E.
+- 검색 인덱싱은 feature/decision/session/document 4종 (file/task 미인덱싱 — ADR-0005/0009/0010/0016/0019).
+- 자동 테스트는 도메인/migrations 한정 (`npm test` — 183 tests) — HTTP 라우트 / MCP / UI 는 수동 E2E.
 - 양방향 spec.md 파일 동기화 미구현.
 - **AI 파일 설명 / Code Map은 Sprint 16(ADR-0016)에서 제거됨.** `sessions.files`와 `feature_files` 매핑은 유지 (Sprint 4-5의 핵심).
+- **chokidar 워처는 Sprint 21(ADR-0018)에서 제거됨.** `deriveSessionFiles` 가 `git status --porcelain` 으로 endSession 시점에 derive (policy B uncommitted only).
+- `last_session.notes_excerpt` 는 Sprint 23 이후 `pm_session_end({notes})` 로 작성된 세션부터 의미 있음.
 
 <!-- vibemate-section:v2 -->
-<!-- vibemate-template-version: 3 -->
+<!-- vibemate-template-version: 4 -->
 
 ## 이 프로젝트는 Vibemate가 활성화되어 있습니다
 
@@ -158,8 +159,19 @@ Feature 작업 시작 시 (다른 기능으로 전환할 때 포함):
 - `pm_log_decision` 으로 ADR 기록 제안 (사용자 confirm 후 호출)
 
 세션 종료 직전:
-- `pm_session_end` 호출 (session_id, 한 줄 요약, primary_feature_id)
-- summary는 한국어 권장. 어떤 기능을 어떻게 진행했는지 명확하게.
+- `pm_session_end` 호출 (session_id, summary, primary_feature_id, **notes**)
+- **summary**: 한 줄 핵심 — 검색 / 카드 노출에 사용. 한국어 권장.
+- **notes**: 구조화된 Markdown — 다음 세션이 "이어서 작업" 할 수 있게 정리.
+  예:
+  ```
+  ## 완료
+  - 구현 / 수정한 항목
+  ## 남은 일
+  - 미완료 항목 + 다음 세션이 시작할 위치
+  ## 결정
+  - 의식적으로 정한 정책 (큰 결정은 `pm_log_decision` 으로 별도 ADR 기록)
+  ```
+- 이 `notes` 의 첫 200자가 다음 세션 시작 시 `pm_get_context` 의 `last_session.notes_excerpt` 로 노출됨.
 
 태스크 / 기능 변경:
 - 태스크 시작: `pm_update_task` (status=in_progress)

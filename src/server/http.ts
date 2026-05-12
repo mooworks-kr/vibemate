@@ -199,6 +199,17 @@ export function createApp() {
 
   // ----- Sessions -----
 
+  // Sprint 23 (h5uk): single session detail — feeds the renderSessionDetail
+  // sub-view with files / prev-next nav / labeled timestamps.
+  app.get('/api/sessions/:id', (c) => {
+    const id = c.req.param('id');
+    try {
+      return c.json(domain.getSessionDetail(id));
+    } catch (e) {
+      return c.json({ error: (e as Error).message }, 404);
+    }
+  });
+
   app.get('/api/projects/:id/sessions', (c) => {
     const projectId = c.req.param('id');
     const limit = Number(c.req.query('limit') ?? 50);

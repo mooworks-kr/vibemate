@@ -71,7 +71,7 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 
 ## 진행 상황
 
-### ✓ 완료 (Sprint 1-16)
+### ✓ 완료 (Sprint 1-23)
 
 **기반 (Sprint 1-3)**
 - 도메인 레이어 E2E
@@ -124,13 +124,58 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 - 단위 테스트 38 → **119 → 103** (Sprint 16에서 -16, +1 회귀 가드)
 - 번들 50.28 KB → **40.84 KB** (-19% — codemap UI + 4 file 함수 제거)
 
+**Sprint 17 — spec_md 작업 흐름 (ADR-0017)**
+- `pm_set_active_feature` 응답에 `spec_md` 포함 → Claude Code 가 feature 시작 시 자동 surface
+- `setActiveProject` 시 `currentTab === 'workspace'` 면 자동으로 features 탭 전환
+- claudeMdTemplate v3: feature 작업 시작 시 spec_md 검토 가이드 추가
+
+**Sprint 18 — 완료 항목 접기 + workspace 확장**
+- 사이드바 완료 features 토글 (Option C, localStorage `vibemate.hideCompleted`)
+- `pm_get_context` / workspace endpoint 가 in_progress + todo 모두 반환 (이전: in_progress 만)
+- STATUS_PRIORITY 정렬: in_progress > todo > done > archived
+
+**Sprint 19 — Active features Cross-project 강화**
+- workspace endpoint 카드에 next_task / unread_decisions count surface
+- spec_md 결정 항목 ADR 자동 연결 (Sprint 17 흐름 후속)
+
+**Sprint 20 — Project Overview (ADR-0017 후속)**
+- `dashboard` → `overview` 탭 리네임 + `GET /api/projects/:id/overview`
+- `ProjectHealth` 4-status (active / todo_only / archived / empty) — in_progress 기준 + needs_review fallback
+- 최근 세션 + active features + 우선 다음 작업 묶음
+
+**Sprint 21 — chokidar 제거 (ADR-0018)**
+- 파일 워처 완전 삭제 → `git status --porcelain` at `endSession` (policy B: uncommitted only)
+- EMFILE 근본 해결 + 의존성 chokidar 제거
+- `watcher.ts` 삭제, `deriveSessionFiles` 도메인 함수로 대체
+- launchd plist fd 한도 10240 → 65536 (보험)
+
+**Sprint 22 — Spec Hub (ADR-0019)**
+- documents 데이터 모델 + M:N feature 매핑 (`documents` + `document_features`)
+- HTTP +8 routes (CRUD + features mapping + active_documents) / MCP +6 tools
+- 새 마이그레이션 `0006_documents.sql`: 6 kind enum + FTS5 통합 (weight 0.8, KIND_WEIGHT 확장)
+- Frontend: `docs` 탭 추가 + `renderDocumentDetail` + `renderMarkdownLite` (50 LOC)
+- features.spec_md 와 documents 양립 — spec_md = feature scope, documents = 자료 hub
+- claudeMdTemplate v3 active_documents 가이드 보강
+
+**Sprint 23 — Session Intelligence (ADR-0020)**
+- `pm_get_context.last_session` 자동 surface (active_feature 있을 때) — `notes_excerpt` 200자
+- `pm_session_end({notes})` optional 파라미터 + COALESCE 보존 (Sprint 12 import-history 무회귀)
+- 새 HTTP `GET /api/sessions/:id` (404 graceful) + 새 MCP `pm_get_session_detail`
+- Frontend: sessions 탭 sub-view drill-in (`currentSession` state) + prev/next 네비 + Overview 카드 → drill-in
+- claudeMdTemplate v3 → **v4**: `## 완료 / ## 남은 일 / ## 결정` 구조화 가이드 + `last_session` 노출 안내. 마커 v2 유지.
+- HTTP 29 → **30** (+1), MCP 25 → **26** (+1), tests 169 → **183** (+14), 번들 57.63 → **61.97 KB** (+4.34 KB)
+- 스키마 변경 0 (기존 notes 컬럼 재활용)
+
 ### 다음 백로그 후보
 
-- `[Maintenance]` `main.ts` 잔존 `any` ~42건 narrow (Sprint 8 후속)
+- `[Maintenance]` `main.ts` 잔존 `any` narrow (Sprint 8 후속)
+- AI Context Pack (`ijze`): 다음 세션 prompt 생성 — Sprint 23 비범위
+- Feature Flow Map: feature 간 의존/링크 시각화
 - 검색 한계 재검토: 한국어 형태소 분석기/임베딩 (ADR-0009 비범위)
 - tasks 검색 인덱싱 재검토: 운영 데이터로 가치 재평가 (ADR-0010 비범위)
 - 다른 source import: jira/notion/linear (Sprint 12의 `imported_<source>` 패턴 확장)
 - 양방향 spec.md 동기화 (미구현 명시)
+- agent별 작업 흐름 구분 (Codex/Claude 등) — Sprint 23 비범위
 
 ## 데이터 위치
 
@@ -150,11 +195,11 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 - **자동 매핑 + 수동 보정**. 세션 종료 시 touch한 파일을 active feature에 confidence 0.7~0.85로 자동 매핑.
 - **단일 프로젝트 구조**. 백엔드/프론트엔드를 분리하지 않음 — 로컬 데스크톱 앱이라 분리 이유 없음.
 
-Sprint 4-16 ADR (vibemate DB에 ADR-0001~0016 기록, 웹 대시보드 또는 `pm_get_context`로 조회):
+Sprint 4-23 ADR (vibemate DB에 ADR-0001~0020 기록, 웹 대시보드 또는 `pm_get_context`로 조회):
 - 0001 API 에러 응답: list = 200+`[]`, 단일 = 404+`{error}`
 - 0002 삭제 정책: feature=archive, task/decision=hard delete + decision PATCH 지원
-- 0003 ~~AI 파일 설명~~: edit_type {modified, created} 필터 + 강제 재생성=DELETE 캐시 + CLAUDE.md 마이그레이션은 명시 트리거만 — **historical (ADR-0016에서 기능 자체가 제거됨)**
-- 0004 검색 BM25: title 3:1 가중치 + kind multiplier (feature 1.0 / decision 0.9 / ~~file 0.7~~ / session 0.6) — Sprint 16에서 `file` 가중치 삭제
+- 0003 ~~AI 파일 설명~~: edit_type {modified, created} 필터 + 강제 재생성=DELETE 캐시 — **historical (ADR-0016에서 기능 자체가 제거됨)**
+- 0004 검색 BM25: title 3:1 가중치 + kind multiplier (feature 1.0 / decision 0.9 / ~~file 0.7~~ / session 0.6 / document 0.8)
 - 0005 검색 인덱싱 범위: tasks 미인덱싱 + tokenizer 옵션 미적용
 - 0006 인벤토리 우선 워크플로우 (스프린트 첫 task는 항상 인벤토리)
 - 0007 프론트엔드 타입화: types-first + ElProps loose union, @ts-nocheck 제거는 strict 통과 시
@@ -166,13 +211,18 @@ Sprint 4-16 ADR (vibemate DB에 ADR-0001~0016 기록, 웹 대시보드 또는 `p
 - 0013 commit prefix → feature: type whitelist + scope 필수 + case-insensitive 머지 + min-count 3
 - 0014 사용자 정의 regex 추출: named scope 우선 + custom 모드 분리 + 그룹 0 reject + 패턴 길이 200
 - 0015 Workspace view: 단일 endpoint + Tab union 확장 + 사이드바 dual-mode + mark 클라 계산
-- 0016 Code Map / AI 파일 설명 제거: 실 사용량이 가설보다 낮음 + 유지비용 > 가치 + sessions.files / feature_files 매핑은 유지
+- 0016 Code Map / AI 파일 설명 제거: 실 사용량이 가설보다 낮음 + 유지비용 > 가치
+- 0017 spec_md 작업 흐름: `pm_set_active_feature` 응답에 spec_md 포함 + setActiveProject 자동 탭 전환 + claudeMdTemplate v3
+- 0018 파일 워처 제거: chokidar EMFILE 근본 해결 + `git status --porcelain` at endSession (policy B uncommitted only)
+- 0019 Spec Hub: documents 모델 + kind 6종 + features.spec_md 양립 + FTS5 노출(weight 0.8) + simple textarea
+- 0020 Session Intelligence: notes Markdown 구조화 + getContext.last_session surface + claudeMdTemplate v4
 
 ## 알려진 제약
 
-- 자동 테스트는 도메인/migrations/migrate-claude-md 한정 (`npm test` — 103 tests). HTTP 라우트 / MCP / UI는 수동 E2E.
-- 큰 monorepo에서 chokidar 파일 워처 성능 미검증.
+- 자동 테스트는 도메인/migrations/migrate-claude-md 한정 (`npm test` — 183 tests). HTTP 라우트 / MCP / UI는 수동 E2E.
+- ~~큰 monorepo에서 chokidar 파일 워처 성능 미검증.~~ — Sprint 21(ADR-0018) chokidar 제거됨.
 - 한국어 검색은 어절 시작 매칭만 가능 (어절 중간 매칭은 미지원, ADR-0009).
-- 검색 인덱싱은 feature/decision/session 3종 (ADR-0005/0010/0016 — tasks/file 모두 미인덱싱).
+- 검색 인덱싱은 feature/decision/session/document 4종 (ADR-0005/0010/0016/0019 — tasks/file 미인덱싱).
 - 양방향 spec.md 파일 동기화 미구현.
 - AI 파일 설명 / Code Map은 Sprint 16(ADR-0016)에서 제거됨. `sessions.files`와 `feature_files` 매핑은 유지 (Sprint 4-5).
+- `last_session.notes_excerpt` 는 사용자가 `pm_session_end({notes})` 패턴으로 구조화 작성한 세션부터 의미 있음 (Sprint 23). 기존 import-history 세션의 notes_excerpt 는 0자.

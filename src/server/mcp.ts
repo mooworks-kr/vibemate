@@ -51,13 +51,18 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
       session_id: z.string().describe('session_start에서 받은 ID'),
       summary: z.string().describe('세션 한 줄 요약 (한국어 권장)'),
       primary_feature_id: z.string().optional().describe('이 세션에서 주로 작업한 기능'),
+      // Sprint 23 (h5uk / ADR-0020): structured Markdown notes
+      // (`## 완료 / ## 남은 일 / ## 결정`). The first 200 chars become the
+      // next session's `last_session.notes_excerpt`. See claudeMdTemplate v4.
+      notes: z.string().optional().describe('구조화된 Markdown 메모 (## 완료 / ## 남은 일 / ## 결정). 다음 세션 시작 시 last_session.notes_excerpt 로 노출됨.'),
     },
-    async ({ session_id, summary, primary_feature_id }) => {
+    async ({ session_id, summary, primary_feature_id, notes }) => {
       return ok(
         domain.endSession({
           sessionId: session_id,
           summary,
           primaryFeatureId: primary_feature_id,
+          notes,
         }),
       );
     },
@@ -89,6 +94,19 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     async ({ project_id, feature_id }) => {
       const pid = resolveProject(project_id);
       return ok(domain.getContext(pid, undefined, feature_id));
+    },
+  );
+
+  // Sprint 23 (h5uk): single-session detail with files + prev/next nav.
+  // Lets Claude Code re-read a specific session's structured notes (per
+  // claudeMdTemplate v4 — `## 완료 / ## 남은 일 / ## 결정`) on demand.
+  server.tool(
+    'pm_get_session_detail',
+    {
+      session_id: z.string(),
+    },
+    async ({ session_id }) => {
+      return ok(domain.getSessionDetail(session_id));
     },
   );
 

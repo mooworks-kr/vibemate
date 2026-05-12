@@ -60,6 +60,35 @@ describe('endSession', () => {
     expect(row.summary).toBe('세션 종료 요약');
     expect(row.ended_at).toBeGreaterThan(0);
   });
+
+  // Sprint 23 (h5uk / ADR-0020): claudeMdTemplate v4 instructs callers to
+  // pass structured Markdown `notes`. endSession stores it; the first 200
+  // chars become the next session's `last_session.notes_excerpt`.
+  it('persists structured Markdown notes when provided', () => {
+    const { sessionId } = makeSessionWithFiles(t.dir, []);
+    const notes = '## 완료\n- 인벤토리\n## 남은 일\n- 백엔드 구현';
+    domain.endSession({ sessionId, summary: 's', notes });
+    const row = getDb()
+      .prepare('SELECT notes FROM sessions WHERE id = ?')
+      .get(sessionId) as { notes: string };
+    expect(row.notes).toBe(notes);
+  });
+
+  it('preserves existing notes when caller omits the field (COALESCE)', () => {
+    // Pre-seed the row with notes the way `pm import-history` does (commit
+    // body in notes). endSession without a `notes` arg must not clobber it.
+    const project = domain.createProject({ name: 'P', rootPath: t.dir });
+    const startCtx = domain.startSession({ projectId: project.id });
+    getDb()
+      .prepare('UPDATE sessions SET notes = ? WHERE id = ?')
+      .run('pre-existing commit body', startCtx.session_id);
+
+    domain.endSession({ sessionId: startCtx.session_id, summary: 's' });
+    const row = getDb()
+      .prepare('SELECT notes FROM sessions WHERE id = ?')
+      .get(startCtx.session_id) as { notes: string };
+    expect(row.notes).toBe('pre-existing commit body');
+  });
 });
 
 // (Removed in ADR-0016: describe blocks for getFileContent / saveFileExplanation /

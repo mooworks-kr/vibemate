@@ -21,6 +21,7 @@ import type {
   FeatureContext,
   FeatureFile,
   FeatureStatus,
+  LastSessionSummary,
   Project,
   ProjectHealth,
   ProjectOverview,
@@ -30,6 +31,9 @@ import type {
   ProjectStats,
   SearchResult,
   Session,
+  SessionDetail,
+  SessionDetailSibling,
+  SessionFile,
   SessionStartContext,
   Task,
   TaskStatus,
@@ -664,6 +668,11 @@ export function getContext(
     // so Claude Code can ground itself in PRD / planning / architecture
     // memos at session boundary (mirrors spec_md surface area).
     active_documents: activeDocumentsFor(activeFeature?.id),
+    // Sprint 23 (h5uk): the active feature's most recent ended session,
+    // for "이어서 작업하기". claudeMdTemplate v4 instructs users to write
+    // notes in `## 완료 / ## 남은 일 / ## 결정` form so this excerpt is
+    // actually useful as a hand-off blob.
+    last_session: activeFeature ? latestEndedSessionFor(activeFeature.id) : null,
   };
 }
 
@@ -924,14 +933,34 @@ export function endSession(args: {
   sessionId: string;
   summary: string;
   primaryFeatureId?: string;
+  /** Sprint 23 (h5uk, ADR-0020): structured Markdown — `## 완료 / ## 남은 일 /
+   *  ## 결정`. The first 200 chars surface on the next session start via
+   *  `getContext.last_session.notes_excerpt`. claudeMdTemplate v4 guides
+   *  callers to provide this. Optional — when absent, `notes` keeps its
+   *  prior value (commonly null for live sessions, or commit body for
+   *  import-history-derived sessions).
+   */
+  notes?: string;
 }): { ok: true; files_touched: string[] } {
   const db = getDb();
   const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(args.sessionId) as any;
   if (!session) throw new Error(`Session not found: ${args.sessionId}`);
 
+  // `COALESCE(?, notes)` keeps the existing notes when the caller doesn't
+  // pass one — mirrors the feature_id treatment a line above.
   db.prepare(
-    `UPDATE sessions SET ended_at = ?, summary = ?, feature_id = COALESCE(?, feature_id) WHERE id = ?`,
-  ).run(now(), args.summary, args.primaryFeatureId ?? null, args.sessionId);
+    `UPDATE sessions
+     SET ended_at = ?, summary = ?,
+         notes = COALESCE(?, notes),
+         feature_id = COALESCE(?, feature_id)
+     WHERE id = ?`,
+  ).run(
+    now(),
+    args.summary,
+    args.notes ?? null,
+    args.primaryFeatureId ?? null,
+    args.sessionId,
+  );
 
   // Sprint 21 (ADR-0019): derive working-tree changes at end-of-session.
   // The project's root_path is the cwd for the git invocation. Any rows
@@ -1103,6 +1132,113 @@ export function listSessions(projectId: string, limit: number = 50): Array<
       .all(s.id) as { file_path: string }[];
     return { ...rowToSession(s), feature_name: s.feature_name, files: files.map((f) => f.file_path) };
   });
+}
+
+// ============================================================
+// Session detail (Sprint 23, h5uk — Session Intelligence)
+//
+// `getSessionDetail` is the rich shape behind GET /api/sessions/:id. Unlike
+// `listSessions` (cards in the sessions tab + Overview / feature detail),
+// this fetches:
+//   * the full row + joined feature_name
+//   * all session_files with edit_type (the cards truncate to 6 path strings)
+//   * prev/next siblings within the same feature so the detail view can
+//     wire up "← 이전 세션 / 다음 세션 →" navigation
+// ============================================================
+
+/** Compact `Session` row shaped for the prev/next nav. Pulled out as a
+ *  helper so getSessionDetail doesn't repeat the small projection twice. */
+function siblingSession(row: { id: string; started_at: number; summary: string | null } | undefined): SessionDetailSibling | null {
+  if (!row) return null;
+  return {
+    id: row.id,
+    time: relativeTime(row.started_at),
+    summary: row.summary,
+  };
+}
+
+export function getSessionDetail(sessionId: string): SessionDetail {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT s.*, f.name AS feature_name FROM sessions s
+       LEFT JOIN features f ON f.id = s.feature_id
+       WHERE s.id = ?`,
+    )
+    .get(sessionId) as
+      | (Session & { feature_name: string | null })
+      | undefined;
+  if (!row) throw new Error(`Session not found: ${sessionId}`);
+
+  const fileRows = db
+    .prepare(
+      `SELECT session_id, file_path, edit_type FROM session_files
+       WHERE session_id = ? ORDER BY file_path`,
+    )
+    .all(sessionId) as unknown as SessionFile[];
+
+  // prev/next siblings — same feature, by started_at. If feature_id is null
+  // (e.g. orphan / pre-Sprint-21 session), there is no sibling axis to walk
+  // and we just return null on both sides.
+  let prevRow: { id: string; started_at: number; summary: string | null } | undefined;
+  let nextRow: typeof prevRow;
+  if (row.feature_id) {
+    prevRow = db
+      .prepare(
+        `SELECT id, started_at, summary FROM sessions
+         WHERE feature_id = ? AND started_at < ? AND summary IS NOT NULL
+         ORDER BY started_at DESC LIMIT 1`,
+      )
+      .get(row.feature_id, row.started_at) as typeof prevRow;
+    nextRow = db
+      .prepare(
+        `SELECT id, started_at, summary FROM sessions
+         WHERE feature_id = ? AND started_at > ? AND summary IS NOT NULL
+         ORDER BY started_at ASC LIMIT 1`,
+      )
+      .get(row.feature_id, row.started_at) as typeof nextRow;
+  }
+
+  return {
+    ...rowToSession(row),
+    feature_name: row.feature_name,
+    files: fileRows,
+    started_at_label: relativeTime(row.started_at),
+    ended_at_label: row.ended_at != null ? relativeTime(row.ended_at) : null,
+    prev_session: siblingSession(prevRow),
+    next_session: siblingSession(nextRow),
+  };
+}
+
+// Sprint 23 #6 (h5uk / ADR-0020): excerpt budget for the LastSessionSummary
+// notes — mirrors DocumentSummary.excerpt cap from Sprint 22.
+const LAST_SESSION_NOTES_EXCERPT_CHARS = 200;
+
+/** Most-recently-ended session attached to `featureId`. Returns null when
+ *  there's no such session (fresh feature, or feature only has the
+ *  currently-open session). */
+function latestEndedSessionFor(featureId: string): LastSessionSummary | null {
+  const row = getDb()
+    .prepare(
+      `SELECT id, ended_at, summary, notes FROM sessions
+       WHERE feature_id = ? AND ended_at IS NOT NULL
+       ORDER BY ended_at DESC LIMIT 1`,
+    )
+    .get(featureId) as
+      | { id: string; ended_at: number; summary: string | null; notes: string | null }
+      | undefined;
+  if (!row) return null;
+  const notes = (row.notes ?? '').trim();
+  const excerpt =
+    notes.length <= LAST_SESSION_NOTES_EXCERPT_CHARS
+      ? notes
+      : notes.slice(0, LAST_SESSION_NOTES_EXCERPT_CHARS) + '…';
+  return {
+    id: row.id,
+    ended_at_label: relativeTime(row.ended_at),
+    summary: row.summary,
+    notes_excerpt: excerpt,
+  };
 }
 
 // ============================================================
@@ -1674,9 +1810,13 @@ export type {
 export const VIBEMATE_SECTION_BEGIN = '<!-- vibemate-section:v2 -->';
 export const VIBEMATE_SECTION_END = '<!-- /vibemate-section -->';
 // Bumped 2 → 3 in Sprint 17 (ADR-0017) when the spec_md hand-off workflow
-// was added to the template body. Existing v2 sections migrate cleanly
-// because the section markers are unchanged.
-export const VIBEMATE_TEMPLATE_VERSION = 3;
+// was added to the template body.
+// Bumped 3 → 4 in Sprint 23 (ADR-0020) when the session-end notes template
+// (`## 완료 / ## 남은 일 / ## 결정`) was added so claudeMdTemplate consumers
+// produce notes the `last_session.notes_excerpt` surface can actually use.
+// Existing v2/v3 sections migrate cleanly because the section markers are
+// unchanged — the migrator only swaps the body between BEGIN/END.
+export const VIBEMATE_TEMPLATE_VERSION = 4;
 // Legacy single-line marker emitted by Sprint ≤8 templates. Single-shot,
 // no closing marker. Detected for backward-compat; first migration pass
 // rewrites these to the v2 pair.
@@ -1717,8 +1857,19 @@ Feature 작업 시작 시 (다른 기능으로 전환할 때 포함):
 - \`pm_log_decision\` 으로 ADR 기록 제안 (사용자 confirm 후 호출)
 
 세션 종료 직전:
-- \`pm_session_end\` 호출 (session_id, 한 줄 요약, primary_feature_id)
-- summary는 한국어 권장. 어떤 기능을 어떻게 진행했는지 명확하게.
+- \`pm_session_end\` 호출 (session_id, summary, primary_feature_id, **notes**)
+- **summary**: 한 줄 핵심 — 검색 / 카드 노출에 사용. 한국어 권장.
+- **notes**: 구조화된 Markdown — 다음 세션이 "이어서 작업" 할 수 있게 정리.
+  예:
+  \`\`\`
+  ## 완료
+  - 구현 / 수정한 항목
+  ## 남은 일
+  - 미완료 항목 + 다음 세션이 시작할 위치
+  ## 결정
+  - 의식적으로 정한 정책 (큰 결정은 \`pm_log_decision\` 으로 별도 ADR 기록)
+  \`\`\`
+- 이 \`notes\` 의 첫 200자가 다음 세션 시작 시 \`pm_get_context\` 의 \`last_session.notes_excerpt\` 로 노출됨.
 
 태스크 / 기능 변경:
 - 태스크 시작: \`pm_update_task\` (status=in_progress)

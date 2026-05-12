@@ -21,6 +21,7 @@ import type {
   ProjectStats,
   Project,
   SearchResult,
+  SessionDetail,
   Task,
   TaskStatus,
 } from '../server/types.js';
@@ -32,6 +33,8 @@ export type ProjectOverviewResponse = ProjectOverview;
 // Sprint 22 (3wtr) — re-export Document types so renderDocs and friends
 // don't have to reach across the boundary at every call site.
 export type { Document, DocumentKind };
+// Sprint 23 (h5uk) — re-export session detail shape for the sub-view cache.
+export type { SessionDetail };
 
 // (Removed in ADR-0016: FileTreeNode + FileDetailResponse + DataCache.fileTree
 // + AppState.currentFile + AppState.linkingFile + AppState.fileDetailLoading.
@@ -118,6 +121,10 @@ export interface DataCache {
   /** Per-feature documents list — fed by `/api/features/:id/documents`,
    *  used by feature detail's "관련 문서" section. Keyed by feature id. */
   documentsByFeature?: Record<string, Document[]>;
+  /** Sprint 23 (h5uk): cached `/api/sessions/:id` responses keyed by
+   *  session id. Populated lazily by the detail sub-view when a session
+   *  card is clicked. */
+  sessionDetails?: Record<string, SessionDetail>;
 }
 
 /**
@@ -268,6 +275,10 @@ export interface AppState {
   /** Toggle between raw textarea and a minimal markdown preview inside the
    *  detail view's edit mode. Default false (text). */
   documentPreview: boolean;
+
+  // Sessions tab (Sprint 23, h5uk) ---------------------------------------
+  /** Currently-selected session for the detail sub-view (null = list). */
+  currentSession: string | null;
 }
 
 // ============================================================

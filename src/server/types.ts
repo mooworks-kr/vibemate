@@ -66,6 +66,54 @@ export interface SessionFile {
   edit_type: EditType;
 }
 
+// Sprint 23 (h5uk) — Session Intelligence.
+//
+// `SessionDetail` is the rich shape returned by GET /api/sessions/:id and
+// `pm_get_session_detail` MCP. Carries the base Session row + joined
+// feature_name + edit-typed files + prev/next session pointers for the
+// "navigate within this feature's session history" affordance in the
+// session-detail sub-view.
+export interface SessionDetailSibling {
+  id: string;
+  /** Pre-formatted relative time (matches AdrCard/SessionSummary convention). */
+  time: string;
+  /** First line / summary blurb — long-form notes stay on the detail page. */
+  summary: string | null;
+}
+
+export interface SessionDetail extends Session {
+  /** Resolved name of the linked feature, or null when the session is
+   *  unattached (e.g. pm import-history without an extracted feature). */
+  feature_name: string | null;
+  /** Files touched in this session (Sprint 21 / ADR-0019: derived from
+   *  `git status --porcelain` at endSession time). */
+  files: SessionFile[];
+  /** Pre-formatted started/ended labels — the UI reads these directly. */
+  started_at_label: string;
+  ended_at_label: string | null;
+  /** Same-feature siblings for the prev/next nav buttons in the detail
+   *  view. Null when there is no neighbour on that side. */
+  prev_session: SessionDetailSibling | null;
+  next_session: SessionDetailSibling | null;
+}
+
+/**
+ * Compact projection used by pm_get_context to advertise the "이어서 작업하기"
+ * surface. Shipped on the SessionStartContext when the active feature has
+ * a most-recently-ended session; null otherwise.
+ *
+ * `notes_excerpt` is bounded the same way `DocumentSummary.excerpt` is
+ * (Sprint 22) — 200 chars max. Designed for "what was I in the middle of
+ * last time?" hint, not full context.
+ */
+export interface LastSessionSummary {
+  id: string;
+  /** Pre-formatted relative time. */
+  ended_at_label: string;
+  summary: string | null;
+  notes_excerpt: string;
+}
+
 export interface FeatureFile {
   feature_id: string;
   file_path: string;
@@ -197,6 +245,13 @@ export interface SessionStartContext {
    *  context (PRD / planning / architecture notes) at session start.
    *  Empty when no active feature OR no linked docs. */
   active_documents: DocumentSummary[];
+  /** Sprint 23 (h5uk): the most-recently-ended session attached to the
+   *  same `active_feature`. Powers the "이어서 작업하기" affordance —
+   *  Claude Code can re-read the last session's notes (which the
+   *  claudeMdTemplate v4 guides users to structure with `## 남은 일` /
+   *  `## 결정`) and pick up where the previous session stopped. Null when
+   *  there's no active feature or no prior session on it. */
+  last_session: LastSessionSummary | null;
 }
 
 // (Removed in ADR-0016: FileNode. File-tree API retired.)

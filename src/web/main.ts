@@ -14,6 +14,7 @@ import type {
   ProjectOverview,
   SearchKind,
   SearchResult,
+  SessionDetail,
   Task,
   TaskStatus,
   WorkspaceFeature,
@@ -55,6 +56,7 @@ const DATA: DataCache = {
   overviews: {},
   documents: {},
   documentsByFeature: {},
+  sessionDetails: {},
 };
 
 
@@ -94,6 +96,9 @@ const state: AppState = {
   addingDocument: false,
   editingDocumentId: null,
   documentPreview: false,
+
+  // Sessions tab — Sprint 23 (h5uk)
+  currentSession: null,
 };
 
 // (Removed in ADR-0016: FILE_DETAIL cache + fdKey helper. Code Map retired.)
@@ -1152,6 +1157,36 @@ function renderDocumentForm(doc: Document | null): HTMLElement {
   return wrap;
 }
 
+// =================================================
+// Sessions (Sprint 23, h5uk — Session Intelligence)
+// =================================================
+
+/**
+ * Sprint 23 (h5uk): extract the "## 남은 일" section from a notes blob so
+ * the sessions tab card can show a one-line preview of the "what's
+ * unfinished?" hint. Falls back to empty string when the section is
+ * absent — claudeMdTemplate v4 nudges users to write it but doesn't
+ * force the shape. Section ends at the next `## ` header or end-of-text.
+ */
+function extractRemainingPreview(notes: string | null | undefined): string {
+  if (!notes) return '';
+  const re = /^##\s*남은\s*일\s*$([\s\S]*?)(?=^##\s|$(?![\r\n]))/mi;
+  const m = re.exec(notes);
+  if (!m) return '';
+  // First non-empty line in the section, trimmed of bullet markers, capped.
+  const body = m[1]!.trim();
+  const firstLine = body.split('\n').map((l) => l.trim()).find((l) => l) ?? '';
+  const cleaned = firstLine.replace(/^[-*]\s*/, '');
+  return cleaned.length > 100 ? cleaned.slice(0, 100) + '…' : cleaned;
+}
+
+async function loadSessionDetail(sessionId: string): Promise<SessionDetail> {
+  const detail = await fetchJSON<SessionDetail>(`/api/sessions/${sessionId}`);
+  DATA.sessionDetails = DATA.sessionDetails ?? {};
+  DATA.sessionDetails[sessionId] = detail;
+  return detail;
+}
+
 async function setActiveProject(projectId: string): Promise<void> {
   state.currentProject = projectId;
   state.error = null;
@@ -1795,13 +1830,22 @@ function renderOverview(): void {
     sList.appendChild(el('div', { class: 'empty-state-text', text: '아직 세션 기록이 없습니다.', style: 'padding: 8px 0; color: var(--text-3);' }));
   } else {
     ov.recent_sessions.forEach((s) => {
-      sList.appendChild(el('div', { class: 'activity-item' }, [
-        el('div', { class: 'activity-time', text: s.time }),
-        el('div', { class: 'activity-content' }, [
-          el('div', { class: 'activity-summary', text: s.summary }),
-          el('span', { class: 'activity-feature', text: s.feature_name ?? '' }),
-        ]),
+      // Sprint 23 (h5uk): each row navigates to renderSessionDetail.
+      const row = el('div', {
+        class: 'activity-item',
+        onClick: () => {
+          state.currentTab = 'sessions';
+          state.currentSession = s.id;
+          render();
+        },
+      });
+      row.style.cursor = 'pointer';
+      row.appendChild(el('div', { class: 'activity-time', text: s.time }));
+      row.appendChild(el('div', { class: 'activity-content' }, [
+        el('div', { class: 'activity-summary', text: s.summary }),
+        el('span', { class: 'activity-feature', text: s.feature_name ?? '' }),
       ]));
+      sList.appendChild(row);
     });
   }
   right.appendChild(sList);
@@ -2255,6 +2299,14 @@ function renderDecisions(): void {
 // Main: Sessions
 // =================================================
 function renderSessions(): void {
+  // Sprint 23 (h5uk): detail sub-view dispatch — when a session is
+  // selected, swap the list for the detail page. Matches Sprint 22's
+  // Docs tab pattern (currentDocument drilldown).
+  if (state.currentSession) {
+    renderSessionDetail(state.currentSession);
+    return;
+  }
+
   const main = $('#main')!;
   main.innerHTML = '';
   const p = getProject()!;
@@ -2290,13 +2342,35 @@ function renderSessions(): void {
     bucket.forEach((s) => {
       // Match the dataset on session-row in renderFeatureDetail so the search
       // palette can scroll-to-row regardless of which tab the user lands on.
+      // Sprint 23 (h5uk): cards drill into renderSessionDetail on click.
       const card = el('div', {
         class: 'session-card',
         ...(s.id ? { 'data-ref-id': s.id, 'data-kind': 'session' } : {}),
+        onClick: () => {
+          if (!s.id) return;
+          state.currentSession = s.id;
+          render();
+        },
       });
+      card.style.cursor = s.id ? 'pointer' : 'default';
       card.appendChild(el('div', { class: 'session-card-time', text: s.time }));
       const right = el('div', {});
       right.appendChild(el('p', { class: 'session-card-summary', text: s.summary }));
+      // Sprint 23 (h5uk): if the cached detail has notes with a "## 남은 일"
+      // section, surface the first bullet as a preview line so the user can
+      // tell at a glance which sessions left work unfinished. The cards
+      // page itself doesn't fetch detail (cost would be N round-trips for
+      // a long list); preview only appears when the detail has been viewed
+      // at least once and is in the cache.
+      const cachedDetail = (DATA.sessionDetails ?? {})[s.id ?? ''];
+      const remaining = cachedDetail ? extractRemainingPreview(cachedDetail.notes) : '';
+      if (remaining) {
+        right.appendChild(el('div', {
+          class: 'session-card-remaining',
+          text: '남은 일: ' + remaining,
+          style: 'color: var(--text-3); font-size: 11px; margin-top: 4px;',
+        }));
+      }
       const meta = el('div', { class: 'session-card-meta' });
       const fchip = el('span', { class: 'activity-feature', text: s.feature ?? '', onClick: (e) => {
         e.stopPropagation();
@@ -2315,6 +2389,133 @@ function renderSessions(): void {
     });
     main.appendChild(grp);
   });
+}
+
+/**
+ * Sprint 23 (h5uk): session detail sub-view. Lazily fetches the rich
+ * `SessionDetail` shape (joined feature_name + files + prev/next) on first
+ * paint, renders the structured `notes` as Markdown (reuses Sprint 22's
+ * `renderMarkdownLite`), and exposes "← 이전 세션 / 다음 세션 →" nav.
+ */
+function renderSessionDetail(sessionId: string): void {
+  const main = $('#main')!;
+  main.innerHTML = '';
+  const detail = (DATA.sessionDetails ?? {})[sessionId];
+
+  if (!detail) {
+    loadSessionDetail(sessionId).then(() => render()).catch((e) => {
+      state.error = e instanceof Error ? e.message : '세션 로드 실패';
+      render();
+    });
+    main.appendChild(el('div', { class: 'page-header' }, [
+      el('h1', { class: 'page-title', text: '세션 불러오는 중…' }),
+    ]));
+    return;
+  }
+
+  // Header — back link + summary + feature link + timestamps.
+  const header = el('div', { class: 'page-header' });
+  const back = el('a', {
+    class: 'breadcrumb',
+    text: '← 세션 목록',
+    onClick: () => { state.currentSession = null; render(); },
+  });
+  back.style.cursor = 'pointer';
+  header.appendChild(back);
+  header.appendChild(el('h1', { class: 'page-title', text: detail.summary ?? '(요약 없음)' }));
+  const timeRow = el('p', { class: 'page-tagline' });
+  const startedText = '시작 ' + detail.started_at_label;
+  const endedText = detail.ended_at_label ? ' · 종료 ' + detail.ended_at_label : ' · 진행 중';
+  timeRow.textContent = startedText + endedText;
+  header.appendChild(timeRow);
+  if (detail.feature_name && detail.feature_id) {
+    const featLink = el('a', {
+      text: '연결된 기능: ' + detail.feature_name,
+      onClick: () => {
+        state.currentTab = 'features';
+        state.currentFeature = detail.feature_id;
+        state.currentSession = null;
+        render();
+      },
+    });
+    featLink.style.cssText = 'cursor: pointer; color: var(--accent); font-size: 12px;';
+    header.appendChild(featLink);
+  }
+  main.appendChild(header);
+
+  // Notes body — render as Markdown if non-empty, else hint.
+  const notesSec = el('div', { class: 'detail-section feature-spec-section' });
+  notesSec.appendChild(el('div', { class: 'detail-section-title' }, [el('span', { text: '메모' })]));
+  if (detail.notes && detail.notes.trim()) {
+    const body = el('div', { class: 'feature-spec-body markdown-preview' });
+    body.style.cssText = 'background: var(--bg-elevated); padding: 12px 16px; border-radius: 6px;';
+    body.innerHTML = renderMarkdownLite(detail.notes);
+    notesSec.appendChild(body);
+  } else {
+    notesSec.appendChild(el('div', {
+      class: 'empty-state-text',
+      text: '메모가 없습니다. claudeMdTemplate v4 가이드에 따라 `## 완료 / ## 남은 일 / ## 결정` 형태로 작성하면 다음 세션에서 자동 노출됩니다.',
+      style: 'padding: 8px 0; color: var(--text-3);',
+    }));
+  }
+  main.appendChild(notesSec);
+
+  // Files touched — edit_type chip for each.
+  if (detail.files.length > 0) {
+    const filesSec = el('div', { class: 'detail-section' });
+    filesSec.appendChild(el('div', { class: 'detail-section-title' }, [
+      el('span', { text: '수정한 파일' }),
+      el('span', { class: 'detail-section-count', text: String(detail.files.length) }),
+    ]));
+    const flist = el('div', { class: 'file-list' });
+    detail.files.forEach((f) => {
+      const row = el('div', { class: 'file-row' });
+      row.appendChild(el('span', {
+        text: f.edit_type,
+        style: 'color: var(--text-3); font-size: 10px; margin-right: 8px; min-width: 56px; display: inline-block;',
+      }));
+      row.appendChild(el('div', { class: 'file-path' }, [el('code', { text: f.file_path })]));
+      flist.appendChild(row);
+    });
+    filesSec.appendChild(flist);
+    main.appendChild(filesSec);
+  }
+
+  // Prev / next nav within same feature.
+  if (detail.prev_session || detail.next_session) {
+    const nav = el('div');
+    nav.style.cssText = 'display: flex; justify-content: space-between; margin-top: 16px; gap: 12px;';
+    const prevBtn = el('button', {
+      text: detail.prev_session
+        ? '← 이전 세션 (' + detail.prev_session.time + ')'
+        : '이전 세션 없음',
+      onClick: () => {
+        if (detail.prev_session) {
+          state.currentSession = detail.prev_session.id;
+          render();
+        }
+      },
+    });
+    prevBtn.disabled = !detail.prev_session;
+    prevBtn.style.cssText = 'flex: 1; padding: 8px 12px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-2); border-radius: 4px; font: inherit; font-size: 12px; cursor: ' + (detail.prev_session ? 'pointer' : 'not-allowed') + '; opacity: ' + (detail.prev_session ? '1' : '0.5') + ';';
+    nav.appendChild(prevBtn);
+
+    const nextBtn = el('button', {
+      text: detail.next_session
+        ? '다음 세션 (' + detail.next_session.time + ') →'
+        : '다음 세션 없음',
+      onClick: () => {
+        if (detail.next_session) {
+          state.currentSession = detail.next_session.id;
+          render();
+        }
+      },
+    });
+    nextBtn.disabled = !detail.next_session;
+    nextBtn.style.cssText = 'flex: 1; padding: 8px 12px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-2); border-radius: 4px; font: inherit; font-size: 12px; cursor: ' + (detail.next_session ? 'pointer' : 'not-allowed') + '; opacity: ' + (detail.next_session ? '1' : '0.5') + ';';
+    nav.appendChild(nextBtn);
+    main.appendChild(nav);
+  }
 }
 
 // =================================================
