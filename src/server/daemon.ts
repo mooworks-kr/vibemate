@@ -2,7 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { defaultDataDir } from './lib.js';
 import { startHttpServer } from './http.js';
-import { startFileWatcher, stopAllWatchers } from './watcher.js';
+
+// Sprint 21 (zxl3, ADR-0019): chokidar file watcher retired. The daemon's
+// sole job is now the HTTP server + PID-file housekeeping. `session_files`
+// is derived at endSession time via `git status --porcelain` instead — see
+// domain.ts:endSession.
 
 const PID_FILE = path.join(defaultDataDir(), 'daemon.pid');
 
@@ -22,11 +26,9 @@ export async function startDaemon(port: number = 7321): Promise<void> {
   fs.writeFileSync(PID_FILE, String(process.pid));
 
   startHttpServer(port);
-  startFileWatcher();
 
-  const cleanup = async () => {
+  const cleanup = (): void => {
     console.log('[vibemate] shutting down…');
-    await stopAllWatchers();
     if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
     process.exit(0);
   };

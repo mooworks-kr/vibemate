@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { getDb, transact } from './db.js';
 import { runGitLog, type ParsedCommit } from './git-import.js';
 import {
@@ -8,7 +9,6 @@ import {
   newSessionId,
   now,
   relativeTime,
-  relativizeToProject,
   shouldIgnoreFile,
 } from './lib.js';
 import type {
@@ -645,6 +645,71 @@ export function getProjectOverview(projectId: string): ProjectOverview {
   };
 }
 
+/**
+ * Sprint 21 (zxl3, ADR-0019): derive the session's touched files from the
+ * project's working tree at end-of-session time. Replaces the chokidar live
+ * watcher whose tree-enumeration was burning file descriptors (EMFILE).
+ *
+ * Policy B (uncommitted only): we read `git status --porcelain` once and
+ * map the two-char status code to our EditType. ADR-0012's mapping rules
+ * carry over — deletions drop out, untracked counts as 'created', anything
+ * else is 'modified'. Mid-session commits aren't tracked; that's a known
+ * limitation in the spec_md (the patterns we care about don't include
+ * "commit then keep working on different files in the same session").
+ *
+ * Failure modes — all graceful, all return `[]`:
+ *   * non-git directory (`fatal: not a git repository`)
+ *   * git not installed (ENOENT)
+ *   * any other spawn / exit-code failure
+ * The "files weren't captured" outcome is identical to the watcher-era
+ * case where the user did all edits before opening a session.
+ */
+export function deriveSessionFiles(rootPath: string): Array<{ path: string; edit_type: EditType }> {
+  let out: string;
+  try {
+    // `--untracked-files=all` expands new directories into their constituent
+    // file paths — without it git aggregates to `src/` when the whole dir is
+    // untracked, and we'd lose the leaf names we want to record in
+    // session_files. Cost is bounded by `shouldIgnoreFile` filtering out
+    // node_modules / dist / build below.
+    out = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+      cwd: rootPath,
+      encoding: 'utf8',
+      // Don't surface git's diagnostics into our own stdout/stderr — they
+      // confuse MCP (stdout is the JSON-RPC channel) and aren't actionable
+      // since we always fall back to empty.
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return [];
+  }
+
+  const results: Array<{ path: string; edit_type: EditType }> = [];
+  for (const rawLine of out.split('\n')) {
+    if (rawLine.length < 4) continue; // empty / too-short to be a valid entry
+    const status = rawLine.substring(0, 2);
+    // Format: `XY ` then path. For renames git emits `R  old -> new`; we
+    // pick the destination so the new file's path lands in session_files.
+    let p = rawLine.substring(3).trim();
+    if (status.includes('R')) {
+      const arrowIdx = p.indexOf(' -> ');
+      if (arrowIdx >= 0) p = p.slice(arrowIdx + 4).trim();
+    }
+    if (!p) continue;
+    // Skip deletes — ADR-0012 carry-over. We track presence, not absence.
+    if (status[0] === 'D' || status[1] === 'D') continue;
+
+    // `??` = untracked (brand new); `A` = staged add. Both → 'created'.
+    // Everything else (M / R / C / mixed) → 'modified'.
+    const edit_type: EditType =
+      status === '??' || status.includes('A') ? 'created' : 'modified';
+
+    if (shouldIgnoreFile(p)) continue;
+    results.push({ path: p, edit_type });
+  }
+  return results;
+}
+
 export function endSession(args: {
   sessionId: string;
   summary: string;
@@ -657,6 +722,21 @@ export function endSession(args: {
   db.prepare(
     `UPDATE sessions SET ended_at = ?, summary = ?, feature_id = COALESCE(?, feature_id) WHERE id = ?`,
   ).run(now(), args.summary, args.primaryFeatureId ?? null, args.sessionId);
+
+  // Sprint 21 (ADR-0019): derive working-tree changes at end-of-session.
+  // The project's root_path is the cwd for the git invocation. Any rows
+  // already in session_files (e.g. legacy data from the watcher era, or
+  // from `pm import-history`) are preserved — `recordSessionFile` is
+  // idempotent and keeps the stronger edit_type rank.
+  const project = db
+    .prepare('SELECT root_path FROM projects WHERE id = ?')
+    .get(session.project_id) as { root_path: string } | undefined;
+  if (project) {
+    const derived = deriveSessionFiles(project.root_path);
+    for (const f of derived) {
+      recordSessionFile(args.sessionId, f.path, f.edit_type);
+    }
+  }
 
   // Auto-link files touched in this session to the primary feature
   const featureId = args.primaryFeatureId ?? session.feature_id;
@@ -816,28 +896,12 @@ export function listSessions(projectId: string, limit: number = 50): Array<
 }
 
 // ============================================================
-// File-watcher integration: record edits without an active session
+// (Removed in Sprint 21 / ADR-0019: `recordFileEdit`. Used to be the
+// chokidar watcher's entry point — given a project + path, look up the
+// open session and stash the edit. Now session_files is derived at
+// endSession time via `git status --porcelain` (see deriveSessionFiles
+// below), so this whole live-tracking surface is gone.)
 // ============================================================
-
-/**
- * Record a file edit. If there's an open session for the project, attach to it.
- * If not, the edit goes unrecorded (we don't keep an "orphan" bucket in this MVP).
- */
-export function recordFileEdit(
-  projectId: string,
-  filePath: string,
-  editType: EditType,
-): void {
-  const db = getDb();
-  const session = db
-    .prepare(
-      `SELECT id FROM sessions WHERE project_id = ? AND ended_at IS NULL
-       ORDER BY started_at DESC LIMIT 1`,
-    )
-    .get(projectId) as { id: string } | undefined;
-  if (!session) return;
-  recordSessionFile(session.id, filePath, editType);
-}
 
 // ============================================================
 // File tree
@@ -1342,7 +1406,9 @@ export function listWorkspaceFeatures(opts: ListWorkspaceFeaturesOpts = {}): Wor
   });
 }
 
-export { relativizeToProject };
+// (Removed in Sprint 21 / ADR-0019: `relativizeToProject` re-export. The
+// watcher was the sole consumer; live consumers reach into ./lib.js directly
+// if needed. The function still exists there for git-import path normalisation.)
 // Re-export so cli.ts and tests can compose without reaching into the helper.
 export type { ParsedCommit };
 export {

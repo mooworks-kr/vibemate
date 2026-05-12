@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import * as domain from '../domain.js';
 import { getDb } from '../db.js';
-import { createTempDb } from './helpers.js';
+import { createTempDb, gitInit } from './helpers.js';
 
 let t: ReturnType<typeof createTempDb>;
 
@@ -194,5 +198,156 @@ describe('setActiveFeature', () => {
     expect(() => domain.setActiveFeature('no-such-session', f.id)).toThrow(
       /Session not found/,
     );
+  });
+});
+
+// Sprint 21 (zxl3, ADR-0019): deriveSessionFiles + endSession git integration.
+// These tests need a real git working tree (via `gitInit` from helpers).
+//
+// We deliberately don't mock execFileSync — the parsing has subtle branches
+// (porcelain status codes, rename arrows, deletes) and a fake exercise
+// would be more fragile than a real one. The fixture stays tiny (≤3 files,
+// no remotes) so all tests run in well under a second.
+
+describe('deriveSessionFiles', () => {
+  it('returns an empty array for a non-git directory (graceful)', () => {
+    const nonGit = fs.mkdtempSync(path.join(os.tmpdir(), 'vibemate-nongit-'));
+    try {
+      expect(domain.deriveSessionFiles(nonGit)).toEqual([]);
+    } finally {
+      fs.rmSync(nonGit, { recursive: true, force: true });
+    }
+  });
+
+  it('returns an empty array on a clean git repo', () => {
+    const g = gitInit();
+    try {
+      expect(domain.deriveSessionFiles(g.repoDir)).toEqual([]);
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  it("maps modifications to 'modified' and untracked files to 'created'", () => {
+    const g = gitInit();
+    try {
+      // Modify the tracked README and drop an untracked file.
+      fs.appendFileSync(path.join(g.repoDir, 'README.md'), 'second line\n');
+      fs.writeFileSync(path.join(g.repoDir, 'NEW.md'), 'brand new\n');
+
+      const got = domain.deriveSessionFiles(g.repoDir);
+      // Sort for stable assertions; status order isn't a contract.
+      const byPath = Object.fromEntries(got.map((f) => [f.path, f.edit_type]));
+      expect(byPath['README.md']).toBe('modified');
+      expect(byPath['NEW.md']).toBe('created');
+      expect(got).toHaveLength(2);
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  it("maps staged adds to 'created' (status 'A ')", () => {
+    const g = gitInit();
+    try {
+      fs.writeFileSync(path.join(g.repoDir, 'staged.ts'), 'export {};\n');
+      execFileSync('git', ['add', 'staged.ts'], { cwd: g.repoDir, stdio: 'ignore' });
+      const got = domain.deriveSessionFiles(g.repoDir);
+      expect(got).toEqual([{ path: 'staged.ts', edit_type: 'created' }]);
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  it('skips deletions per ADR-0012 (we track presence, not absence)', () => {
+    const g = gitInit();
+    try {
+      fs.rmSync(path.join(g.repoDir, 'README.md'));
+      const got = domain.deriveSessionFiles(g.repoDir);
+      expect(got).toEqual([]);
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  it('applies shouldIgnoreFile (node_modules / .git / build artifacts)', () => {
+    const g = gitInit();
+    try {
+      // Two of these should land in node_modules / dist (ignored). Only
+      // the src/ file should survive the filter. shouldIgnoreFile lives in
+      // lib.ts and is shared with import-history, so any drift would
+      // surface here too.
+      fs.mkdirSync(path.join(g.repoDir, 'node_modules', 'foo'), { recursive: true });
+      fs.writeFileSync(path.join(g.repoDir, 'node_modules', 'foo', 'index.js'), 'x');
+      fs.mkdirSync(path.join(g.repoDir, 'dist'), { recursive: true });
+      fs.writeFileSync(path.join(g.repoDir, 'dist', 'bundle.js'), 'x');
+      fs.mkdirSync(path.join(g.repoDir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(g.repoDir, 'src', 'real.ts'), 'export {};');
+
+      const got = domain.deriveSessionFiles(g.repoDir);
+      expect(got.map((f) => f.path)).toEqual(['src/real.ts']);
+    } finally {
+      g.cleanup();
+    }
+  });
+});
+
+describe('endSession + git status integration', () => {
+  it('writes derived files into session_files and surfaces them in files_touched', () => {
+    const g = gitInit();
+    try {
+      // Same temp-DB scaffolding as the other endSession tests above.
+      const project = domain.createProject({ name: 'P', rootPath: g.repoDir });
+      const startCtx = domain.startSession({ projectId: project.id });
+      // Make changes AFTER startSession — Sprint 21 flow doesn't snapshot
+      // a baseline; we just look at the working tree at endSession.
+      fs.appendFileSync(path.join(g.repoDir, 'README.md'), 'edit\n');
+      fs.writeFileSync(path.join(g.repoDir, 'note.txt'), 'hi');
+
+      const res = domain.endSession({ sessionId: startCtx.session_id, summary: 's' });
+      expect(res.ok).toBe(true);
+      expect(res.files_touched.sort()).toEqual(['README.md', 'note.txt']);
+
+      // And the rows landed in session_files for downstream queries
+      // (sessions tab, feature_files autoLink).
+      const rows = getDb()
+        .prepare('SELECT file_path FROM session_files WHERE session_id = ?')
+        .all(startCtx.session_id) as { file_path: string }[];
+      expect(rows.map((r) => r.file_path).sort()).toEqual(['README.md', 'note.txt']);
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  it('is idempotent on re-end (recordSessionFile rank guard keeps existing rows clean)', () => {
+    // Calling endSession twice — which shouldn't happen in practice but
+    // is the kind of edge case that bit us in import-history — must not
+    // duplicate rows or downgrade edit_types.
+    const g = gitInit();
+    try {
+      const project = domain.createProject({ name: 'P', rootPath: g.repoDir });
+      const startCtx = domain.startSession({ projectId: project.id });
+      fs.writeFileSync(path.join(g.repoDir, 'note.txt'), 'hi');
+
+      domain.endSession({ sessionId: startCtx.session_id, summary: 's' });
+      domain.endSession({ sessionId: startCtx.session_id, summary: 's again' });
+
+      const rows = getDb()
+        .prepare('SELECT file_path, edit_type FROM session_files WHERE session_id = ?')
+        .all(startCtx.session_id) as { file_path: string; edit_type: string }[];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.file_path).toBe('note.txt');
+      expect(rows[0]!.edit_type).toBe('created');
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  it('returns empty files_touched when the project root is not a git repo (graceful)', () => {
+    // matches the existing "no session_files recorded" test above but
+    // exercises the new derive-path explicitly.
+    const project = domain.createProject({ name: 'P', rootPath: t.dir });
+    const startCtx = domain.startSession({ projectId: project.id });
+    const res = domain.endSession({ sessionId: startCtx.session_id, summary: 's' });
+    expect(res.files_touched).toEqual([]);
   });
 });
