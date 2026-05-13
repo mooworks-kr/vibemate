@@ -4,6 +4,7 @@
 // see git history for the seed values.
 
 import type {
+  ContextBrief,
   Decision,
   Document,
   DocumentKind,
@@ -57,6 +58,7 @@ const DATA: DataCache = {
   documents: {},
   documentsByFeature: {},
   sessionDetails: {},
+  contextBriefs: {},
 };
 
 
@@ -99,6 +101,9 @@ const state: AppState = {
 
   // Sessions tab — Sprint 23 (h5uk)
   currentSession: null,
+
+  // Context Brief expand state — Sprint 24 (ijze)
+  expandedContextBriefs: new Set<string>(),
 };
 
 // (Removed in ADR-0016: FILE_DETAIL cache + fdKey helper. Code Map retired.)
@@ -303,6 +308,9 @@ async function toggleTaskUI(taskId: number, currentStatus: TaskStatus): Promise<
   // Sprint 20 (u3zu): overview's next_task depends on task status, so a
   // toggle must invalidate the cached overview for this project.
   invalidateOverview(state.currentProject);
+  // Sprint 24 (ijze): the brief embeds open-tasks state for the current
+  // feature, so a task toggle must refresh it on next view.
+  invalidateContextBrief(state.currentFeature);
   render();
 }
 
@@ -391,6 +399,10 @@ async function createDecisionUI(payload: {
   state.addingDecision = false;
   // Sprint 20 (u3zu): overview's recent_decisions list reflects this new row.
   invalidateOverview(state.currentProject);
+  // Sprint 24 (ijze): the brief includes recent decisions (feature-tied
+  // first). If the new decision was tied to the current feature it'll
+  // bump to the top; either way drop the cache to refetch.
+  invalidateContextBrief(state.currentFeature);
   render();
 }
 
@@ -421,6 +433,9 @@ async function updateFeatureUI(
   // Sprint 20 (u3zu): a feature status change (todo→in_progress→done) reorders
   // the overview's active_features and can flip the health label.
   invalidateOverview(state.currentProject);
+  // Sprint 24 (ijze): the brief embeds feature name/goal/status/spec_md
+  // and the patched feature is the same one the brief was rendered for.
+  invalidateContextBrief(featureId);
   render();
 }
 
@@ -754,6 +769,8 @@ async function linkDocumentToFeatureUI(docId: string, featureId: string): Promis
   if (!ok) return;
   // Drop the feature-side cache so next paint refetches with the new row.
   if (DATA.documentsByFeature) delete DATA.documentsByFeature[featureId];
+  // Sprint 24 (ijze): documents section of the brief just gained an entry.
+  invalidateContextBrief(featureId);
   render();
 }
 
@@ -767,6 +784,7 @@ async function unlinkDocumentFromFeatureUI(docId: string, featureId: string): Pr
   });
   if (!ok) return;
   if (DATA.documentsByFeature) delete DATA.documentsByFeature[featureId];
+  invalidateContextBrief(featureId);
   render();
 }
 
@@ -1185,6 +1203,157 @@ async function loadSessionDetail(sessionId: string): Promise<SessionDetail> {
   DATA.sessionDetails = DATA.sessionDetails ?? {};
   DATA.sessionDetails[sessionId] = detail;
   return detail;
+}
+
+// =================================================
+// Context Brief (Sprint 24, ijze — AI Context Pack)
+// =================================================
+
+async function loadContextBrief(featureId: string): Promise<ContextBrief> {
+  const brief = await fetchJSON<ContextBrief>(`/api/features/${featureId}/context-brief`);
+  DATA.contextBriefs = DATA.contextBriefs ?? {};
+  DATA.contextBriefs[featureId] = brief;
+  return brief;
+}
+
+/** Drop the cached Context Brief for `featureId`. Mutations that affect
+ *  any block in the brief (task add/toggle, decision log, document link,
+ *  feature edit, session end) should call this to keep the next paint
+ *  fresh. The brief is on-demand so over-invalidation is cheap. */
+function invalidateContextBrief(featureId: string | null | undefined): void {
+  if (!featureId) return;
+  if (DATA.contextBriefs) delete DATA.contextBriefs[featureId];
+}
+
+/**
+ * Copy the brief markdown to the clipboard. Wraps Clipboard API with the
+ * same legacy-textarea fallback Sprint 16's copyPathToClipboard used —
+ * private mode / older browsers still get the path. Tiny toast on
+ * success/failure mirrors the Sprint 5 mutate() UX.
+ */
+async function copyContextBriefToClipboard(text: string): Promise<void> {
+  let ok = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    }
+  } catch { /* fall through */ }
+  if (!ok) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position: fixed; opacity: 0;';
+    document.body.appendChild(ta);
+    ta.select();
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
+    document.body.removeChild(ta);
+  }
+  showToast(ok ? 'Context Brief 복사됨' : '복사에 실패했습니다.', ok ? 'success' : 'error');
+}
+
+/**
+ * Render the Context Brief section inside feature detail. Default collapsed;
+ * expanding triggers a lazy fetch (Sprint 22 / 23 pattern) and renders the
+ * Markdown via renderMarkdownLite. Copy button works regardless of expand
+ * state — it'll fetch on the fly if the cache is empty.
+ */
+function renderContextBriefSection(featureId: string): HTMLElement {
+  const wrap = el('div', { class: 'detail-section' });
+  wrap.appendChild(el('div', { class: 'detail-section-title' }, [
+    el('span', { text: '🤖 Context Brief' }),
+    el('span', {
+      class: 'detail-section-count',
+      text: '에이전트 컨텍스트',
+      style: 'color: var(--text-3); font-size: 11px;',
+    }),
+  ]));
+
+  const expanded = state.expandedContextBriefs.has(featureId);
+  const cached = (DATA.contextBriefs ?? {})[featureId];
+
+  // Action row: Copy + 펼치기/접기.
+  const actions = el('div');
+  actions.style.cssText = 'display: flex; gap: 8px; align-items: center; margin-bottom: 8px;';
+
+  const copyBtn = el('button', {
+    text: '복사',
+    title: 'Markdown 을 클립보드에 복사',
+    onClick: async () => {
+      const brief = cached ?? await loadContextBrief(featureId).catch((e) => {
+        showError(e instanceof Error ? e.message : 'Context Brief 로드 실패');
+        return null;
+      });
+      if (!brief) return;
+      await copyContextBriefToClipboard(brief.markdown);
+    },
+  });
+  copyBtn.style.cssText = 'padding: 4px 10px; background: var(--accent); border: 1px solid var(--accent); color: var(--text); border-radius: 4px; font: inherit; font-size: 12px; cursor: pointer;';
+  actions.appendChild(copyBtn);
+
+  const toggleBtn = el('button', {
+    text: expanded ? '접기' : '펼쳐보기',
+    onClick: () => {
+      if (expanded) {
+        state.expandedContextBriefs.delete(featureId);
+      } else {
+        state.expandedContextBriefs.add(featureId);
+        // Kick off the fetch if we don't have it yet — render() will be
+        // called again by the promise's .then.
+        if (!cached) {
+          loadContextBrief(featureId).then(() => render()).catch((e) => {
+            showError(e instanceof Error ? e.message : 'Context Brief 로드 실패');
+          });
+        }
+      }
+      render();
+    },
+  });
+  toggleBtn.style.cssText = 'padding: 4px 10px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-2); border-radius: 4px; font: inherit; font-size: 12px; cursor: pointer;';
+  actions.appendChild(toggleBtn);
+
+  // Helper hint line — explains what the brief is for, mirroring the
+  // session-end notes hint pattern from Sprint 23.
+  const hint = el('span', {
+    text: '새 에이전트 세션에 붙여넣어 프로젝트 + 기능 + 진행 상황을 한 번에 전달합니다.',
+    style: 'color: var(--text-3); font-size: 11px; margin-left: auto;',
+  });
+  actions.appendChild(hint);
+  wrap.appendChild(actions);
+
+  if (!expanded) return wrap;
+
+  // Expanded body — show preview, or loading state on first fetch.
+  if (!cached) {
+    wrap.appendChild(el('div', {
+      class: 'empty-state-text',
+      text: 'Context Brief 불러오는 중…',
+      style: 'padding: 8px 0; color: var(--text-3);',
+    }));
+    return wrap;
+  }
+
+  const preview = el('div', { class: 'feature-spec-body markdown-preview' });
+  preview.style.cssText = 'background: var(--bg-elevated); padding: 12px 16px; border-radius: 6px; max-height: 480px; overflow-y: auto;';
+  preview.innerHTML = renderMarkdownLite(cached.markdown);
+  wrap.appendChild(preview);
+
+  // Footer: count summary so the user knows what's inside without
+  // scanning the whole markdown.
+  const s = cached.sections;
+  const counts: string[] = [];
+  if (s.open_tasks.length > 0) counts.push(`작업 ${s.open_tasks.length}`);
+  if (s.linked_files.length > 0) counts.push(`파일 ${s.linked_files.length}${s.linked_files_overflow > 0 ? `+${s.linked_files_overflow}` : ''}`);
+  if (s.documents.length > 0) counts.push(`문서 ${s.documents.length}${s.documents_overflow > 0 ? `+${s.documents_overflow}` : ''}`);
+  if (s.recent_decisions.length > 0) counts.push(`결정 ${s.recent_decisions.length}${s.recent_decisions_overflow > 0 ? `+${s.recent_decisions_overflow}` : ''}`);
+  if (s.recent_sessions.length > 0) counts.push(`세션 ${s.recent_sessions.length}${s.recent_sessions_overflow > 0 ? `+${s.recent_sessions_overflow}` : ''}`);
+  if (counts.length > 0) {
+    wrap.appendChild(el('div', {
+      text: counts.join(' · '),
+      style: 'color: var(--text-3); font-size: 11px; margin-top: 8px;',
+    }));
+  }
+
+  return wrap;
 }
 
 async function setActiveProject(projectId: string): Promise<void> {
@@ -1982,6 +2151,11 @@ function renderFeatureDetail() {
     spec.appendChild(el('pre', { class: 'feature-spec-body', text: f.spec_md.trim() }));
     main.appendChild(spec);
   }
+
+  // Sprint 24 (ijze): Context Brief affordance. Right after spec so the
+  // "explain this to an agent" action sits next to the human-readable
+  // scope — natural pairing.
+  main.appendChild(renderContextBriefSection(f.id));
 
   const progRow = el('div', { class: 'progress-row' }, [
     el('div', { class: 'progress-bar' }, [el('div', { class: 'progress-fill', style: 'width:' + f.progress + '%' })]),

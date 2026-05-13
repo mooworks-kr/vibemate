@@ -340,6 +340,18 @@ export function createApp() {
     return c.json(domain.listDocumentsForFeature(id));
   });
 
+  // Sprint 24 (ijze) — AI Context Pack. Returns the agent-ready Markdown
+  // bundle for a feature; the structured `sections` payload feeds the
+  // web UI's per-section counts without re-parsing the body.
+  app.get('/api/features/:id/context-brief', (c) => {
+    const id = c.req.param('id');
+    try {
+      return c.json(domain.getContextBrief(id));
+    } catch (e) {
+      return c.json({ error: (e as Error).message }, 404);
+    }
+  });
+
   // ----- Workspace (cross-project active-features view) -----
 
   app.get('/api/workspace/active-features', (c) => {

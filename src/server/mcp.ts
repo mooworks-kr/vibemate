@@ -97,6 +97,27 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     },
   );
 
+  // Sprint 24 (ijze) — AI Context Pack. Builds the Markdown blob a user
+  // pastes into a fresh agent session. Kept separate from `pm_get_context`
+  // (which stays a lightweight session-start payload) because the brief is
+  // larger and on-demand; bundling it into every getContext call would
+  // bloat the always-on hot path.
+  server.tool(
+    'pm_get_context_brief',
+    {
+      feature_id: z.string().describe('Context Brief 를 생성할 feature ID'),
+    },
+    async ({ feature_id }) => {
+      const brief = domain.getContextBrief(feature_id);
+      // Surface just the markdown blob to the model — that's the payload
+      // the user wants to copy/paste. Structured sections stay on the
+      // HTTP response for the UI.
+      return {
+        content: [{ type: 'text' as const, text: brief.markdown }],
+      };
+    },
+  );
+
   // Sprint 23 (h5uk): single-session detail with files + prev/next nav.
   // Lets Claude Code re-read a specific session's structured notes (per
   // claudeMdTemplate v4 — `## 완료 / ## 남은 일 / ## 결정`) on demand.

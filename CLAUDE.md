@@ -9,8 +9,8 @@ src/
 ├── server/          # Node.js 백엔드 (MCP + HTTP + DB + CLI)
 │   ├── cli.ts            # commander 진입점
 │   ├── daemon.ts         # HTTP 백그라운드 데몬 (chokidar 제거됨, Sprint 21)
-│   ├── mcp.ts            # Claude Code가 stdio로 호출 (26개 툴)
-│   ├── http.ts           # Hono REST API + 정적 파일 서빙 (30 routes)
+│   ├── mcp.ts            # Claude Code가 stdio로 호출 (27개 툴)
+│   ├── http.ts           # Hono REST API + 정적 파일 서빙 (31 routes)
 │   ├── domain.ts         # 비즈니스 로직 단일 소스
 │   ├── db.ts             # SQLite (node:sqlite) + 스키마
 │   ├── migrations.ts     # migration runner + schema_migrations 테이블
@@ -90,7 +90,7 @@ npm run typecheck  # 서버 + 웹 둘 다
 vitest. 도메인 + migrations 커버, HTTP 라우트/MCP/UI는 미커버 (수동 E2E로 검증).
 
 ```bash
-npm test                # 183 tests — domain/migrations/HTTP-스모크/migrate-claude-md/import/extract/workspace/setActiveFeature/documents/session-detail (Sprint 23)
+npm test                # 194 tests — domain/migrations/HTTP-스모크/migrate-claude-md/import/extract/workspace/setActiveFeature/documents/session-detail/context-brief (Sprint 24)
 npm run test:watch
 npm run test:coverage   # v8 reporter
 ```

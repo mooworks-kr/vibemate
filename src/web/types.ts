@@ -11,6 +11,7 @@
 //     change can be absorbed by the load adapter without touching renderers.
 
 import type {
+  ContextBrief,
   Decision,
   Document,
   DocumentKind,
@@ -35,6 +36,8 @@ export type ProjectOverviewResponse = ProjectOverview;
 export type { Document, DocumentKind };
 // Sprint 23 (h5uk) — re-export session detail shape for the sub-view cache.
 export type { SessionDetail };
+// Sprint 24 (ijze) — Context Brief response shape.
+export type { ContextBrief };
 
 // (Removed in ADR-0016: FileTreeNode + FileDetailResponse + DataCache.fileTree
 // + AppState.currentFile + AppState.linkingFile + AppState.fileDetailLoading.
@@ -125,6 +128,10 @@ export interface DataCache {
    *  session id. Populated lazily by the detail sub-view when a session
    *  card is clicked. */
   sessionDetails?: Record<string, SessionDetail>;
+  /** Sprint 24 (ijze): cached `/api/features/:id/context-brief` responses
+   *  keyed by feature id. Populated when the user expands the Context
+   *  Brief section or clicks Copy. */
+  contextBriefs?: Record<string, ContextBrief>;
 }
 
 /**
@@ -279,6 +286,12 @@ export interface AppState {
   // Sessions tab (Sprint 23, h5uk) ---------------------------------------
   /** Currently-selected session for the detail sub-view (null = list). */
   currentSession: string | null;
+
+  // Context Brief (Sprint 24, ijze) ---------------------------------------
+  /** Feature ids whose Context Brief section is currently expanded in
+   *  feature detail. A Set rather than a single id so users can keep
+   *  several expanded if they switch between features in one session. */
+  expandedContextBriefs: Set<string>;
 }
 
 // ============================================================

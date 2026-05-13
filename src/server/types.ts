@@ -97,6 +97,110 @@ export interface SessionDetail extends Session {
   next_session: SessionDetailSibling | null;
 }
 
+// Sprint 24 (ijze) — AI Context Pack: the Markdown blob a user pastes into
+// a fresh agent session so Claude / Codex / etc. picks up the work without
+// requiring the user to re-explain context every time. Produced by
+// `getContextBrief(featureId)` / GET /api/features/:id/context-brief /
+// pm_get_context_brief MCP. Sections are also returned in structured form
+// for the UI to render diff/preview, but the canonical artifact is the
+// `markdown` string — that's what gets copied to the clipboard.
+
+export interface ContextBriefProjectSection {
+  name: string;
+  goal: string | null;
+  tagline: string | null;
+  tech: string[];
+}
+
+export interface ContextBriefClaudeGuideSection {
+  /** Body between the `<!-- vibemate-section:v2 -->` markers in the
+   *  project's CLAUDE.md. null when the file is missing OR the markers
+   *  aren't present. We deliberately exclude the user's own (out-of-marker)
+   *  prose — that may contain secrets / unrelated content. */
+  body: string | null;
+}
+
+export interface ContextBriefFeatureSection {
+  id: string;
+  name: string;
+  goal: string | null;
+  status: FeatureStatus;
+  spec_md: string | null;
+}
+
+export interface ContextBriefTaskRow {
+  id: number;
+  name: string;
+  status: TaskStatus;
+}
+
+export interface ContextBriefFileRow {
+  path: string;
+  description: string | null;
+  source: LinkSource;
+}
+
+export interface ContextBriefDocumentRow {
+  id: string;
+  kind: DocumentKind;
+  title: string;
+  excerpt: string;
+}
+
+export interface ContextBriefDecisionRow {
+  id: string;
+  title: string;
+  date: string;
+}
+
+export interface ContextBriefSessionRow {
+  id: string;
+  time: string;
+  summary: string | null;
+  notes_excerpt: string;
+}
+
+export interface ContextBriefSections {
+  project: ContextBriefProjectSection;
+  claude_guide: ContextBriefClaudeGuideSection;
+  feature: ContextBriefFeatureSection;
+  open_tasks: ContextBriefTaskRow[];
+  /** Open-task overflow count when the section was capped (full count
+   *  minus what's surfaced). Always 0 here today (tasks aren't capped
+   *  per inventory) but reserved for future cap shifts. */
+  open_tasks_overflow: number;
+  linked_files: ContextBriefFileRow[];
+  linked_files_overflow: number;
+  documents: ContextBriefDocumentRow[];
+  documents_overflow: number;
+  recent_decisions: ContextBriefDecisionRow[];
+  recent_decisions_overflow: number;
+  recent_sessions: ContextBriefSessionRow[];
+  recent_sessions_overflow: number;
+}
+
+export interface ContextBriefOpts {
+  /** Override per-section caps. Anything omitted falls back to the
+   *  inventory defaults (linked_files=20, documents=5, decisions=5,
+   *  sessions=3). Tasks aren't capped — they all surface. */
+  caps?: Partial<{
+    linked_files: number;
+    documents: number;
+    recent_decisions: number;
+    recent_sessions: number;
+  }>;
+}
+
+export interface ContextBrief {
+  /** Canonical artifact — the blob the user pastes into a fresh agent
+   *  session. UTF-8 Markdown, no leading/trailing blank lines. */
+  markdown: string;
+  /** Structured projection of each section for the web client / debugging.
+   *  Allows the UI to render counts ("12 open tasks") without re-parsing
+   *  the markdown body. */
+  sections: ContextBriefSections;
+}
+
 /**
  * Compact projection used by pm_get_context to advertise the "이어서 작업하기"
  * surface. Shipped on the SessionStartContext when the active feature has

@@ -71,7 +71,7 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 
 ## 진행 상황
 
-### ✓ 완료 (Sprint 1-23)
+### ✓ 완료 (Sprint 1-24)
 
 **기반 (Sprint 1-3)**
 - 도메인 레이어 E2E
@@ -166,16 +166,30 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 - HTTP 29 → **30** (+1), MCP 25 → **26** (+1), tests 169 → **183** (+14), 번들 57.63 → **61.97 KB** (+4.34 KB)
 - 스키마 변경 0 (기존 notes 컬럼 재활용)
 
+**Sprint 24 — AI Context Pack (ADR-0021)**
+- feature 상세에 "🤖 Context Brief" 인라인 sub-section + Copy 버튼 + 펼쳐보기 토글 (default 접힘)
+- 새 HTTP `GET /api/features/:id/context-brief` (404 graceful) + 새 MCP `pm_get_context_brief({feature_id})`
+- **8 섹션 단일 Markdown**: project / CLAUDE-marker / feature / open tasks / linked files (cap 20) / documents (cap 5, excerpt 200) / decisions (cap 5, feature-tied 우선) / sessions (cap 3)
+- 섹션별 overflow marker `…등 N건 생략` (전체 길이 cap 대신 섹션별 — 잘린 정보 가시성)
+- CLAUDE.md **privacy guard**: paired marker (`<!-- vibemate-section:v2 -->`) 안만 추출 — 사용자 비공개 콘텐츠 0건 포함 (ADR-0008 마커 재사용). template-version 메타 라인 제거.
+- 응답 shape: `{markdown, sections}` — markdown 클립보드용 + sections UI count 푸터/디버그용
+- `opts.caps` API-level 지원, UI 미노출 (후속 커스터마이즈 hook)
+- HTTP 30 → **31** (+1), MCP 26 → **27** (+1), tests 183 → **194** (+11), 번들 61.97 → **65.44 KB** (+3.47 KB)
+- DB 스키마 변경 0, mutation 0 (read-only)
+- Dogfood 측정 (Markdown 크기): ijze 3.9KB / 3wtr 5.3KB / h5uk 4.0KB — 클립보드 + AI 컨텍스트 적정
+
 ### 다음 백로그 후보
 
 - `[Maintenance]` `main.ts` 잔존 `any` narrow (Sprint 8 후속)
-- AI Context Pack (`ijze`): 다음 세션 prompt 생성 — Sprint 23 비범위
 - Feature Flow Map: feature 간 의존/링크 시각화
+- 에이전트별 프롬프트 템플릿 (Codex/Claude 구분) — Sprint 24 비범위
+- 작업 완료 후 왕복 흐름 (Context Brief → 결과 → Vibemate 반영) — Sprint 24 비범위
+- Context Brief 우선순위 사용자 커스터마이즈 UI — Sprint 24 비범위 (API-level opts.caps 만 지원)
 - 검색 한계 재검토: 한국어 형태소 분석기/임베딩 (ADR-0009 비범위)
 - tasks 검색 인덱싱 재검토: 운영 데이터로 가치 재평가 (ADR-0010 비범위)
 - 다른 source import: jira/notion/linear (Sprint 12의 `imported_<source>` 패턴 확장)
 - 양방향 spec.md 동기화 (미구현 명시)
-- agent별 작업 흐름 구분 (Codex/Claude 등) — Sprint 23 비범위
+- agent별 작업 흐름 구분 (Codex/Claude 등) — Sprint 23/24 비범위
 
 ## 데이터 위치
 
@@ -195,7 +209,7 @@ Claude Code MCP 설정 (`~/.claude.json` 등):
 - **자동 매핑 + 수동 보정**. 세션 종료 시 touch한 파일을 active feature에 confidence 0.7~0.85로 자동 매핑.
 - **단일 프로젝트 구조**. 백엔드/프론트엔드를 분리하지 않음 — 로컬 데스크톱 앱이라 분리 이유 없음.
 
-Sprint 4-23 ADR (vibemate DB에 ADR-0001~0020 기록, 웹 대시보드 또는 `pm_get_context`로 조회):
+Sprint 4-24 ADR (vibemate DB에 ADR-0001~0021 기록, 웹 대시보드 또는 `pm_get_context`로 조회):
 - 0001 API 에러 응답: list = 200+`[]`, 단일 = 404+`{error}`
 - 0002 삭제 정책: feature=archive, task/decision=hard delete + decision PATCH 지원
 - 0003 ~~AI 파일 설명~~: edit_type {modified, created} 필터 + 강제 재생성=DELETE 캐시 — **historical (ADR-0016에서 기능 자체가 제거됨)**
@@ -216,10 +230,11 @@ Sprint 4-23 ADR (vibemate DB에 ADR-0001~0020 기록, 웹 대시보드 또는 `p
 - 0018 파일 워처 제거: chokidar EMFILE 근본 해결 + `git status --porcelain` at endSession (policy B uncommitted only)
 - 0019 Spec Hub: documents 모델 + kind 6종 + features.spec_md 양립 + FTS5 노출(weight 0.8) + simple textarea
 - 0020 Session Intelligence: notes Markdown 구조화 + getContext.last_session surface + claudeMdTemplate v4
+- 0021 AI Context Pack: 8 섹션 단일 Markdown + CLAUDE.md paired marker 추출(privacy guard) + 섹션별 cap + pm_get_context_brief 신규
 
 ## 알려진 제약
 
-- 자동 테스트는 도메인/migrations/migrate-claude-md 한정 (`npm test` — 183 tests). HTTP 라우트 / MCP / UI는 수동 E2E.
+- 자동 테스트는 도메인/migrations/migrate-claude-md/context-brief 한정 (`npm test` — 194 tests). HTTP 라우트 / MCP / UI는 수동 E2E.
 - ~~큰 monorepo에서 chokidar 파일 워처 성능 미검증.~~ — Sprint 21(ADR-0018) chokidar 제거됨.
 - 한국어 검색은 어절 시작 매칭만 가능 (어절 중간 매칭은 미지원, ADR-0009).
 - 검색 인덱싱은 feature/decision/session/document 4종 (ADR-0005/0010/0016/0019 — tasks/file 미인덱싱).

@@ -12,6 +12,9 @@ import {
   shouldIgnoreFile,
 } from './lib.js';
 import type {
+  ContextBrief,
+  ContextBriefOpts,
+  ContextBriefSections,
   Decision,
   Document,
   DocumentKind,
@@ -533,6 +536,273 @@ export function listFeaturesForDocument(documentId: string): Feature[] {
     )
     .all(documentId) as any[];
   return rows.map(rowToFeature);
+}
+
+// ============================================================
+// Context Brief (Sprint 24, ijze — AI Context Pack)
+//
+// Composes the existing project / feature / task / file / document /
+// decision / session surfaces into a single Markdown blob a user can
+// paste into a fresh agent session. The shape mirrors what a human would
+// type if they were re-introducing the project at session start; the
+// helpers below own the rendering — there's no template file because
+// the only consumer is `getContextBrief` and inline strings keep the
+// section ordering visible alongside the data shape.
+//
+// Per-section caps (inventory #116): linked_files=20, documents=5,
+// decisions=5, sessions=3. Tasks aren't capped (a feature's full backlog
+// is small enough). Section bodies that exceed their cap append a
+// `...등 N건 생략` line so the agent knows the list was truncated.
+// ============================================================
+
+const CONTEXT_BRIEF_DEFAULTS = {
+  linked_files: 20,
+  documents: 5,
+  recent_decisions: 5,
+  recent_sessions: 3,
+} as const;
+
+/**
+ * Pull just the body between `<!-- vibemate-section:v2 -->` and
+ * `<!-- /vibemate-section -->` from a CLAUDE.md file on disk. We pick that
+ * range on purpose — the marker block is content vibemate's own templating
+ * generated (tool guide / Project ID), so it's safe to ship to an agent.
+ * Anything *outside* the markers is user prose that may include secrets,
+ * unrelated notes, or paths to private files; we never include it.
+ *
+ * Returns null when the file is missing, unreadable, or has no marker.
+ * "graceful skip" matches the rest of the brief — sections drop out
+ * rather than fail the whole call.
+ */
+function readClaudeGuideBetweenMarkers(rootPath: string): string | null {
+  const filePath = path.join(rootPath, 'CLAUDE.md');
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return null;
+  }
+  const beginIdx = raw.indexOf(VIBEMATE_SECTION_BEGIN);
+  if (beginIdx < 0) return null;
+  const endIdx = raw.indexOf(VIBEMATE_SECTION_END, beginIdx);
+  if (endIdx < 0) return null;
+  // Slice the body between the markers (exclusive of both). Strip the
+  // template-version meta comment so it doesn't clutter the brief.
+  const inner = raw
+    .slice(beginIdx + VIBEMATE_SECTION_BEGIN.length, endIdx)
+    .replace(/<!--\s*vibemate-template-version:\s*\d+\s*-->/g, '')
+    .trim();
+  return inner.length > 0 ? inner : null;
+}
+
+/**
+ * Render a single section as a `## Heading` + body block, returning an
+ * empty string when the body is empty so callers can `.filter(Boolean)`
+ * and skip blanks. Keeps the markdown layout consistent across sections.
+ */
+function renderBriefSection(heading: string, body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return '';
+  return `## ${heading}\n\n${trimmed}`;
+}
+
+/**
+ * Cap a list of rows and produce both the surfaced slice + the overflow
+ * count (`full.length - cap`, or 0). Used by every section so the per-cap
+ * truncation math lives in one spot.
+ */
+function capRows<T>(rows: T[], cap: number): { surfaced: T[]; overflow: number } {
+  if (rows.length <= cap) return { surfaced: rows, overflow: 0 };
+  return { surfaced: rows.slice(0, cap), overflow: rows.length - cap };
+}
+
+/** Append `...등 N건 생략` when `overflow > 0`, else empty string. */
+function overflowLine(overflow: number): string {
+  return overflow > 0 ? `\n\n…등 ${overflow}건 생략` : '';
+}
+
+export function getContextBrief(
+  featureId: string,
+  opts: ContextBriefOpts = {},
+): ContextBrief {
+  const feature = getFeature(featureId);
+  if (!feature) throw new Error(`Feature not found: ${featureId}`);
+  const project = getProject(feature.project_id);
+  if (!project) throw new Error(`Project not found: ${feature.project_id}`);
+
+  const caps = {
+    linked_files: opts.caps?.linked_files ?? CONTEXT_BRIEF_DEFAULTS.linked_files,
+    documents: opts.caps?.documents ?? CONTEXT_BRIEF_DEFAULTS.documents,
+    recent_decisions: opts.caps?.recent_decisions ?? CONTEXT_BRIEF_DEFAULTS.recent_decisions,
+    recent_sessions: opts.caps?.recent_sessions ?? CONTEXT_BRIEF_DEFAULTS.recent_sessions,
+  };
+
+  // ----- 1. Project header -----
+  const projectSection = {
+    name: project.name,
+    goal: project.goal,
+    tagline: project.tagline,
+    tech: project.tech ?? [],
+  };
+
+  // ----- 2. CLAUDE guide (paired marker only) -----
+  const claudeBody = readClaudeGuideBetweenMarkers(project.root_path);
+  const claudeSection = { body: claudeBody };
+
+  // ----- 3. Feature -----
+  const featureSection = {
+    id: feature.id,
+    name: feature.name,
+    goal: feature.goal,
+    status: feature.status,
+    spec_md: feature.spec_md,
+  };
+
+  // ----- 4. Open tasks (status != done) — uncapped, see comment above -----
+  const allTasks = listTasks(feature.id);
+  const openTasks = allTasks
+    .filter((tk) => tk.status !== 'done')
+    .map((tk) => ({ id: tk.id, name: tk.name, status: tk.status }));
+
+  // ----- 5. Linked files — confidence DESC, cap 20 -----
+  const allFiles = listFeatureFiles(feature.id);
+  const sortedFiles = [...allFiles].sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
+  const filesCapped = capRows(sortedFiles, caps.linked_files);
+  const linkedFiles = filesCapped.surfaced.map((f) => ({
+    path: f.file_path,
+    description: f.description,
+    source: f.source,
+  }));
+
+  // ----- 6. Documents — newest first, cap 5, body excerpted to 200 chars -----
+  const allDocs = listDocumentsForFeature(feature.id);
+  const docsCapped = capRows(allDocs, caps.documents);
+  const documents = docsCapped.surfaced.map((d) => {
+    const body = d.content_md.trim();
+    const excerpt =
+      body.length <= 200 ? body : body.slice(0, 200) + '…';
+    return { id: d.id, kind: d.kind, title: d.title, excerpt };
+  });
+
+  // ----- 7. Recent decisions — feature-tied first, then project-wide -----
+  // SQLite has no ORDER BY conditional that's friendlier than this two-pass
+  // approach. Keeps the SQL trivial and the result deterministic.
+  const allDecisions = listDecisions(project.id);
+  const featureTied = allDecisions.filter((d) => d.feature_id === feature.id);
+  const projectWide = allDecisions.filter((d) => d.feature_id !== feature.id);
+  const decisionsOrdered = [...featureTied, ...projectWide];
+  const decisionsCapped = capRows(decisionsOrdered, caps.recent_decisions);
+  const recentDecisions = decisionsCapped.surfaced.map((d) => ({
+    id: d.id,
+    title: d.title,
+    date: relativeTime(d.created_at),
+  }));
+
+  // ----- 8. Recent sessions — same feature, last N by started_at -----
+  const sameFeatureSessions = listSessions(project.id, 50).filter(
+    (s) => s.feature_id === feature.id,
+  );
+  const sessionsCapped = capRows(sameFeatureSessions, caps.recent_sessions);
+  const recentSessions = sessionsCapped.surfaced.map((s) => {
+    const notes = (s.notes ?? '').trim();
+    const notes_excerpt =
+      notes.length <= 200 ? notes : notes.slice(0, 200) + '…';
+    return {
+      id: s.id,
+      time: relativeTime(s.started_at),
+      summary: s.summary,
+      notes_excerpt,
+    };
+  });
+
+  const sections: ContextBriefSections = {
+    project: projectSection,
+    claude_guide: claudeSection,
+    feature: featureSection,
+    open_tasks: openTasks,
+    open_tasks_overflow: 0,
+    linked_files: linkedFiles,
+    linked_files_overflow: filesCapped.overflow,
+    documents,
+    documents_overflow: docsCapped.overflow,
+    recent_decisions: recentDecisions,
+    recent_decisions_overflow: decisionsCapped.overflow,
+    recent_sessions: recentSessions,
+    recent_sessions_overflow: sessionsCapped.overflow,
+  };
+
+  // ============================================================
+  // Markdown rendering — keep block order in sync with the inventory
+  // (#116 권장 방향). Each block uses `renderBriefSection` so empty
+  // bodies drop out cleanly; the join filter strips the resulting blanks.
+  // ============================================================
+
+  const projectBody = [
+    `**${projectSection.name}**`,
+    projectSection.tagline ? `_${projectSection.tagline}_` : '',
+    projectSection.goal ? `\n${projectSection.goal}` : '',
+    projectSection.tech.length > 0 ? `\n기술: ${projectSection.tech.join(', ')}` : '',
+  ].filter(Boolean).join('\n');
+
+  const claudeBodyText = claudeSection.body ?? '';
+
+  const featureLines = [
+    `**${featureSection.name}** (${featureSection.status})`,
+    featureSection.goal ?? '',
+    featureSection.spec_md ? `\n${featureSection.spec_md}` : '',
+  ].filter(Boolean).join('\n');
+
+  const openTasksBody =
+    openTasks.length === 0
+      ? '(열린 작업 없음)'
+      : openTasks.map((t) => `- [${t.status === 'in_progress' ? '~' : ' '}] ${t.name}`).join('\n');
+
+  const linkedFilesBody =
+    linkedFiles.length === 0
+      ? '(연결된 파일 없음)'
+      : linkedFiles.map((f) => `- \`${f.path}\`${f.description ? ` — ${f.description}` : ''}`).join('\n')
+        + overflowLine(filesCapped.overflow);
+
+  const documentsBody =
+    documents.length === 0
+      ? '(연결된 문서 없음)'
+      : documents.map((d) => `### [${d.kind}] ${d.title}\n${d.excerpt}`).join('\n\n')
+        + overflowLine(docsCapped.overflow);
+
+  const decisionsBody =
+    recentDecisions.length === 0
+      ? '(최근 결정 없음)'
+      : recentDecisions.map((d) => `- **${d.id}** ${d.title} _(${d.date})_`).join('\n')
+        + overflowLine(decisionsCapped.overflow);
+
+  const sessionsBody =
+    recentSessions.length === 0
+      ? '(이 기능에 연결된 세션 없음)'
+      : recentSessions
+          .map((s) => {
+            const head = `### ${s.time}${s.summary ? ` — ${s.summary}` : ''}`;
+            const excerpt = s.notes_excerpt ? `\n${s.notes_excerpt}` : '';
+            return head + excerpt;
+          })
+          .join('\n\n')
+        + overflowLine(sessionsCapped.overflow);
+
+  const blocks = [
+    renderBriefSection('프로젝트', projectBody),
+    // CLAUDE guide is verbatim — no extra heading wrap because the
+    // marker body usually starts with its own `## …` already.
+    claudeBodyText ? `## CLAUDE 가이드\n\n${claudeBodyText}` : '',
+    renderBriefSection(`기능 — ${featureSection.name}`, featureLines),
+    renderBriefSection(`열린 작업 (${openTasks.length})`, openTasksBody),
+    renderBriefSection(`연결된 파일 (${linkedFiles.length}${filesCapped.overflow > 0 ? `+${filesCapped.overflow}` : ''})`, linkedFilesBody),
+    renderBriefSection(`문서 (${documents.length}${docsCapped.overflow > 0 ? `+${docsCapped.overflow}` : ''})`, documentsBody),
+    renderBriefSection(`최근 결정 (${recentDecisions.length}${decisionsCapped.overflow > 0 ? `+${decisionsCapped.overflow}` : ''})`, decisionsBody),
+    renderBriefSection(`최근 세션 (${recentSessions.length}${sessionsCapped.overflow > 0 ? `+${sessionsCapped.overflow}` : ''})`, sessionsBody),
+  ].filter(Boolean);
+
+  const markdown = `# Context Brief\n\n${blocks.join('\n\n')}`.trim();
+
+  return { markdown, sections };
 }
 
 // ============================================================
