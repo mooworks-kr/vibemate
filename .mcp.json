@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "vibemate": {
-      "command": "node",
-      "args": ["./dist/server/cli.js", "mcp"]
-    }
-  }
-}

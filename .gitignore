@@ -18,3 +18,10 @@ coverage/
 
 # migrate-claude-md backups
 *.bak
+
+# local agent / tooling configs (per-user; .claude-plugin/ stays committed)
+.claude/
+.codex/
+.mcp.json
+AGENTS.md
+CLAUDE.md
