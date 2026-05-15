@@ -33,6 +33,7 @@ import type {
   FeatureFileRow,
   FeatureListItem,
   FeaturePatch,
+  FileNode,
   ProjectListEntry,
   ProjectListItem,
   RawSessionResponse,
@@ -42,7 +43,12 @@ import type {
   TaskRow,
   WorkspaceFeatureRow,
 } from './types';
-import { readPersistedFlag, writePersistedFlag } from './persist.js';
+import { readPersistedFlag, writePersistedFlag, readPersistedString, writePersistedString } from './persist.js';
+// Sprint 26 (i18n) / T1: locale infra. `loadPersistedLocale` runs before the
+// first render so the initial paint already reflects the user's choice.
+// `setLocale` is consumed by the toggle UI added in T3 — imported eagerly
+// here so T2/T3 patches can land without re-importing.
+import { getLocale, loadPersistedLocale, setLocale, t, type Locale } from './i18n.js';
 
 // Sprint 18 (y8pr): localStorage key for the features-sidebar
 // "hide completed" toggle. New keys use dot.camel namespacing — the older
@@ -123,14 +129,14 @@ function humanizeServerError(raw: string): string {
   if (!raw) return raw;
   // <root>: Unrecognized key(s) in object: 'foo', 'bar'
   const unknown = raw.match(/Unrecognized key\(s\) in object: ([^;]+)/);
-  if (unknown) return `알 수 없는 필드: ${unknown[1].replace(/'/g, '').trim()}`;
+  if (unknown) return t('validate.unknown_field', { field: unknown[1].replace(/'/g, '').trim() });
   // foo: Required
   if (/:\s*Required/.test(raw)) {
     const f = raw.split(':')[0]?.trim();
-    return f ? `${f}: 필수 입력` : raw;
+    return f ? t('validate.required.with_field', { field: f }) : raw;
   }
   // Invalid enum value
-  if (/Invalid enum value/.test(raw)) return `잘못된 값: ${raw.split(';')[0]}`;
+  if (/Invalid enum value/.test(raw)) return t('validate.invalid_enum', { raw: raw.split(';')[0]! });
   return raw;
 }
 
@@ -159,7 +165,7 @@ function showError(msg: string): void { showToast(msg, 'error'); }
 // inline. Keep this side-effect-free so it composes either way.
 function validateRequired(fields: Array<[string, string | undefined | null]>): string | null {
   for (const [label, val] of fields) {
-    if (!val || !String(val).trim()) return `${label}: 필수 입력`;
+    if (!val || !String(val).trim()) return t('validate.required.label', { label });
   }
   return null;
 }
@@ -196,7 +202,7 @@ async function mutate<T = any>(opts: {
   try {
     res = await fetch(opts.url, init);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : '네트워크 오류';
+    const msg = e instanceof Error ? e.message : t('error.network');
     showToast(msg, 'error');
     return null;
   }
@@ -237,7 +243,7 @@ async function createFeatureUI(name: string): Promise<void> {
   if (!f) return;
   const enriched: EnrichedFeature = {
     id: f.id, name: f.name, goal: f.goal, spec_md: f.spec_md, status: f.status,
-    progress: 0, tasks: [], files: [], sessions: [],
+    progress: 0, tasks: [], files: [], sessions: [], decisions: [],
   };
   DATA.features[projectId] = [...(DATA.features[projectId] || []), enriched];
   state.currentFeature = f.id;
@@ -271,8 +277,8 @@ async function deleteTaskUI(taskId: number): Promise<void> {
   const ok = await mutate({
     method: 'DELETE',
     url: `/api/tasks/${taskId}`,
-    confirm: '이 태스크를 삭제할까요?',
-    successToast: '태스크 삭제됨',
+    confirm: t('confirm.task.delete'),
+    successToast: t('toast.task.deleted'),
   });
   if (!ok) return;
   for (const feat of DATA.features[state.currentProject!] || []) {
@@ -314,6 +320,35 @@ async function toggleTaskUI(taskId: number, currentStatus: TaskStatus): Promise<
   render();
 }
 
+/**
+ * T1: keep `EnrichedFeature.decisions` consistent after a decision mutation.
+ * Drops `adrId` from every cached feature, then re-inserts a summary under
+ * the feature pointed at by `updated.feature_id` (when non-null). Newest-first
+ * order is preserved by unshifting. Mirrors the server-side
+ * `listDecisionsForFeature` projection.
+ */
+function syncFeatureDecisionsForAdr(adrId: string, updated: Decision): void {
+  const feats = DATA.features[state.currentProject!] || [];
+  for (const feat of feats) {
+    if (feat.decisions.some((dd) => dd.id === adrId)) {
+      feat.decisions = feat.decisions.filter((dd) => dd.id !== adrId);
+    }
+  }
+  if (!updated.feature_id) return;
+  const target = feats.find((f) => f.id === updated.feature_id);
+  if (!target) return;
+  const ctx = (updated.context ?? '').trim();
+  target.decisions = [
+    {
+      id: updated.id,
+      title: updated.title,
+      context_excerpt: ctx.length === 0 ? '' : ctx.length <= 80 ? ctx : ctx.slice(0, 80) + '…',
+      created_at: updated.created_at,
+    },
+    ...target.decisions,
+  ];
+}
+
 async function updateDecisionUI(adrId: string, patch: DecisionPatch): Promise<void> {
   // Strip empty optional strings — server's strict schema accepts the field
   // absent OR a non-empty string. feature_id allows null (clear) explicitly.
@@ -347,6 +382,9 @@ async function updateDecisionUI(adrId: string, patch: DecisionPatch): Promise<vo
       feature: featureName,
     };
   }
+  // T1: keep feature.decisions in sync. Strip from any feature that previously
+  // owned this ADR, then re-append under the current feature_id (if any).
+  syncFeatureDecisionsForAdr(adrId, updated);
   state.editingDecisionId = null;
   render();
 }
@@ -355,12 +393,18 @@ async function deleteDecisionUI(adrId: string): Promise<void> {
   const ok = await mutate({
     method: 'DELETE',
     url: `/api/decisions/${adrId}`,
-    confirm: `이 결정 기록(${adrId})을 삭제할까요?`,
-    successToast: '결정 삭제됨',
+    confirm: t('confirm.decision.delete', { id: adrId }),
+    successToast: t('toast.decision.deleted'),
   });
   if (!ok) return;
   DATA.decisions[state.currentProject!] =
     (DATA.decisions[state.currentProject!] || []).filter((d) => d.id !== adrId);
+  // T1: drop the ADR from any feature.decisions cache that referenced it.
+  for (const feat of DATA.features[state.currentProject!] || []) {
+    if (feat.decisions.some((dd) => dd.id === adrId)) {
+      feat.decisions = feat.decisions.filter((dd) => dd.id !== adrId);
+    }
+  }
   if (state.editingDecisionId === adrId) state.editingDecisionId = null;
   render();
 }
@@ -392,10 +436,13 @@ async function createDecisionUI(payload: {
   // part of AdrCard via `extends Decision`. `date` is the only synthetic field.
   const enriched: AdrCard = {
     ...adr,
-    date: '방금',
+    date: t('time.just_now'),
     feature: featureName,
   };
   DATA.decisions[state.currentProject!] = [enriched, ...(DATA.decisions[state.currentProject!] || [])];
+  // T1: thread the new ADR into the linked feature's decisions cache so the
+  // feature-detail "관련 결정" section reflects it without a reload.
+  syncFeatureDecisionsForAdr(adr.id, adr);
   state.addingDecision = false;
   // Sprint 20 (u3zu): overview's recent_decisions list reflects this new row.
   invalidateOverview(state.currentProject);
@@ -446,8 +493,8 @@ async function unlinkFileUI(featureId: string, filePath: string): Promise<void> 
   const ok = await mutate({
     method: 'DELETE',
     url,
-    confirm: `이 매핑을 해제할까요?\n${filePath}`,
-    successToast: '매핑 해제됨',
+    confirm: t('confirm.file.unlink', { path: filePath }),
+    successToast: t('toast.file.unlinked'),
   });
   if (!ok) return;
   // Remove from feature.files cache so the next render reflects the unlink.
@@ -469,7 +516,14 @@ async function linkFileUI(featureId: string, filePath: string): Promise<void> {
   if (feat) {
     feat.files = feat.files || [];
     if (!feat.files.some((ff) => ff.path === filePath)) {
-      feat.files.push({ path: link.file_path, desc: link.description ?? '' });
+      // Freshly-linked file has no session edits yet — start with empty stats
+      // so the type satisfies FeatureFileRow + the UI suppresses the label.
+      feat.files.push({
+        path: link.file_path,
+        desc: link.description ?? '',
+        last_edited_time: null,
+        edit_session_count: 0,
+      });
     }
   }
   render();
@@ -495,20 +549,23 @@ function makeMarkColor(seed: string): string {
 // (Removed in ADR-0016: adaptFileTree, computeHotFiles, SEVEN_DAYS_MS.
 // File tree / hot-file affordances retired with Code Map.)
 
-// Korean relative time. Buckets are coarse — "방금/5분 전/2시간 전/3일 전" etc.
+// Sprint 26 / T2: relative-time buckets resolve through t() so the helper
+// follows the active locale. Same buckets as before — only the surface
+// strings change. Server-side relativeTime() still emits Korean for fields
+// it pre-formats (e.g. session.time); that gap is tracked on the roadmap.
 function relTime(ts: number | null | undefined): string | null {
   if (!ts || typeof ts !== 'number') return null;
   const diff = Date.now() - ts;
-  if (diff < 60_000) return '방금';
+  if (diff < 60_000) return t('time.just_now');
   const m = Math.floor(diff / 60_000);
-  if (m < 60) return `${m}분 전`;
+  if (m < 60) return t('time.minutes', { n: m });
   const h = Math.floor(m / 60);
-  if (h < 24) return `${h}시간 전`;
+  if (h < 24) return t('time.hours', { n: h });
   const d = Math.floor(h / 24);
-  if (d === 1) return '어제';
-  if (d < 7) return `${d}일 전`;
-  if (d < 30) return `${Math.floor(d / 7)}주 전`;
-  return `${Math.floor(d / 30)}달 전`;
+  if (d === 1) return t('time.yesterday');
+  if (d < 7) return t('time.days', { n: d });
+  if (d < 30) return t('time.weeks', { n: Math.floor(d / 7) });
+  return t('time.months', { n: Math.floor(d / 30) });
 }
 
 // Pick the most informative timestamp for a task row. Accepts any task-shaped
@@ -541,7 +598,7 @@ async function loadWorkspaceFeatures(): Promise<void> {
     const rows = await fetchJSON<WorkspaceFeatureRow[]>(`/api/workspace/active-features?${qs}`);
     state.workspaceFeatures = rows;
   } catch (e) {
-    state.workspaceError = (e as Error).message ?? '워크스페이스 로드 실패';
+    state.workspaceError = (e as Error).message ?? t('error.workspace.load.failed');
   } finally {
     state.workspaceLoading = false;
     render();
@@ -616,8 +673,11 @@ async function loadProjectDetail(projectId: string): Promise<void> {
       files: (fd.files || []).map((ff): FeatureFileRow => ({
         path: ff.file_path,
         desc: ff.description ?? '',
+        last_edited_time: relTime(ff.last_edited_at ?? null),
+        edit_session_count: ff.edit_session_count ?? 0,
       })),
       sessions: fd.sessions || [], // {time, summary, files}
+      decisions: fd.decisions || [], // ADRs linked via decisions.feature_id (T1)
     };
   });
 
@@ -658,18 +718,27 @@ function invalidateOverview(projectId: string | null): void {
   if (DATA.overviews) delete DATA.overviews[projectId];
 }
 
+// Re-added after ADR-0016 removal. Lazy-load; callers check DATA.fileTrees
+// before rendering a Code Map surface and call this if the entry is absent.
+async function loadFileTree(projectId: string): Promise<FileNode[]> {
+  const tree = await fetchJSON<FileNode[]>(`/api/projects/${projectId}/file-tree`);
+  DATA.fileTrees = DATA.fileTrees ?? {};
+  DATA.fileTrees[projectId] = tree;
+  return tree;
+}
+
 // =================================================
 // Documents (Sprint 22, 3wtr — Spec Hub)
 // =================================================
 
-const DOCUMENT_KIND_LABEL: Record<DocumentKind, string> = {
-  prd:          'PRD',
-  planning:     '기획서',
-  architecture: '아키텍처',
-  retro:        '회고',
-  feature_spec: 'Feature Spec',
-  other:        '기타',
-};
+// Sprint 26 / T2: kind id → label resolved through t() per call so consumers
+// pick up the active locale. Define as a getter wrapper instead of a static
+// map to keep the lookup site identical (`DOCUMENT_KIND_LABEL[kind]`).
+const DOCUMENT_KIND_LABEL = new Proxy({} as Record<DocumentKind, string>, {
+  get(_target, prop: string) {
+    return t(`docs.kind.${prop}`);
+  },
+});
 /** Render order for the kind-grouped Docs list. Mirrors the label map order
  *  except 'other' is last (catch-all sinks to bottom). */
 const DOCUMENT_KIND_ORDER: ReadonlyArray<DocumentKind> = [
@@ -709,7 +778,7 @@ async function createDocumentUI(payload: {
     method: 'POST',
     url: `/api/projects/${pid}/documents`,
     body: payload,
-    successToast: '문서 추가됨',
+    successToast: t('toast.document.added'),
   });
   if (!doc) return;
   // Prepend so the new row shows up at the top of its kind group.
@@ -747,8 +816,8 @@ async function deleteDocumentUI(docId: string): Promise<void> {
   const ok = await mutate({
     method: 'DELETE',
     url: `/api/documents/${docId}`,
-    confirm: '이 문서를 삭제할까요?',
-    successToast: '문서 삭제됨',
+    confirm: t('confirm.document.delete'),
+    successToast: t('toast.document.deleted'),
   });
   if (!ok) return;
   DATA.documents = DATA.documents ?? {};
@@ -764,7 +833,7 @@ async function linkDocumentToFeatureUI(docId: string, featureId: string): Promis
     method: 'POST',
     url: '/api/document-features',
     body: { document_id: docId, feature_id: featureId },
-    successToast: '연결됨',
+    successToast: t('toast.document.linked'),
   });
   if (!ok) return;
   // Drop the feature-side cache so next paint refetches with the new row.
@@ -779,8 +848,8 @@ async function unlinkDocumentFromFeatureUI(docId: string, featureId: string): Pr
     method: 'DELETE',
     url: '/api/document-features',
     body: { document_id: docId, feature_id: featureId },
-    confirm: '이 연결을 해제할까요?',
-    successToast: '연결 해제됨',
+    confirm: t('confirm.unlink.feature_doc'),
+    successToast: t('toast.document.unlinked'),
   });
   if (!ok) return;
   if (DATA.documentsByFeature) delete DATA.documentsByFeature[featureId];
@@ -883,7 +952,7 @@ function renderDocs(): void {
   const projectId = state.currentProject;
   if (!projectId) {
     main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '프로젝트를 선택해주세요' }),
+      el('div', { class: 'empty-state-title', text: t('project.empty.select') }),
     ]));
     return;
   }
@@ -897,11 +966,11 @@ function renderDocs(): void {
   // Lazy fetch on first view.
   if (!(DATA.documents ?? {})[projectId]) {
     loadDocuments(projectId).then(() => render()).catch((e) => {
-      state.error = e instanceof Error ? e.message : '문서 로드 실패';
+      state.error = e instanceof Error ? e.message : t('docs.load.failed');
       render();
     });
     main.appendChild(el('div', { class: 'page-header' }, [
-      el('h1', { class: 'page-title', text: '문서 불러오는 중…' }),
+      el('h1', { class: 'page-title', text: t('docs.loading') }),
     ]));
     return;
   }
@@ -910,15 +979,15 @@ function renderDocs(): void {
 
   // Page header + "+ 문서 추가" toolbar.
   main.appendChild(el('div', { class: 'page-header' }, [
-    el('div', { class: 'breadcrumb', text: p.name + ' / 문서' }),
-    el('h1', { class: 'page-title', text: '문서 (Spec Hub)' }),
-    el('p', { class: 'page-tagline', text: 'PRD / 기획서 / 아키텍처 노트 / 회고 / feature spec — feature 와 연결해 작업 컨텍스트를 보존합니다.' }),
+    el('div', { class: 'breadcrumb', text: p.name + t('breadcrumb.sep') + t('tab.docs') }),
+    el('h1', { class: 'page-title', text: t('docs.title') }),
+    el('p', { class: 'page-tagline', text: t('docs.tagline') }),
   ]));
 
   const toolbar = el('div');
   toolbar.style.cssText = 'display: flex; justify-content: flex-end; margin-bottom: 12px;';
   const addBtn = el('button', {
-    text: state.addingDocument ? '취소' : '+ 문서 추가',
+    text: state.addingDocument ? t('button.cancel') : t('docs.add'),
     onClick: () => { state.addingDocument = !state.addingDocument; render(); },
   });
   addBtn.style.cssText = 'padding: 6px 12px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text); border-radius: 4px; font: inherit; cursor: pointer;';
@@ -931,8 +1000,8 @@ function renderDocs(): void {
 
   if (docs.length === 0 && !state.addingDocument) {
     main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '아직 문서가 없습니다' }),
-      el('div', { class: 'empty-state-text', text: '`+ 문서 추가` 로 PRD / 기획서 / 아키텍처 메모를 등록할 수 있어요. 작성한 문서는 검색(Cmd+K) 에서도 잡힙니다.' }),
+      el('div', { class: 'empty-state-title', text: t('docs.empty.title') }),
+      el('div', { class: 'empty-state-text', text: t('docs.empty.text') }),
     ]));
     return;
   }
@@ -986,9 +1055,9 @@ function renderDocumentDetail(docId: string): void {
   const doc = docs.find((d) => d.id === docId);
   if (!doc) {
     main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '문서를 찾지 못했습니다' }),
+      el('div', { class: 'empty-state-title', text: t('docs.detail.notfound') }),
       el('button', {
-        text: '← 문서 목록',
+        text: t('docs.detail.back'),
         onClick: () => { state.currentDocument = null; render(); },
       }),
     ]));
@@ -999,7 +1068,7 @@ function renderDocumentDetail(docId: string): void {
   const header = el('div', { class: 'page-header' });
   const back = el('a', {
     class: 'breadcrumb',
-    text: '← 문서 목록',
+    text: t('docs.detail.back'),
     onClick: () => {
       state.currentDocument = null;
       state.editingDocumentId = null;
@@ -1016,7 +1085,7 @@ function renderDocumentDetail(docId: string): void {
   header.appendChild(titleRow);
   header.appendChild(el('p', {
     class: 'page-tagline',
-    text: '업데이트 ' + (relTime(doc.updated_at) ?? '방금'),
+    text: t('docs.detail.updated_prefix') + (relTime(doc.updated_at) ?? t('docs.detail.recently')),
   }));
   main.appendChild(header);
 
@@ -1025,12 +1094,12 @@ function renderDocumentDetail(docId: string): void {
   actions.style.cssText = 'display: flex; gap: 8px; margin-bottom: 16px;';
   if (state.editingDocumentId === doc.id) {
     actions.appendChild(el('button', {
-      text: state.documentPreview ? '편집' : '미리보기',
+      text: state.documentPreview ? t('docs.detail.toggle.edit') : t('docs.detail.toggle.preview'),
       onClick: () => { state.documentPreview = !state.documentPreview; render(); },
     }));
   } else {
     actions.appendChild(el('button', {
-      text: '수정',
+      text: t('button.edit'),
       onClick: () => {
         state.editingDocumentId = doc.id;
         state.documentPreview = false;
@@ -1039,7 +1108,7 @@ function renderDocumentDetail(docId: string): void {
     }));
   }
   actions.appendChild(el('button', {
-    text: '삭제',
+    text: t('button.delete'),
     onClick: () => deleteDocumentUI(doc.id),
   }));
   for (const btn of Array.from(actions.children)) {
@@ -1052,7 +1121,7 @@ function renderDocumentDetail(docId: string): void {
     main.appendChild(renderDocumentForm(doc));
   } else if (state.documentPreview && state.editingDocumentId === doc.id) {
     const previewBox = el('div', { class: 'feature-spec-section' });
-    previewBox.appendChild(el('div', { class: 'detail-section-title' }, [el('span', { text: '미리보기' })]));
+    previewBox.appendChild(el('div', { class: 'detail-section-title' }, [el('span', { text: t('docs.detail.preview') })]));
     const body = el('div', { class: 'feature-spec-body markdown-preview' });
     body.style.cssText = 'background: var(--bg-elevated); padding: 12px 16px; border-radius: 6px;';
     body.innerHTML = renderMarkdownLite(doc.content_md);
@@ -1063,7 +1132,7 @@ function renderDocumentDetail(docId: string): void {
     if (doc.content_md.trim()) {
       readBox.appendChild(el('pre', { class: 'feature-spec-body', text: doc.content_md }));
     } else {
-      readBox.appendChild(el('div', { class: 'empty-state-text', text: '본문이 비어있습니다. "수정" 으로 작성하세요.' }));
+      readBox.appendChild(el('div', { class: 'empty-state-text', text: t('docs.detail.empty.body') }));
     }
     main.appendChild(readBox);
   }
@@ -1094,16 +1163,16 @@ function renderDocumentForm(doc: Document | null): HTMLElement {
   const labelStyle = 'font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em;';
 
   // title
-  wrap.appendChild(el('label', { text: '제목', style: labelStyle }));
+  wrap.appendChild(el('label', { text: t('docs.form.title'), style: labelStyle }));
   const titleInput = document.createElement('input');
   titleInput.type = 'text';
   titleInput.value = doc?.title ?? '';
-  titleInput.placeholder = '문서 제목 (필수)';
+  titleInput.placeholder = t('docs.form.title.placeholder');
   titleInput.style.cssText = fieldStyle;
   wrap.appendChild(titleInput);
 
   // kind
-  wrap.appendChild(el('label', { text: '종류', style: labelStyle }));
+  wrap.appendChild(el('label', { text: t('docs.form.kind'), style: labelStyle }));
   const kindSel = document.createElement('select');
   kindSel.style.cssText = fieldStyle;
   DOCUMENT_KIND_ORDER.forEach((k) => {
@@ -1114,21 +1183,21 @@ function renderDocumentForm(doc: Document | null): HTMLElement {
   wrap.appendChild(kindSel);
 
   // content_md
-  wrap.appendChild(el('label', { text: 'Markdown 본문', style: labelStyle }));
+  wrap.appendChild(el('label', { text: t('docs.form.body'), style: labelStyle }));
   const textarea = document.createElement('textarea');
   textarea.rows = 16;
   textarea.value = doc?.content_md ?? '';
-  textarea.placeholder = '## 배경\n...\n## 비범위\n...';
+  textarea.placeholder = t('docs.form.body.placeholder');
   textarea.style.cssText = fieldStyle + '; resize: vertical; min-height: 240px; font-family: var(--font-mono, monospace);';
   wrap.appendChild(textarea);
 
   const actions = el('div');
   actions.style.cssText = 'display: flex; gap: 8px; margin-top: 4px;';
   const submit = el('button', {
-    text: doc ? '저장' : '생성',
+    text: doc ? t('docs.form.submit.update') : t('docs.form.submit.create'),
     onClick: () => {
       const title = titleInput.value.trim();
-      const err = validateRequired([['제목', title]]);
+      const err = validateRequired([[t('docs.field.title'), title]]);
       if (err) { showError(err); titleInput.focus(); return; }
       const kind = kindSel.value as DocumentKind;
       const content_md = textarea.value;
@@ -1141,7 +1210,7 @@ function renderDocumentForm(doc: Document | null): HTMLElement {
   });
   submit.style.cssText = 'padding: 6px 14px; background: var(--accent); border: 1px solid var(--accent); color: var(--text); border-radius: 4px; font: inherit; cursor: pointer;';
   const cancel = el('button', {
-    text: '취소',
+    text: t('button.cancel'),
     onClick: () => {
       if (doc) {
         state.editingDocumentId = null;
@@ -1248,7 +1317,7 @@ async function copyContextBriefToClipboard(text: string): Promise<void> {
     try { ok = document.execCommand('copy'); } catch { ok = false; }
     document.body.removeChild(ta);
   }
-  showToast(ok ? 'Context Brief 복사됨' : '복사에 실패했습니다.', ok ? 'success' : 'error');
+  showToast(ok ? t('toast.brief.copied') : t('toast.brief.copy.failed'), ok ? 'success' : 'error');
 }
 
 /**
@@ -1263,7 +1332,7 @@ function renderContextBriefSection(featureId: string): HTMLElement {
     el('span', { text: '🤖 Context Brief' }),
     el('span', {
       class: 'detail-section-count',
-      text: '에이전트 컨텍스트',
+      text: t('brief.title'),
       style: 'color: var(--text-3); font-size: 11px;',
     }),
   ]));
@@ -1276,11 +1345,11 @@ function renderContextBriefSection(featureId: string): HTMLElement {
   actions.style.cssText = 'display: flex; gap: 8px; align-items: center; margin-bottom: 8px;';
 
   const copyBtn = el('button', {
-    text: '복사',
-    title: 'Markdown 을 클립보드에 복사',
+    text: t('brief.copy'),
+    title: t('brief.copy.title'),
     onClick: async () => {
       const brief = cached ?? await loadContextBrief(featureId).catch((e) => {
-        showError(e instanceof Error ? e.message : 'Context Brief 로드 실패');
+        showError(e instanceof Error ? e.message : t('brief.load.failed'));
         return null;
       });
       if (!brief) return;
@@ -1291,7 +1360,7 @@ function renderContextBriefSection(featureId: string): HTMLElement {
   actions.appendChild(copyBtn);
 
   const toggleBtn = el('button', {
-    text: expanded ? '접기' : '펼쳐보기',
+    text: expanded ? t('brief.toggle.collapse') : t('brief.toggle.expand'),
     onClick: () => {
       if (expanded) {
         state.expandedContextBriefs.delete(featureId);
@@ -1301,7 +1370,7 @@ function renderContextBriefSection(featureId: string): HTMLElement {
         // called again by the promise's .then.
         if (!cached) {
           loadContextBrief(featureId).then(() => render()).catch((e) => {
-            showError(e instanceof Error ? e.message : 'Context Brief 로드 실패');
+            showError(e instanceof Error ? e.message : t('brief.load.failed'));
           });
         }
       }
@@ -1314,7 +1383,7 @@ function renderContextBriefSection(featureId: string): HTMLElement {
   // Helper hint line — explains what the brief is for, mirroring the
   // session-end notes hint pattern from Sprint 23.
   const hint = el('span', {
-    text: '새 에이전트 세션에 붙여넣어 프로젝트 + 기능 + 진행 상황을 한 번에 전달합니다.',
+    text: t('brief.intro'),
     style: 'color: var(--text-3); font-size: 11px; margin-left: auto;',
   });
   actions.appendChild(hint);
@@ -1326,7 +1395,7 @@ function renderContextBriefSection(featureId: string): HTMLElement {
   if (!cached) {
     wrap.appendChild(el('div', {
       class: 'empty-state-text',
-      text: 'Context Brief 불러오는 중…',
+      text: t('brief.loading'),
       style: 'padding: 8px 0; color: var(--text-3);',
     }));
     return wrap;
@@ -1341,11 +1410,14 @@ function renderContextBriefSection(featureId: string): HTMLElement {
   // scanning the whole markdown.
   const s = cached.sections;
   const counts: string[] = [];
-  if (s.open_tasks.length > 0) counts.push(`작업 ${s.open_tasks.length}`);
-  if (s.linked_files.length > 0) counts.push(`파일 ${s.linked_files.length}${s.linked_files_overflow > 0 ? `+${s.linked_files_overflow}` : ''}`);
-  if (s.documents.length > 0) counts.push(`문서 ${s.documents.length}${s.documents_overflow > 0 ? `+${s.documents_overflow}` : ''}`);
-  if (s.recent_decisions.length > 0) counts.push(`결정 ${s.recent_decisions.length}${s.recent_decisions_overflow > 0 ? `+${s.recent_decisions_overflow}` : ''}`);
-  if (s.recent_sessions.length > 0) counts.push(`세션 ${s.recent_sessions.length}${s.recent_sessions_overflow > 0 ? `+${s.recent_sessions_overflow}` : ''}`);
+  // Sprint 26 / T2: counts go through t() with placeholders so locale flips
+  // re-flow the entire footer. Overflow suffix stays raw — it's purely numeric.
+  const overflowSuffix = (n: number) => (n > 0 ? `+${n}` : '');
+  if (s.open_tasks.length > 0) counts.push(t('brief.count.tasks', { n: s.open_tasks.length }));
+  if (s.linked_files.length > 0) counts.push(t('brief.count.files', { n: `${s.linked_files.length}${overflowSuffix(s.linked_files_overflow)}` }));
+  if (s.documents.length > 0) counts.push(t('brief.count.docs', { n: `${s.documents.length}${overflowSuffix(s.documents_overflow)}` }));
+  if (s.recent_decisions.length > 0) counts.push(t('brief.count.decisions', { n: `${s.recent_decisions.length}${overflowSuffix(s.recent_decisions_overflow)}` }));
+  if (s.recent_sessions.length > 0) counts.push(t('brief.count.sessions', { n: `${s.recent_sessions.length}${overflowSuffix(s.recent_sessions_overflow)}` }));
   if (counts.length > 0) {
     wrap.appendChild(el('div', {
       text: counts.join(' · '),
@@ -1358,6 +1430,7 @@ function renderContextBriefSection(featureId: string): HTMLElement {
 
 async function setActiveProject(projectId: string): Promise<void> {
   state.currentProject = projectId;
+  writePersistedString('vibemate.currentProject', projectId);
   state.error = null;
   // ADR-0018: when switching into a project from the cross-project workspace
   // view, drop the user on the project's Overview first — that's the "what
@@ -1509,7 +1582,7 @@ function renderDecisionForm(editing?: AdrCard) {
       HTMLInputElement | HTMLTextAreaElement;
     if (node instanceof HTMLInputElement) node.type = 'text';
     if (node instanceof HTMLTextAreaElement) node.rows = 2;
-    node.placeholder = required ? `${label} (필수)` : label;
+    node.placeholder = required ? t('decisions.form.placeholder.required', { label }) : label;
     node.style.cssText = fieldStyle;
     inputs[key] = node;
     const grp = el('div');
@@ -1519,11 +1592,11 @@ function renderDecisionForm(editing?: AdrCard) {
     return grp;
   };
 
-  wrap.appendChild(mk('title', '제목', false, true));
-  wrap.appendChild(mk('context', '배경', true));
-  wrap.appendChild(mk('alternatives', '대안', true));
-  wrap.appendChild(mk('decision', '결정', true));
-  wrap.appendChild(mk('consequences', '결과/영향', true));
+  wrap.appendChild(mk('title', t('decisions.form.field.title'), false, true));
+  wrap.appendChild(mk('context', t('decisions.form.field.context'), true));
+  wrap.appendChild(mk('alternatives', t('decisions.form.field.alternatives'), true));
+  wrap.appendChild(mk('decision', t('decisions.form.field.decision'), true));
+  wrap.appendChild(mk('consequences', t('decisions.form.field.consequences'), true));
 
   // Pre-fill when editing.
   if (editing) {
@@ -1537,11 +1610,11 @@ function renderDecisionForm(editing?: AdrCard) {
   // Optional: feature dropdown.
   const features = getFeatures();
   if (features.length > 0) {
-    const lab = el('label', { text: '관련 기능 (선택)' });
+    const lab = el('label', { text: t('decisions.form.feature.label') });
     lab.style.cssText = labelStyle;
     const sel = document.createElement('select');
     sel.style.cssText = fieldStyle;
-    sel.appendChild(new Option('— 없음 —', ''));
+    sel.appendChild(new Option(t('decisions.form.feature.none'), ''));
     features.forEach((f) => sel.appendChild(new Option(f.name, f.id)));
     if (editing?.feature_id) sel.value = editing.feature_id;
     inputs['feature_id'] = sel;
@@ -1561,7 +1634,7 @@ function renderDecisionForm(editing?: AdrCard) {
   // Action buttons.
   const submit = () => {
     const title = inputs.title.value.trim();
-    const err = validateRequired([['제목', title]]);
+    const err = validateRequired([[t('decisions.form.field.title'), title]]);
     if (err) {
       showError(err);
       inputs.title.focus();
@@ -1589,9 +1662,9 @@ function renderDecisionForm(editing?: AdrCard) {
   };
   const actions = el('div');
   actions.style.cssText = 'display: flex; gap: 8px; margin-top: 6px;';
-  const submitBtn = el('button', { text: editing ? '수정 저장' : '저장', onClick: submit });
+  const submitBtn = el('button', { text: editing ? t('decisions.form.submit.update') : t('decisions.form.submit.create'), onClick: submit });
   submitBtn.style.cssText = 'padding: 6px 14px; background: var(--accent); border: 1px solid var(--accent); color: var(--text); border-radius: 4px; font: inherit; cursor: pointer;';
-  const cancelBtn = el('button', { text: '취소', onClick: closeForm });
+  const cancelBtn = el('button', { text: t('button.cancel'), onClick: closeForm });
   cancelBtn.style.cssText = 'padding: 6px 14px; background: transparent; border: 1px solid var(--border); color: var(--text-2); border-radius: 4px; font: inherit; cursor: pointer;';
   actions.appendChild(submitBtn);
   actions.appendChild(cancelBtn);
@@ -1659,7 +1732,7 @@ function statsFor(projId: string | null): { inProg: number; todo: number; done: 
 // =================================================
 function renderProjectSwitcher(): void {
   const p = getProject();
-  $('#currentProjectName')!.textContent = p ? p.name : '프로젝트 없음';
+  $('#currentProjectName')!.textContent = p ? p.name : t('project.switcher.none');
   const mark = $('#currentProjectMark')!;
   mark.style.background = p ? p.markColor : 'var(--bg-soft)';
   mark.textContent = p ? p.mark : '–';
@@ -1690,17 +1763,9 @@ document.addEventListener('click', () => $('#projectDropdown')!.classList.remove
 // =================================================
 // Tabs
 // =================================================
-const TABS: ReadonlyArray<{ id: Tab; label: string }> = [
-  { id: 'workspace', label: '📋 내 작업' },
-  // Sprint 20 (u3zu): 'dashboard' → 'overview'. Single project-detail
-  // first screen; consumes /api/projects/:id/overview directly.
-  { id: 'overview', label: '오버뷰' },
-  // Sprint 22 (3wtr): Spec Hub. Free-form per-project documents.
-  { id: 'docs', label: '문서' },
-  { id: 'features', label: '기능' },
-  { id: 'decisions', label: '결정 기록' },
-  { id: 'sessions', label: '세션 로그' },
-];
+// Sprint 26 / T2: tab ids only — labels go through `t('tab.<id>')` so the
+// segmented header reflects the current locale on every render.
+const TAB_IDS: ReadonlyArray<Tab> = ['workspace', 'overview', 'docs', 'features', 'decisions', 'sessions'];
 function renderTabs(): void {
   const tabs = $('#tabs')!;
   tabs.innerHTML = '';
@@ -1710,11 +1775,11 @@ function renderTabs(): void {
     decisions: stats.decisions,
     sessions: stats.sessions,
   };
-  TABS.forEach((t) => {
-    const btn = el('button', { class: 'tab' + (t.id === state.currentTab ? ' active' : ''), onClick: () => { state.currentTab = t.id; render(); } });
-    btn.appendChild(document.createTextNode(t.label));
-    if (counts[t.id] != null) {
-      const c = el('span', { class: 'tab-count', text: String(counts[t.id]) });
+  TAB_IDS.forEach((id) => {
+    const btn = el('button', { class: 'tab' + (id === state.currentTab ? ' active' : ''), onClick: () => { state.currentTab = id; render(); } });
+    btn.appendChild(document.createTextNode(t(`tab.${id}`)));
+    if (counts[id] != null) {
+      const c = el('span', { class: 'tab-count', text: String(counts[id]) });
       btn.appendChild(c);
     }
     tabs.appendChild(btn);
@@ -1738,7 +1803,7 @@ function renderSidebar() {
   if (showFeatureSidebar) {
     const sec = el('div', { class: 'sb-section' });
     sec.appendChild(el('div', { class: 'sb-heading' }, [
-      el('span', { text: '기능' }),
+      el('span', { text: t('sidebar.features') }),
       el('button', {
         class: 'sb-add-btn',
         text: state.addingFeature ? '×' : '+',
@@ -1748,7 +1813,7 @@ function renderSidebar() {
 
     if (state.addingFeature) {
       sec.appendChild(inlineInputRow({
-        placeholder: '새 기능 이름…',
+        placeholder: t('sidebar.add.feature.placeholder'),
         onSubmit: (val) => createFeatureUI(val),
         onCancel: () => { state.addingFeature = false; render(); },
       }));
@@ -1763,10 +1828,11 @@ function renderSidebar() {
       if (f.status in grouped) grouped[f.status as GroupKey].push(f);
     });
 
-    const order: ReadonlyArray<{ key: GroupKey; label: string }> = [
-      { key: 'in_progress', label: '진행 중' },
-      { key: 'todo', label: '할 일' },
-      { key: 'done', label: '완료' },
+    // Sprint 26 / T2: labels resolve through t() so a locale flip repaints.
+    const order: ReadonlyArray<{ key: GroupKey; labelKey: string }> = [
+      { key: 'in_progress', labelKey: 'sidebar.group.in_progress' },
+      { key: 'todo', labelKey: 'sidebar.group.todo' },
+      { key: 'done', labelKey: 'sidebar.group.done' },
     ];
 
     // Sprint 18 (y8pr): the "완료" group is collapsible behind a single hint
@@ -1780,7 +1846,7 @@ function renderSidebar() {
       render();
     };
 
-    order.forEach(({ key, label }) => {
+    order.forEach(({ key, labelKey }) => {
       if (grouped[key].length === 0) return;
 
       // Collapsed-hint branch for the done group.
@@ -1788,7 +1854,7 @@ function renderSidebar() {
         const hint = el('div', {
           class: 'sb-heading sb-collapsed-hint',
           onClick: toggleHideCompleted,
-          title: '완료된 기능 보이기',
+          title: t('sidebar.done.show.title'),
         });
         hint.style.cssText = [
           'margin-top: 10px',
@@ -1796,7 +1862,7 @@ function renderSidebar() {
           'cursor: pointer',
           'color: var(--text-3)',
         ].join('; ');
-        hint.appendChild(el('span', { text: `완료 ${grouped[key].length}개 (숨김 · 보이기)` }));
+        hint.appendChild(el('span', { text: t('sidebar.done.collapsed', { count: grouped[key].length }) }));
         sec.appendChild(hint);
         return; // skip rendering the items themselves
       }
@@ -1804,14 +1870,14 @@ function renderSidebar() {
       const subHeading = el('div', { class: 'sb-heading' });
       subHeading.style.marginTop = '10px';
       subHeading.style.fontSize = '10.5px';
-      subHeading.appendChild(el('span', { text: label + ' · ' + grouped[key].length }));
+      subHeading.appendChild(el('span', { text: t(labelKey) + ' · ' + grouped[key].length }));
       // Inverse affordance: when done is currently expanded, offer a quick
       // "숨기기" link inside its heading so the user can collapse it back
       // without hunting for a setting elsewhere.
       if (key === 'done') {
         const hideBtn = el('span', {
-          text: '숨기기',
-          title: '완료된 기능 숨기기',
+          text: t('sidebar.done.hide'),
+          title: t('sidebar.done.hide.title'),
           onClick: (e: MouseEvent) => { e.stopPropagation(); toggleHideCompleted(); },
         });
         hideBtn.style.cssText = [
@@ -1848,11 +1914,13 @@ function renderSidebar() {
 // Human-readable health label + pill class. Kept here so the renderer is
 // the only place that needs to think about strings — domain side just
 // emits the discriminator.
-const HEALTH_LABEL: Record<ProjectOverview['status'], string> = {
-  active:    '진행 중',
-  todo_only: '시작 대기',
-  stale:     '정체',
-  empty:     '비어 있음',
+// Sprint 26 / T2: keep the discriminator → key mapping module-level (cheap)
+// and resolve through t() at render time so the pill flips on locale change.
+const HEALTH_LABEL_KEY: Record<ProjectOverview['status'], string> = {
+  active:    'overview.health.active',
+  todo_only: 'overview.health.todo_only',
+  stale:     'overview.health.stale',
+  empty:     'overview.health.empty',
 };
 const HEALTH_PILL_CLASS: Record<ProjectOverview['status'], string> = {
   active:    'in-progress',
@@ -1867,7 +1935,7 @@ function renderOverview(): void {
   const projectId = state.currentProject;
   if (!projectId) {
     main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '프로젝트를 선택해주세요' }),
+      el('div', { class: 'empty-state-title', text: t('project.empty.select') }),
     ]));
     return;
   }
@@ -1878,11 +1946,11 @@ function renderOverview(): void {
   // the page paints with a placeholder until then to avoid layout jank.
   if (!ov) {
     loadProjectOverview(projectId).then(() => render()).catch((e) => {
-      state.error = e instanceof Error ? e.message : '오버뷰 로드 실패';
+      state.error = e instanceof Error ? e.message : t('overview.loading');
       render();
     });
     main.appendChild(el('div', { class: 'page-header' }, [
-      el('h1', { class: 'page-title', text: '오버뷰 불러오는 중…' }),
+      el('h1', { class: 'page-title', text: t('overview.loading') }),
     ]));
     return;
   }
@@ -1895,7 +1963,7 @@ function renderOverview(): void {
   const titleRow = el('div');
   titleRow.style.cssText = 'display: flex; align-items: center; gap: 12px;';
   titleRow.appendChild(el('h1', { class: 'page-title', text: ov.project.name }));
-  titleRow.appendChild(pillEl(HEALTH_PILL_CLASS[ov.status], HEALTH_LABEL[ov.status]));
+  titleRow.appendChild(pillEl(HEALTH_PILL_CLASS[ov.status], t(HEALTH_LABEL_KEY[ov.status])));
   header.appendChild(titleRow);
   if (ov.project.goal) {
     header.appendChild(el('p', { class: 'page-tagline', text: ov.project.goal }));
@@ -1905,13 +1973,13 @@ function renderOverview(): void {
   // Stat grid — driven by server `stats`. No mock trend strings.
   const grid = el('div', { class: 'stat-grid' });
   const lastActivityText = ov.last_activity_at
-    ? '최근 활동 ' + (relTime(ov.last_activity_at) ?? '')
-    : '활동 기록 없음';
+    ? t('overview.last_activity.recent', { time: relTime(ov.last_activity_at) ?? '' })
+    : t('overview.last_activity.none');
   ([
-    { label: '진행 중인 기능', value: ov.project.stats.active_features, trend: '/ ' + ov.project.stats.total_features + ' 전체' },
-    { label: '미완료 태스크', value: ov.project.stats.todo_tasks, trend: ov.project.stats.done_tasks + '개 완료' },
-    { label: '이번 주 세션', value: ov.project.stats.sessions_this_week, trend: lastActivityText },
-    { label: '결정 기록', value: ov.project.stats.decisions, trend: '' },
+    { label: t('overview.stats.active_features.label'), value: ov.project.stats.active_features, trend: t('overview.stats.active_features.trend', { total: ov.project.stats.total_features }) },
+    { label: t('overview.stats.todo_tasks.label'), value: ov.project.stats.todo_tasks, trend: t('overview.stats.todo_tasks.trend', { done: ov.project.stats.done_tasks }) },
+    { label: t('overview.stats.sessions_this_week.label'), value: ov.project.stats.sessions_this_week, trend: lastActivityText },
+    { label: t('overview.stats.decisions.label'), value: ov.project.stats.decisions, trend: '' },
   ]).forEach((s) => {
     grid.appendChild(el('div', { class: 'stat-card' }, [
       el('div', { class: 'stat-label', text: s.label }),
@@ -1924,15 +1992,8 @@ function renderOverview(): void {
   // Empty-state guidance — Sprint 14/15 onboarding pattern.
   if (ov.status === 'empty') {
     main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '아직 기능이 없습니다' }),
-      el('div', {
-        class: 'empty-state-text',
-        text:
-          'CLI 에서 시작하기:'
-          + '\n  • `pm import-history` — git history 로 sessions 가져오기'
-          + '\n  • `pm extract-features` — commit prefix 로 feature 추출'
-          + '\n또는 사이드바에서 기능을 직접 추가하세요.',
-      }),
+      el('div', { class: 'empty-state-title', text: t('overview.empty.cli.title') }),
+      el('div', { class: 'empty-state-text', text: t('overview.empty.cli.text') }),
     ]));
     return;
   }
@@ -1947,7 +2008,7 @@ function renderOverview(): void {
     card.style.cursor = 'pointer';
     card.appendChild(el('div', { class: 'now-header' }, [
       el('div', { class: 'now-meta' }, [
-        el('div', { class: 'now-eyebrow', text: '다음 액션' }),
+        el('div', { class: 'now-eyebrow', text: t('overview.next_action') }),
         el('h2', { class: 'now-title', text: next.task_name }),
       ]),
     ]));
@@ -1960,12 +2021,12 @@ function renderOverview(): void {
   // Left: active features (in_progress + todo, Sprint 19 sort).
   const left = el('div', {});
   left.appendChild(el('div', { class: 'section-title' }, [
-    el('span', { text: '활성 기능 · ' + ov.active_features.length }),
-    el('a', { class: 'section-link', text: '전체 기능 →', onClick: () => { state.currentTab = 'features'; render(); } }),
+    el('span', { text: t('overview.active_features') + ' · ' + ov.active_features.length }),
+    el('a', { class: 'section-link', text: t('overview.all_features'), onClick: () => { state.currentTab = 'features'; render(); } }),
   ]));
   const flist = el('div', { class: 'feature-card-list' });
   if (ov.active_features.length === 0) {
-    flist.appendChild(el('div', { class: 'empty-state-text', text: '진행 중이거나 todo 인 기능이 없습니다.', style: 'padding: 8px 0; color: var(--text-3);' }));
+    flist.appendChild(el('div', { class: 'empty-state-text', text: t('overview.empty.features'), style: 'padding: 8px 0; color: var(--text-3);' }));
   } else {
     ov.active_features.forEach((f) => {
       const fcard = el('div', {
@@ -1991,12 +2052,12 @@ function renderOverview(): void {
   // Right: stacked recent sessions + recent decisions.
   const right = el('div', {});
   right.appendChild(el('div', { class: 'section-title' }, [
-    el('span', { text: '최근 세션' }),
-    el('a', { class: 'section-link', text: '세션 전체 →', onClick: () => { state.currentTab = 'sessions'; render(); } }),
+    el('span', { text: t('overview.recent_sessions') }),
+    el('a', { class: 'section-link', text: t('overview.all_sessions'), onClick: () => { state.currentTab = 'sessions'; render(); } }),
   ]));
   const sList = el('div', { class: 'activity-list' });
   if (ov.recent_sessions.length === 0) {
-    sList.appendChild(el('div', { class: 'empty-state-text', text: '아직 세션 기록이 없습니다.', style: 'padding: 8px 0; color: var(--text-3);' }));
+    sList.appendChild(el('div', { class: 'empty-state-text', text: t('overview.empty.sessions'), style: 'padding: 8px 0; color: var(--text-3);' }));
   } else {
     ov.recent_sessions.forEach((s) => {
       // Sprint 23 (h5uk): each row navigates to renderSessionDetail.
@@ -2020,12 +2081,12 @@ function renderOverview(): void {
   right.appendChild(sList);
 
   right.appendChild(el('div', { class: 'section-title', style: 'margin-top: 16px;' }, [
-    el('span', { text: '최근 결정' }),
-    el('a', { class: 'section-link', text: '결정 전체 →', onClick: () => { state.currentTab = 'decisions'; render(); } }),
+    el('span', { text: t('overview.recent_decisions') }),
+    el('a', { class: 'section-link', text: t('overview.all_decisions'), onClick: () => { state.currentTab = 'decisions'; render(); } }),
   ]));
   const dList = el('div', { class: 'activity-list' });
   if (ov.recent_decisions.length === 0) {
-    dList.appendChild(el('div', { class: 'empty-state-text', text: '아직 결정 기록이 없습니다.', style: 'padding: 8px 0; color: var(--text-3);' }));
+    dList.appendChild(el('div', { class: 'empty-state-text', text: t('overview.empty.decisions'), style: 'padding: 8px 0; color: var(--text-3);' }));
   } else {
     ov.recent_decisions.forEach((d) => {
       dList.appendChild(el('div', { class: 'activity-item' }, [
@@ -2051,7 +2112,10 @@ function pillEl(status: string, label: string): HTMLSpanElement {
   ]);
 }
 function statusLabel(s: string): string {
-  return s === 'done' ? '완료' : s === 'in_progress' ? '진행 중' : '할 일';
+  // Sprint 26 / T2: routed through t() so workspace + overview pills follow
+  // the active locale. Falls back to the 'todo' key for any unrecognised id.
+  if (s === 'done' || s === 'in_progress' || s === 'archived') return t(`status.${s}`);
+  return t('status.todo');
 }
 
 // =================================================
@@ -2063,15 +2127,15 @@ function renderFeatureDetail() {
   const f = getFeature();
   if (!f) {
     main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '기능을 선택해주세요' }),
-      el('div', { class: 'empty-state-text', text: '왼쪽에서 기능을 클릭하면 상세 정보가 표시됩니다.' })
+      el('div', { class: 'empty-state-title', text: t('feature.empty.title') }),
+      el('div', { class: 'empty-state-text', text: t('feature.empty.text') })
     ]));
     return;
   }
 
   const p = getProject()!;
   const header = el('div', { class: 'page-header' });
-  header.appendChild(el('div', { class: 'breadcrumb', text: p.name + ' / 기능' }));
+  header.appendChild(el('div', { class: 'breadcrumb', text: p.name + t('breadcrumb.sep') + t('tab.features') }));
 
   const titleRow = el('h1', { class: 'page-title' });
 
@@ -2094,7 +2158,7 @@ function renderFeatureDetail() {
     input.addEventListener('keydown', (e: KeyboardEvent) => {
       if (e.key === 'Enter') {
         const v = input.value.trim();
-        const err = validateRequired([['이름', v]]);
+        const err = validateRequired([[t('feature.field.name'), v]]);
         if (err) { showError(err); return; }
         if (v === f.name) { state.editingFeatureName = null; render(); return; }
         updateFeatureUI(f.id, { name: v });
@@ -2108,8 +2172,8 @@ function renderFeatureDetail() {
   } else {
     titleRow.appendChild(el('span', { text: f.name }));
     const editBtn = el('button', {
-      text: '수정',
-      title: '이름 수정',
+      text: t('button.edit'),
+      title: t('button.edit.feature.title'),
       onClick: () => { state.editingFeatureName = f.id; render(); },
     });
     editBtn.style.cssText = 'margin-left: 4px; padding: 2px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-3); border-radius: 4px; font: inherit; font-size: 11px; cursor: pointer;';
@@ -2120,15 +2184,12 @@ function renderFeatureDetail() {
   // sidebar grouping silently skips archived (see renderSidebar) so the feature
   // disappears from the list once archived. Dashboard / direct URL still reach it.
   const statusSel = document.createElement('select');
-  statusSel.title = '상태 변경';
-  const STATUS_OPTS: Array<[string, string]> = [
-    ['todo', '할 일'],
-    ['in_progress', '진행 중'],
-    ['done', '완료'],
-    ['archived', '보관됨'],
-  ];
-  STATUS_OPTS.forEach(([v, label]) => {
-    const opt = new Option(label, v);
+  statusSel.title = t('feature.status.title');
+  // Sprint 26 / T2: status labels resolve through t() each render so the
+  // dropdown follows the active locale.
+  const STATUS_OPTS: ReadonlyArray<FeatureStatus> = ['todo', 'in_progress', 'done', 'archived'];
+  STATUS_OPTS.forEach((v) => {
+    const opt = new Option(t(`status.${v}`), v);
     if (v === f.status) opt.selected = true;
     statusSel.appendChild(opt);
   });
@@ -2146,7 +2207,7 @@ function renderFeatureDetail() {
   if (f.spec_md && f.spec_md.trim()) {
     const spec = el('div', { class: 'detail-section feature-spec-section' });
     spec.appendChild(el('div', { class: 'detail-section-title' }, [
-      el('span', { text: '스펙' }),
+      el('span', { text: t('feature.section.spec') }),
     ]));
     spec.appendChild(el('pre', { class: 'feature-spec-body', text: f.spec_md.trim() }));
     main.appendChild(spec);
@@ -2161,33 +2222,52 @@ function renderFeatureDetail() {
     el('div', { class: 'progress-bar' }, [el('div', { class: 'progress-fill', style: 'width:' + f.progress + '%' })]),
     el('div', { class: 'progress-text', text: f.tasks.filter((t) => t.status === 'done').length + ' / ' + f.tasks.length + ' · ' + f.progress + '%' }),
   ]);
-  progRow.style.marginBottom = '32px';
   main.appendChild(progRow);
+
+  // T3 (feature-flow-map): one-line cross-reference summary right under the
+  // progress bar. Counts read straight from the enriched feature — no extra
+  // fetch. `linkedDocs.length` falls back to 0 when the cache hasn't been
+  // primed yet; the section auto-refreshes once `loadDocumentsForFeature`
+  // resolves (re-runs render()).
+  const flowDocsCount = ((DATA.documentsByFeature ?? {})[f.id] ?? []).length;
+  const flowMeta = el('div', { class: 'flow-meta' });
+  flowMeta.style.cssText = 'color: var(--text-3); font-size: 12px; margin-top: 6px; margin-bottom: 32px;';
+  // Sprint 26 / T2: i18n interpolation. Template lives in the dictionary
+  // (e.g. ko "관련 파일 {files} · 결정 {decisions} · …" / en "{files} files · …").
+  flowMeta.appendChild(el('span', {
+    text: t('feature.flow.meta', {
+      files: f.files.length,
+      decisions: f.decisions.length,
+      docs: flowDocsCount,
+      sessions: f.sessions.length,
+    }),
+  }));
+  main.appendChild(flowMeta);
 
   const tasks = el('div', { class: 'detail-section' });
   tasks.appendChild(el('div', { class: 'detail-section-title' }, [
-    el('span', { text: '할 일' }),
+    el('span', { text: t('feature.section.tasks') }),
     el('span', { class: 'detail-section-count', text: String(f.tasks.length) }),
   ]));
   const tlist = el('div', { class: 'task-list' });
-  f.tasks.forEach(t => {
-    const row = el('div', { class: 'task-row' + (t.status === 'in_progress' ? ' in-progress' : '') });
+  f.tasks.forEach(tk => {
+    const row = el('div', { class: 'task-row' + (tk.status === 'in_progress' ? ' in-progress' : '') });
     const dot = el('span', {
-      class: 'task-status ' + t.status.replace('_', '-'),
-      title: t.status === 'done' ? '완료 해제' : '완료로 표시',
+      class: 'task-status ' + tk.status.replace('_', '-'),
+      title: tk.status === 'done' ? t('button.task.toggle.done') : t('button.task.toggle.todo'),
     });
-    if (typeof t.id === 'number') {
+    if (typeof tk.id === 'number') {
       dot.style.cursor = 'pointer';
-      dot.onclick = (e: MouseEvent) => { e.stopPropagation(); toggleTaskUI(t.id, t.status); };
+      dot.onclick = (e: MouseEvent) => { e.stopPropagation(); toggleTaskUI(tk.id, tk.status); };
     }
     row.appendChild(dot);
-    row.appendChild(el('span', { class: 'task-name' + (t.status === 'done' ? ' done' : ''), text: t.name }));
-    if (t.when) row.appendChild(el('span', { class: 'task-when', text: t.when }));
-    if (typeof t.id === 'number') {
+    row.appendChild(el('span', { class: 'task-name' + (tk.status === 'done' ? ' done' : ''), text: tk.name }));
+    if (tk.when) row.appendChild(el('span', { class: 'task-when', text: tk.when }));
+    if (typeof tk.id === 'number') {
       const delBtn = el('button', {
         text: '×',
-        title: '태스크 삭제',
-        onClick: (e: MouseEvent) => { e.stopPropagation(); deleteTaskUI(t.id); },
+        title: t('button.task.delete.title'),
+        onClick: (e: MouseEvent) => { e.stopPropagation(); deleteTaskUI(tk.id); },
       });
       delBtn.style.cssText = 'margin-left: auto; padding: 0 6px; background: transparent; border: 1px solid var(--border); color: var(--text-3); border-radius: 4px; font-size: 12px; line-height: 18px; cursor: pointer;';
       row.appendChild(delBtn);
@@ -2198,7 +2278,7 @@ function renderFeatureDetail() {
   // Inline "+ 태스크 추가" affordance.
   if (state.addingTaskFor === f.id) {
     tlist.appendChild(inlineInputRow({
-      placeholder: '새 태스크 이름…',
+      placeholder: t('feature.task.add.placeholder'),
       onSubmit: (val) => addTaskUI(f.id, val),
       onCancel: () => { state.addingTaskFor = null; render(); },
     }));
@@ -2210,7 +2290,7 @@ function renderFeatureDetail() {
     addRow.style.cursor = 'pointer';
     addRow.style.opacity = '0.7';
     addRow.appendChild(el('span', { class: 'task-status', text: '+' , style: 'display:flex; align-items:center; justify-content:center; font-size:12px; color: var(--text-3)' }));
-    addRow.appendChild(el('span', { class: 'task-name', text: '태스크 추가', style: 'color: var(--text-3)' }));
+    addRow.appendChild(el('span', { class: 'task-name', text: t('feature.task.add'), style: 'color: var(--text-3)' }));
     tlist.appendChild(addRow);
   }
   tasks.appendChild(tlist);
@@ -2219,7 +2299,7 @@ function renderFeatureDetail() {
   if (f.files.length > 0) {
     const files = el('div', { class: 'detail-section' });
     files.appendChild(el('div', { class: 'detail-section-title' }, [
-      el('span', { text: '관련 코드' }),
+      el('span', { text: t('feature.section.files') }),
       el('span', { class: 'detail-section-count', text: String(f.files.length) }),
     ]));
     const flist = el('div', { class: 'file-list' });
@@ -2230,9 +2310,19 @@ function renderFeatureDetail() {
       const row = el('div', { class: 'file-row' });
       row.appendChild(el('div', { class: 'file-path' }, [el('code', { text: file.path })]));
       row.appendChild(el('div', { class: 'file-desc', text: file.desc }));
+      // T2 (feature-flow-map): show a compact "마지막 수정 …" label when at
+      // least one session has touched this file. Suppressed when count = 0
+      // so freshly-linked files don't carry a misleading empty indicator.
+      if (file.edit_session_count > 0 && file.last_edited_time) {
+        row.appendChild(el('div', {
+          class: 'file-edit-meta',
+          text: t('feature.file.last_edited', { time: file.last_edited_time, count: file.edit_session_count }),
+          style: 'color: var(--text-3); font-size: 11px; margin-top: 2px;',
+        }));
+      }
       const unlinkBtn = el('button', {
-        text: '매핑 해제',
-        title: '이 기능에서 파일 매핑을 해제',
+        text: t('button.unlink.file'),
+        title: t('button.unlink.file.title'),
         onClick: (e: MouseEvent) => { e.stopPropagation(); unlinkFileUI(f.id, file.path); },
       });
       unlinkBtn.style.cssText = 'margin-left: auto; padding: 4px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-3); border-radius: 4px; font-size: 11px; cursor: pointer;';
@@ -2256,13 +2346,13 @@ function renderFeatureDetail() {
     // shows up and the user can attach without leaving feature detail).
     const docsSec = el('div', { class: 'detail-section' });
     docsSec.appendChild(el('div', { class: 'detail-section-title' }, [
-      el('span', { text: '관련 문서' }),
+      el('span', { text: t('feature.section.docs') }),
       el('span', { class: 'detail-section-count', text: String(linkedDocs.length) }),
     ]));
     if (linkedDocs.length === 0) {
       docsSec.appendChild(el('div', {
         class: 'empty-state-text',
-        text: '연결된 문서가 없습니다. 문서 탭에서 작성한 PRD/기획서를 이 기능에 매핑할 수 있어요.',
+        text: t('feature.docs.empty'),
         style: 'padding: 8px 0; color: var(--text-3);',
       }));
     } else {
@@ -2286,8 +2376,8 @@ function renderFeatureDetail() {
           el('code', { text: d.title }),
         ]));
         const unlink = el('button', {
-          text: '연결 해제',
-          title: '이 문서와의 연결을 해제',
+          text: t('button.unlink.doc'),
+          title: t('button.unlink.doc.title'),
           onClick: (e: MouseEvent) => { e.stopPropagation(); unlinkDocumentFromFeatureUI(d.id, f.id); },
         });
         unlink.style.cssText = 'margin-left: auto; padding: 4px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-3); border-radius: 4px; font-size: 11px; cursor: pointer;';
@@ -2306,10 +2396,10 @@ function renderFeatureDetail() {
       picker.style.cssText = 'display: flex; gap: 8px; margin-top: 8px; align-items: center;';
       const sel = document.createElement('select');
       sel.style.cssText = 'padding: 6px 8px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text); border-radius: 4px; font: inherit; min-width: 220px;';
-      sel.appendChild(new Option('— 문서 연결 —', ''));
+      sel.appendChild(new Option(t('feature.docs.picker.placeholder'), ''));
       availableDocs.forEach((d) => sel.appendChild(new Option(`[${DOCUMENT_KIND_LABEL[d.kind]}] ${d.title}`, d.id)));
       const submit = el('button', {
-        text: '+ 연결',
+        text: t('feature.docs.picker.submit'),
         onClick: () => {
           const did = sel.value;
           if (!did) return;
@@ -2324,10 +2414,54 @@ function renderFeatureDetail() {
     main.appendChild(docsSec);
   }
 
+  // T1 (feature-flow-map): "관련 결정" — ADRs whose `decisions.feature_id`
+  // matches this feature. Same layout as 관련 문서: card per row, click to
+  // jump into the decisions tab and flash the matching card (reuses the
+  // search-palette navigation pattern). NULL-feature_id ADRs are excluded
+  // server-side by `listDecisionsForFeature`.
+  if (f.decisions.length > 0) {
+    const adrs = el('div', { class: 'detail-section' });
+    adrs.appendChild(el('div', { class: 'detail-section-title' }, [
+      el('span', { text: t('feature.section.decisions') }),
+      el('span', { class: 'detail-section-count', text: String(f.decisions.length) }),
+    ]));
+    const alist = el('div', { class: 'file-list' });
+    f.decisions.forEach((d) => {
+      const row = el('div', {
+        class: 'file-row',
+        onClick: () => {
+          state.currentTab = 'decisions';
+          render();
+          requestAnimationFrame(() => {
+            const target = document.querySelector<HTMLElement>(
+              `[data-kind="decision"][data-ref-id="${CSS.escape(d.id)}"]`,
+            );
+            if (!target) return;
+            target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            target.classList.remove('search-flash');
+            void target.offsetWidth;
+            target.classList.add('search-flash');
+          });
+        },
+      });
+      row.style.cursor = 'pointer';
+      row.appendChild(el('div', { class: 'file-path' }, [
+        el('span', { text: d.id, style: 'color: var(--text-3); font-size: 10px; margin-right: 8px;' }),
+        el('code', { text: d.title }),
+      ]));
+      if (d.context_excerpt) {
+        row.appendChild(el('div', { class: 'file-desc', text: d.context_excerpt }));
+      }
+      alist.appendChild(row);
+    });
+    adrs.appendChild(alist);
+    main.appendChild(adrs);
+  }
+
   if (f.sessions.length > 0) {
     const sessions = el('div', { class: 'detail-section' });
     sessions.appendChild(el('div', { class: 'detail-section-title' }, [
-      el('span', { text: '작업 기록' }),
+      el('span', { text: t('feature.section.sessions') }),
       el('span', { class: 'detail-section-count', text: String(f.sessions.length) }),
     ]));
     const slist = el('div', { class: 'session-list' });
@@ -2365,16 +2499,16 @@ function renderDecisions(): void {
   const p = getProject()!;
 
   main.appendChild(el('div', { class: 'page-header' }, [
-    el('div', { class: 'breadcrumb', text: p.name + ' / 결정 기록' }),
-    el('h1', { class: 'page-title', text: '결정 기록 (ADR)' }),
-    el('p', { class: 'page-tagline', text: '아키텍처 결정 사항. Claude가 세션 중 의사결정을 감지해 자동 기록하거나, 직접 작성할 수 있습니다.' })
+    el('div', { class: 'breadcrumb', text: p.name + t('breadcrumb.sep') + t('decisions.breadcrumb') }),
+    el('h1', { class: 'page-title', text: t('decisions.title') }),
+    el('p', { class: 'page-tagline', text: t('decisions.tagline') })
   ]));
 
   // Add toolbar with "+ 결정 기록" toggle.
   const toolbar = el('div');
   toolbar.style.cssText = 'display: flex; justify-content: flex-end; margin-bottom: 12px;';
   const addBtn = el('button', {
-    text: state.addingDecision ? '취소' : '+ 결정 기록',
+    text: state.addingDecision ? t('button.cancel') : t('decisions.add'),
     onClick: () => { state.addingDecision = !state.addingDecision; render(); },
   });
   addBtn.style.cssText = 'padding: 6px 12px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text); border-radius: 4px; font: inherit; cursor: pointer;';
@@ -2389,8 +2523,8 @@ function renderDecisions(): void {
   if (adrs.length === 0) {
     if (!state.addingDecision) {
       main.appendChild(el('div', { class: 'empty-state' }, [
-        el('div', { class: 'empty-state-title', text: '아직 결정 기록이 없습니다' }),
-        el('div', { class: 'empty-state-text', text: 'Claude 세션 중 의미있는 결정이 감지되면 여기에 자동으로 기록됩니다.' })
+        el('div', { class: 'empty-state-title', text: t('decisions.empty.title') }),
+        el('div', { class: 'empty-state-text', text: t('decisions.empty.text') })
       ]));
     }
     return;
@@ -2415,8 +2549,8 @@ function renderDecisions(): void {
     const actionGroup = el('span');
     actionGroup.style.cssText = 'margin-left: auto; display: flex; gap: 6px;';
     const editBtn = el('button', {
-      text: '수정',
-      title: '결정 수정',
+      text: t('button.edit'),
+      title: t('decisions.edit.title'),
       onClick: (e: MouseEvent) => {
         e.stopPropagation();
         state.editingDecisionId = adr.id;
@@ -2426,8 +2560,8 @@ function renderDecisions(): void {
     });
     editBtn.style.cssText = 'padding: 2px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-3); border-radius: 4px; font-size: 11px; cursor: pointer;';
     const delBtn = el('button', {
-      text: '삭제',
-      title: '결정 삭제',
+      text: t('button.delete'),
+      title: t('decisions.delete.title'),
       onClick: (e: MouseEvent) => { e.stopPropagation(); deleteDecisionUI(adr.id); },
     });
     delBtn.style.cssText = 'padding: 2px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-3); border-radius: 4px; font-size: 11px; cursor: pointer;';
@@ -2438,9 +2572,9 @@ function renderDecisions(): void {
     card.appendChild(el('h3', { class: 'adr-title', text: adr.title }));
     const body = el('div', { class: 'adr-body' });
     const adrFields: ReadonlyArray<[string, string | null]> = [
-      ['배경', adr.context],
-      ['결정', adr.decision],
-      ['대안', adr.alternatives],
+      [t('decisions.field.context'), adr.context],
+      [t('decisions.field.decision'), adr.decision],
+      [t('decisions.field.alternatives'), adr.alternatives],
     ];
     adrFields.forEach(([k, v]) => {
       body.appendChild(el('div', { class: 'adr-key', text: k }));
@@ -2454,7 +2588,7 @@ function renderDecisions(): void {
       const liveName = getFeatures().find((ff) => ff.id === adr.feature_id)?.name ?? adr.feature;
       if (liveName) {
         card.appendChild(el('div', { class: 'adr-feature-tag' }, [
-          el('span', { text: '관련 기능 · ' }),
+          el('span', { text: t('decisions.feature.linked') }),
           el('span', { style: 'color: var(--accent); cursor:pointer', text: liveName, onClick: (e) => {
             e.stopPropagation();
             state.currentTab = 'features';
@@ -2486,33 +2620,38 @@ function renderSessions(): void {
   const p = getProject()!;
 
   main.appendChild(el('div', { class: 'page-header' }, [
-    el('div', { class: 'breadcrumb', text: p.name + ' / 세션 로그' }),
-    el('h1', { class: 'page-title', text: '세션 로그' }),
-    el('p', { class: 'page-tagline', text: 'Claude Code로 작업한 모든 세션의 기록. 세션 종료 시 요약이 자동 저장됩니다.' })
+    el('div', { class: 'breadcrumb', text: p.name + t('breadcrumb.sep') + t('sessions.breadcrumb') }),
+    el('h1', { class: 'page-title', text: t('sessions.title') }),
+    el('p', { class: 'page-tagline', text: t('sessions.tagline') })
   ]));
 
   const sessions = getAllSessions();
   if (sessions.length === 0) {
     main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '세션 기록이 없습니다' }),
-      el('div', { class: 'empty-state-text', text: 'Claude Code로 작업을 시작하면 세션이 자동 기록됩니다.' })
+      el('div', { class: 'empty-state-title', text: t('sessions.empty.title') }),
+      el('div', { class: 'empty-state-text', text: t('sessions.empty.text') })
     ]));
     return;
   }
 
-  type DayBucket = '오늘' | '어제' | '이전';
+  // Sprint 26 / T2: bucket keys stay as ids ('today' / 'yesterday' / 'earlier');
+  // labels resolve through t(). The discriminator still derives from the
+  // server-formatted Korean relative time string because that's what the
+  // session response carries — switching that would require server-side
+  // locale awareness and is out of scope here.
+  type DayBucket = 'today' | 'yesterday' | 'earlier';
   const groups: Partial<Record<DayBucket, SessionSummaryRow[]>> = {};
   sessions.forEach((s) => {
-    const key: DayBucket = s.time.startsWith('오늘') ? '오늘' : s.time.startsWith('어제') ? '어제' : '이전';
+    const key: DayBucket = s.time.startsWith('오늘') ? 'today' : s.time.startsWith('어제') ? 'yesterday' : 'earlier';
     (groups[key] = groups[key] || []).push(s);
   });
 
-  const dayOrder: ReadonlyArray<DayBucket> = ['오늘', '어제', '이전'];
+  const dayOrder: ReadonlyArray<DayBucket> = ['today', 'yesterday', 'earlier'];
   dayOrder.forEach((g) => {
     const bucket = groups[g];
     if (!bucket) return;
     const grp = el('div', { class: 'session-day-group' });
-    grp.appendChild(el('div', { class: 'session-day-label', text: g }));
+    grp.appendChild(el('div', { class: 'session-day-label', text: t(`sessions.day.${g}`) }));
     bucket.forEach((s) => {
       // Match the dataset on session-row in renderFeatureDetail so the search
       // palette can scroll-to-row regardless of which tab the user lands on.
@@ -2541,7 +2680,7 @@ function renderSessions(): void {
       if (remaining) {
         right.appendChild(el('div', {
           class: 'session-card-remaining',
-          text: '남은 일: ' + remaining,
+          text: t('sessions.remaining_prefix') + remaining,
           style: 'color: var(--text-3); font-size: 11px; margin-top: 4px;',
         }));
       }
@@ -2578,11 +2717,11 @@ function renderSessionDetail(sessionId: string): void {
 
   if (!detail) {
     loadSessionDetail(sessionId).then(() => render()).catch((e) => {
-      state.error = e instanceof Error ? e.message : '세션 로드 실패';
+      state.error = e instanceof Error ? e.message : t('session.detail.load.failed');
       render();
     });
     main.appendChild(el('div', { class: 'page-header' }, [
-      el('h1', { class: 'page-title', text: '세션 불러오는 중…' }),
+      el('h1', { class: 'page-title', text: t('session.detail.loading') }),
     ]));
     return;
   }
@@ -2591,20 +2730,20 @@ function renderSessionDetail(sessionId: string): void {
   const header = el('div', { class: 'page-header' });
   const back = el('a', {
     class: 'breadcrumb',
-    text: '← 세션 목록',
+    text: t('session.detail.back'),
     onClick: () => { state.currentSession = null; render(); },
   });
   back.style.cursor = 'pointer';
   header.appendChild(back);
-  header.appendChild(el('h1', { class: 'page-title', text: detail.summary ?? '(요약 없음)' }));
+  header.appendChild(el('h1', { class: 'page-title', text: detail.summary ?? t('session.detail.no_summary') }));
   const timeRow = el('p', { class: 'page-tagline' });
-  const startedText = '시작 ' + detail.started_at_label;
-  const endedText = detail.ended_at_label ? ' · 종료 ' + detail.ended_at_label : ' · 진행 중';
+  const startedText = t('session.detail.started', { time: detail.started_at_label });
+  const endedText = detail.ended_at_label ? t('session.detail.ended', { time: detail.ended_at_label }) : t('session.detail.ongoing');
   timeRow.textContent = startedText + endedText;
   header.appendChild(timeRow);
   if (detail.feature_name && detail.feature_id) {
     const featLink = el('a', {
-      text: '연결된 기능: ' + detail.feature_name,
+      text: t('session.detail.feature_prefix') + detail.feature_name,
       onClick: () => {
         state.currentTab = 'features';
         state.currentFeature = detail.feature_id;
@@ -2619,7 +2758,7 @@ function renderSessionDetail(sessionId: string): void {
 
   // Notes body — render as Markdown if non-empty, else hint.
   const notesSec = el('div', { class: 'detail-section feature-spec-section' });
-  notesSec.appendChild(el('div', { class: 'detail-section-title' }, [el('span', { text: '메모' })]));
+  notesSec.appendChild(el('div', { class: 'detail-section-title' }, [el('span', { text: t('session.detail.notes') })]));
   if (detail.notes && detail.notes.trim()) {
     const body = el('div', { class: 'feature-spec-body markdown-preview' });
     body.style.cssText = 'background: var(--bg-elevated); padding: 12px 16px; border-radius: 6px;';
@@ -2628,7 +2767,7 @@ function renderSessionDetail(sessionId: string): void {
   } else {
     notesSec.appendChild(el('div', {
       class: 'empty-state-text',
-      text: '메모가 없습니다. claudeMdTemplate v4 가이드에 따라 `## 완료 / ## 남은 일 / ## 결정` 형태로 작성하면 다음 세션에서 자동 노출됩니다.',
+      text: t('session.detail.notes.empty'),
       style: 'padding: 8px 0; color: var(--text-3);',
     }));
   }
@@ -2638,7 +2777,7 @@ function renderSessionDetail(sessionId: string): void {
   if (detail.files.length > 0) {
     const filesSec = el('div', { class: 'detail-section' });
     filesSec.appendChild(el('div', { class: 'detail-section-title' }, [
-      el('span', { text: '수정한 파일' }),
+      el('span', { text: t('session.detail.files') }),
       el('span', { class: 'detail-section-count', text: String(detail.files.length) }),
     ]));
     const flist = el('div', { class: 'file-list' });
@@ -2661,8 +2800,8 @@ function renderSessionDetail(sessionId: string): void {
     nav.style.cssText = 'display: flex; justify-content: space-between; margin-top: 16px; gap: 12px;';
     const prevBtn = el('button', {
       text: detail.prev_session
-        ? '← 이전 세션 (' + detail.prev_session.time + ')'
-        : '이전 세션 없음',
+        ? t('session.detail.prev', { time: detail.prev_session.time })
+        : t('session.detail.no_prev'),
       onClick: () => {
         if (detail.prev_session) {
           state.currentSession = detail.prev_session.id;
@@ -2676,8 +2815,8 @@ function renderSessionDetail(sessionId: string): void {
 
     const nextBtn = el('button', {
       text: detail.next_session
-        ? '다음 세션 (' + detail.next_session.time + ') →'
-        : '다음 세션 없음',
+        ? t('session.detail.next', { time: detail.next_session.time })
+        : t('session.detail.no_next'),
       onClick: () => {
         if (detail.next_session) {
           state.currentSession = detail.next_session.id;
@@ -2706,9 +2845,9 @@ function renderWorkspace(): void {
   }
 
   const header = el('div', { class: 'page-header' }, [
-    el('div', { class: 'breadcrumb', text: '워크스페이스' }),
-    el('h1', { class: 'page-title', text: '내 작업' }),
-    el('p', { class: 'page-tagline', text: '등록된 모든 프로젝트의 진행 중인 기능을 한 곳에서.' }),
+    el('div', { class: 'breadcrumb', text: t('workspace.breadcrumb') }),
+    el('h1', { class: 'page-title', text: t('workspace.title') }),
+    el('p', { class: 'page-tagline', text: t('workspace.tagline') }),
   ]);
   main.appendChild(header);
 
@@ -2716,16 +2855,14 @@ function renderWorkspace(): void {
   // todo features to the list.
   const filterRow = el('div');
   filterRow.style.cssText = 'display: flex; gap: 8px; margin-bottom: 16px; align-items: center;';
-  filterRow.appendChild(el('span', { text: '필터:', style: 'color: var(--text-3); font-size: 12px;' }));
-  const STATUS_OPTS: ReadonlyArray<{ key: FeatureStatus; label: string }> = [
-    { key: 'in_progress', label: '진행 중' },
-    { key: 'todo', label: '할 일' },
-    { key: 'done', label: '완료' },
-  ];
-  STATUS_OPTS.forEach(({ key, label }) => {
+  filterRow.appendChild(el('span', { text: t('workspace.filter'), style: 'color: var(--text-3); font-size: 12px;' }));
+  // Sprint 26 / T2: labels resolve through statusLabel() so the filter pill
+  // tracks the active locale.
+  const WORKSPACE_STATUS_OPTS: ReadonlyArray<FeatureStatus> = ['in_progress', 'todo', 'done'];
+  WORKSPACE_STATUS_OPTS.forEach((key) => {
     const active = state.workspaceStatuses.includes(key);
     const btn = el('button', {
-      text: label,
+      text: statusLabel(key),
       onClick: () => {
         // Toggle membership but always keep at least one — empty selection
         // would render confusingly with "0건". Re-select the only remaining
@@ -2755,28 +2892,22 @@ function renderWorkspace(): void {
   // Loading / error / empty / data branches.
   if (state.workspaceError) {
     main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '워크스페이스를 불러오지 못했습니다' }),
+      el('div', { class: 'empty-state-title', text: t('workspace.error.title') }),
       el('div', { class: 'empty-state-text', text: state.workspaceError }),
     ]));
     return;
   }
   if (state.workspaceLoading || state.workspaceFeatures === null) {
     main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '불러오는 중…' }),
+      el('div', { class: 'empty-state-title', text: t('workspace.loading') }),
     ]));
     return;
   }
   const rows = state.workspaceFeatures;
   if (rows.length === 0) {
     main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '진행 중인 기능이 없습니다' }),
-      el('div', {
-        class: 'empty-state-text',
-        text:
-          '`pm import-history`로 git history를 sessions로 가져오거나, '
-          + '`pm extract-features`로 commit prefix에서 feature를 추출하거나, '
-          + '사이드바에서 프로젝트를 선택해 수동으로 기능을 추가하세요.',
-      }),
+      el('div', { class: 'empty-state-title', text: t('workspace.empty.title') }),
+      el('div', { class: 'empty-state-text', text: t('workspace.empty.text') }),
     ]));
     return;
   }
@@ -2798,7 +2929,7 @@ function renderWorkspace(): void {
     const projMark = makeMark(r.project_name);
     const projGroup = el('span', {
       onClick: (e: MouseEvent) => { e.stopPropagation(); navigateToOverview(r.project_id); },
-      title: '프로젝트 오버뷰로 이동',
+      title: t('workspace.overview.title'),
     });
     projGroup.style.cssText = 'display: inline-flex; align-items: center; gap: 6px; cursor: pointer;';
     const m = el('span', { class: 'project-mark', text: projMark });
@@ -2817,7 +2948,7 @@ function renderWorkspace(): void {
         el('span', { class: 'feature-card-progress-text', text: `${r.tasks_done}/${r.tasks_done + r.tasks_todo} · ${r.progress}%` }),
       ]),
       el('span', {
-        text: r.last_activity_at ? (relTime(r.last_activity_at) ?? '활동 없음') : '활동 없음',
+        text: r.last_activity_at ? (relTime(r.last_activity_at) ?? t('workspace.activity.none')) : t('workspace.activity.none'),
         style: 'color: var(--text-3); font-size: 11px; margin-left: auto;',
       }),
     ]);
@@ -2838,7 +2969,7 @@ function render() {
   if (state.error) {
     $('#main')!.innerHTML = '';
     $('#main')!.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '데이터를 불러오지 못했습니다' }),
+      el('div', { class: 'empty-state-title', text: t('project.error.title') }),
       el('div', { class: 'empty-state-text', text: state.error }),
     ]));
     return;
@@ -2846,15 +2977,15 @@ function render() {
   if (state.loading) {
     $('#main')!.innerHTML = '';
     $('#main')!.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '불러오는 중…' }),
+      el('div', { class: 'empty-state-title', text: t('project.list.loading') }),
     ]));
     return;
   }
   if (DATA.projects.length === 0) {
     $('#main')!.innerHTML = '';
     $('#main')!.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: '등록된 프로젝트가 없습니다' }),
-      el('div', { class: 'empty-state-text', text: 'CLI로 프로젝트를 초기화하세요: `pm init --name "<프로젝트>"`' }),
+      el('div', { class: 'empty-state-title', text: t('project.list.empty.title') }),
+      el('div', { class: 'empty-state-text', text: t('project.list.empty.text') }),
     ]));
     return;
   }
@@ -2926,13 +3057,13 @@ const SEARCH_DEBOUNCE_MS = 280;
 // the KIND_WEIGHT order in domain.ts.
 const KIND_GROUP_ORDER: ReadonlyArray<SearchKind> = ['feature', 'decision', 'document', 'file', 'session'];
 
-const KIND_LABEL: Record<SearchKind, string> = {
-  feature: '기능',
-  decision: '결정',
-  document: '문서',
-  session: '세션',
-  file: '파일',
-};
+// Sprint 26 / T2: resolved through t() on every access (proxied) so the
+// search palette's group headers and per-row badges flip on locale change.
+const KIND_LABEL = new Proxy({} as Record<SearchKind, string>, {
+  get(_target, prop: string) {
+    return t(`search.kind.${prop}`);
+  },
+});
 const KIND_CLASS: Record<SearchKind, string> = {
   feature: 'kind-feature',
   decision: 'kind-decision',
@@ -2960,7 +3091,10 @@ function ensureSearchPaletteDom(): void {
   overlay.style.display = 'none';
   overlay.setAttribute('role', 'dialog');
   overlay.setAttribute('aria-modal', 'true');
-  overlay.setAttribute('aria-label', '검색');
+  overlay.setAttribute('aria-label', t('search.aria.label'));
+  // Sprint 26 / T2: the placeholder is locale-sensitive. We render with a
+  // {{placeholder}} sentinel that we substitute right after creation so the
+  // outer template literal stays readable.
   overlay.innerHTML = `
     <div class="search-palette">
       <div class="search-palette-input-row">
@@ -2969,7 +3103,7 @@ function ensureSearchPaletteDom(): void {
           <path d="M9.5 9.5 L12 12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
         </svg>
         <input type="text" id="searchPaletteInput" class="search-palette-input"
-               placeholder="기능, 결정, 세션, 파일 검색…" autocomplete="off" spellcheck="false">
+               autocomplete="off" spellcheck="false">
         <span class="kbd-hint">Esc</span>
       </div>
       <div class="search-palette-results" id="searchPaletteResults"></div>
@@ -2980,6 +3114,7 @@ function ensureSearchPaletteDom(): void {
     if (e.target === overlay) closeSearchPalette();
   });
   const input = overlay.querySelector('#searchPaletteInput') as HTMLInputElement;
+  input.placeholder = t('search.palette.placeholder');
   input.addEventListener('input', (e: Event) => onSearchInput((e.target as HTMLInputElement).value));
   document.body.appendChild(overlay);
 }
@@ -2990,6 +3125,10 @@ function openSearchPalette(): void {
   const overlay = document.getElementById('searchPalette')!;
   overlay.style.display = 'flex';
   const input = document.getElementById('searchPaletteInput') as HTMLInputElement;
+  // Sprint 26 / T2: refresh placeholder + aria each open so locale flips
+  // between sessions of the palette take effect.
+  input.placeholder = t('search.palette.placeholder');
+  overlay.setAttribute('aria-label', t('search.aria.label'));
   input.value = searchState.query;
   // Defer focus so the browser doesn't fight the keydown that triggered us.
   setTimeout(() => input.focus(), 0);
@@ -3056,7 +3195,7 @@ async function doSearch(q: string): Promise<void> {
     if (e instanceof DOMException && e.name === 'AbortError') return;
     searchState.results = [];
     searchState.loading = false;
-    searchState.error = e instanceof Error ? e.message : '검색에 실패했습니다';
+    searchState.error = e instanceof Error ? e.message : t('search.error.generic');
   }
   renderSearchResults();
 }
@@ -3082,23 +3221,23 @@ function renderSearchResults(): void {
   list.innerHTML = '';
 
   if (!state.currentProject) {
-    list.appendChild(el('div', { class: 'search-empty', text: '프로젝트를 먼저 선택하세요.' }));
+    list.appendChild(el('div', { class: 'search-empty', text: t('search.empty.no_project') }));
     return;
   }
   if (!searchState.query.trim()) {
-    list.appendChild(el('div', { class: 'search-empty', text: '검색어를 입력하세요. (한국어/영문 모두 지원)' }));
+    list.appendChild(el('div', { class: 'search-empty', text: t('search.empty.no_query') }));
     return;
   }
   if (searchState.loading) {
-    list.appendChild(el('div', { class: 'search-empty', text: '검색 중…' }));
+    list.appendChild(el('div', { class: 'search-empty', text: t('search.empty.loading') }));
     return;
   }
   if (searchState.error) {
-    list.appendChild(el('div', { class: 'search-empty search-error', text: '검색에 실패했습니다: ' + searchState.error }));
+    list.appendChild(el('div', { class: 'search-empty search-error', text: t('search.error', { message: searchState.error }) }));
     return;
   }
   if (searchState.results.length === 0) {
-    list.appendChild(el('div', { class: 'search-empty', text: '검색 결과가 없습니다.' }));
+    list.appendChild(el('div', { class: 'search-empty', text: t('search.empty.no_results') }));
     return;
   }
 
@@ -3292,6 +3431,79 @@ if (themeToggleBtn) {
   });
 }
 
+// Sprint 26 / T3: locale toggle. Segmented control rendered into the static
+// container declared in index.html. Built once at bootstrap then re-skinned
+// on click via `setActive` — no full re-render needed for the toggle itself,
+// while `setLocale(next, render)` repaints the rest of the UI.
+//
+// Hydrate the persisted locale here (module-level, before the toggle paints)
+// so the initial active segment matches the user's stored choice. Same effect
+// as wiring it into the bootstrap IIFE but ordered before this block, which
+// guarantees `getLocale()` below returns the resolved value.
+loadPersistedLocale();
+
+// Sprint 26 / T2: a few topbar widgets live in static HTML, outside the
+// render() tree (they predate the dynamic UI). Re-skin them at init and on
+// every locale change so their copy follows the active locale too.
+function refreshStaticLocale(): void {
+  const searchInput = document.querySelector<HTMLInputElement>('.global-search input');
+  if (searchInput) searchInput.placeholder = t('topbar.search.placeholder');
+  const claudeBtn = document.querySelector<HTMLButtonElement>('.start-claude-btn');
+  if (claudeBtn) {
+    // Preserve the leading svg icon; only swap the trailing text node.
+    let textNode: ChildNode | null = null;
+    claudeBtn.childNodes.forEach((n) => {
+      if (n.nodeType === Node.TEXT_NODE && n.textContent && n.textContent.trim().length > 0) textNode = n;
+    });
+    if (textNode) (textNode as Text).textContent = ' ' + t('topbar.claude.btn');
+    claudeBtn.onclick = () => alert(t('topbar.claude.alert'));
+  }
+  // Task #11 (QA): themeToggle aria-label + title are read by screen readers
+  // and tooltip hover — both must follow the active locale, not just the
+  // initial HTML attribute value.
+  const themeBtn = document.getElementById('themeToggle');
+  if (themeBtn) {
+    themeBtn.setAttribute('aria-label', t('topbar.theme.aria'));
+    themeBtn.setAttribute('title', t('topbar.theme.title'));
+  }
+  // Browser tab title — no JS site updated this previously, so EN users saw
+  // the Korean tagline. Setting on every locale refresh keeps it in sync.
+  document.title = t('app.title');
+}
+refreshStaticLocale();
+const localeToggleEl = document.getElementById('localeToggle');
+if (localeToggleEl) {
+  const OPTS: ReadonlyArray<{ loc: Locale; label: string }> = [
+    { loc: 'ko', label: '한국어' },
+    { loc: 'en', label: 'English' },
+  ];
+  const buttons = new Map<Locale, HTMLButtonElement>();
+  const setActive = (loc: Locale) => {
+    buttons.forEach((btn, key) => {
+      btn.classList.toggle('active', key === loc);
+      btn.setAttribute('aria-pressed', key === loc ? 'true' : 'false');
+    });
+  };
+  OPTS.forEach(({ loc, label }) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = label;
+    btn.setAttribute('aria-pressed', 'false');
+    btn.addEventListener('click', () => {
+      setLocale(loc, () => {
+        refreshStaticLocale();
+        render();
+      });
+      setActive(loc);
+    });
+    buttons.set(loc, btn);
+    localeToggleEl.appendChild(btn);
+  });
+  // Reflect the bootstrap-time locale (loaded earlier in the IIFE) on the
+  // segmented control's initial paint.
+  setActive(getLocale());
+}
+
 // Bootstrap: load project list, pick the first, fetch detail, render.
 (async () => {
   render(); // initial paint with loading state
@@ -3308,5 +3520,14 @@ if (themeToggleBtn) {
     render();
     return;
   }
-  await setActiveProject(DATA.projects[0].id);
+  // Hydrate last selected project from localStorage so reload returns the user
+  // to where they were. Fall back to projects[0] if the persisted id is stale
+  // (project deleted between sessions). The workspace→overview tab guard
+  // inside setActiveProject still applies — it's the right default landing for
+  // both fresh entries and restored sessions.
+  const persisted = readPersistedString('vibemate.currentProject', null);
+  const target = persisted && DATA.projects.some((p) => p.id === persisted)
+    ? persisted
+    : DATA.projects[0].id;
+  await setActiveProject(target);
 })();

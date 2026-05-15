@@ -156,7 +156,9 @@ export function createApp() {
     if (!feature) return c.json({ error: 'Feature not found' }, 404);
 
     const tasks = domain.listTasks(id);
-    const files = domain.listFeatureFiles(id);
+    // Sprint 25 / T2: include per-file session-edit aggregates so the
+    // "관련 코드" UI can render a "마지막 수정: <시간> (총 N건)" indicator.
+    const files = domain.listFeatureFilesWithEditStats(id);
     const { progress, done, total } = domain.getFeatureProgress(id);
 
     // Sessions for this feature, with their session_files. `id` is included
@@ -173,6 +175,11 @@ export function createApp() {
         files: s.files,
       }));
 
+    // Decisions linked to this feature (created_at DESC). NULL-feature_id
+    // ADRs are excluded by the domain helper. Surfaced as the "관련 결정"
+    // section in renderFeatureDetail — mirrors the `sessions` folding pattern.
+    const decisions = domain.listDecisionsForFeature(id);
+
     return c.json({
       ...feature,
       progress,
@@ -181,6 +188,7 @@ export function createApp() {
       tasks,
       files,
       sessions,
+      decisions,
     });
   });
 
@@ -249,7 +257,16 @@ export function createApp() {
     return c.json(results);
   });
 
-  // (Removed in ADR-0016: GET /api/projects/:id/file-tree)
+  // ----- File tree -----
+
+  app.get('/api/projects/:id/file-tree', (c) => {
+    const projectId = c.req.param('id');
+    if (!domain.getProject(projectId)) {
+      return c.json({ error: `Project not found: ${projectId}` }, 404);
+    }
+    const tree = domain.getFileTree(projectId);
+    return c.json(tree);
+  });
 
   // ----- Documents (Sprint 22, 3wtr — Spec Hub) -----
 

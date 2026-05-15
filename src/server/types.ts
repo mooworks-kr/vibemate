@@ -50,6 +50,22 @@ export interface Decision {
   created_at: number;
 }
 
+/**
+ * Slim projection used by the feature-detail response (`GET /api/features/:id`)
+ * for the "관련 결정" surface in renderFeatureDetail. Mirrors how `sessions`
+ * is folded into the detail response — decisions stays off the raw `Feature`
+ * DB row interface so feature-list paths don't pay an extra JOIN.
+ *
+ * `context_excerpt` is the first 80 chars of `decisions.context` (with a `…`
+ * suffix when truncated), or empty string when the field is NULL.
+ */
+export interface FeatureDecisionSummary {
+  id: string;
+  title: string;
+  context_excerpt: string;
+  created_at: number;
+}
+
 export interface Session {
   id: string;
   project_id: string;
@@ -226,6 +242,22 @@ export interface FeatureFile {
   source: LinkSource;
   last_session_id: string | null;
   created_at: number;
+  /**
+   * Sprint 25 (Feature Flow Map / T2): session-edit aggregates joined onto the
+   * feature_file row by `listFeatureFilesWithEditStats`. Folded into the
+   * `GET /api/features/:id` response so the "관련 코드" UI can show a
+   * "마지막 수정: <시간> (총 N건)" label per row.
+   *
+   * Scope is sessions in the same project that touched the file (via
+   * `session_files`) — not restricted to this feature's sessions, so the
+   * indicator reflects the file's full edit history.
+   *
+   * Optional because `listFeatureFiles` (the raw row reader) doesn't
+   * populate these; only the enriched path does.
+   */
+  last_edited_session_id?: string | null;
+  last_edited_at?: number | null;
+  edit_session_count?: number;
 }
 
 // (Removed in ADR-0016: FileExplanation. AI file-explanation workflow retired.)
@@ -358,7 +390,13 @@ export interface SessionStartContext {
   last_session: LastSessionSummary | null;
 }
 
-// (Removed in ADR-0016: FileNode. File-tree API retired.)
+// File tree node (re-added for Code Map tab)
+export interface FileNode {
+  name: string;
+  path: string;
+  type: 'file' | 'dir';
+  children?: FileNode[];
+}
 
 // Sprint 22 (3wtr) — Spec Hub: free-form project documents (PRDs, planning
 // memos, architecture notes, retros, external feature specs). Distinct from

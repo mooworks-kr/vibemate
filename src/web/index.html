@@ -1084,6 +1084,33 @@
   .theme-toggle .icon-moon { display: block; }
   :root[data-theme="dark"] .theme-toggle .icon-sun  { display: block; }
   :root[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+
+  /* Sprint 26 / T3: locale toggle. Segmented control next to theme-toggle.
+     Lower visual weight than the primary nav — text-3 default + accent only
+     on the active segment. */
+  .locale-toggle {
+    display: inline-flex;
+    margin-left: 8px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .locale-toggle button {
+    padding: 4px 10px;
+    background: transparent;
+    border: none;
+    color: var(--text-3);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .locale-toggle button:hover { background: var(--bg-hover); color: var(--text-2); }
+  .locale-toggle button.active {
+    background: var(--bg-elevated);
+    color: var(--accent);
+  }
 </style>
 
 <!-- FOUC-safe theme bootstrap. Runs before <body> paints, sets data-theme so
@@ -1138,9 +1165,17 @@
       </svg>
     </button>
 
-    <button class="start-claude-btn" onclick="alert('실제 데이터 모드에서는 Claude Code 세션을 시작하고 현재 컨텍스트를 자동 주입합니다.')">
+    <!-- Sprint 26 (i18n) / T3: locale toggle. Sits next to themeToggle because
+         both are global preferences (the per-tab sidebar would hide this on
+         non-features tabs). Renderer populates the inner segments + binds
+         clicks via setLocale(). -->
+    <div class="locale-toggle" id="localeToggle" role="group" aria-label="언어 / Language"></div>
+
+    <!-- Text + click handler installed by main.ts (refreshStaticLocale) so
+         the label tracks the active locale. -->
+    <button class="start-claude-btn">
       <svg width="13" height="13" viewBox="0 0 13 13"><path d="M6.5 1 L6.5 12 M1 6.5 L12 6.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-      Claude로 작업
+      Claude
     </button>
   </header>
 

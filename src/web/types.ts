@@ -16,7 +16,9 @@ import type {
   Document,
   DocumentKind,
   Feature,
+  FeatureDecisionSummary,
   FeatureFile,
+  FileNode,
   FeatureStatus,
   ProjectOverview,
   ProjectStats,
@@ -39,9 +41,12 @@ export type { SessionDetail };
 // Sprint 24 (ijze) — Context Brief response shape.
 export type { ContextBrief };
 
-// (Removed in ADR-0016: FileTreeNode + FileDetailResponse + DataCache.fileTree
-// + AppState.currentFile + AppState.linkingFile + AppState.fileDetailLoading.
-// Code Map / file-tree / AI file-explanation UI retired.)
+// Re-export FileNode for Code Map consumers.
+export type { FileNode };
+
+// (Removed in ADR-0016: FileDetailResponse + AppState.currentFile +
+// AppState.linkingFile + AppState.fileDetailLoading.
+// AI file-explanation UI retired. FileNode + file-tree API re-added.)
 
 // ============================================================
 // View-layer enrichments
@@ -64,6 +69,12 @@ export interface FeatureFileRow {
   path: string;
   /** = `description ?? ''`. */
   desc: string;
+  /** T2: pre-formatted relative time (e.g. "3시간 전") for the most recent
+   *  session that touched this file. null when no session has edited it. */
+  last_edited_time: string | null;
+  /** T2: total distinct sessions in the project that edited this file. 0
+   *  when none — the UI suppresses the indicator label in that case. */
+  edit_session_count: number;
 }
 
 // Note: `FileFile`-style codemap entities (FileTreeNode, FileDetailResponse)
@@ -92,6 +103,9 @@ export interface EnrichedFeature {
   tasks: TaskRow[];
   files: FeatureFileRow[];
   sessions: SessionSummaryRow[];
+  /** ADRs linked to this feature via `decisions.feature_id`. Newest first.
+   *  Folded into the response by `GET /api/features/:id` (T1 / feature-flow-map). */
+  decisions: FeatureDecisionSummary[];
 }
 
 export interface AdrCard extends Decision {
@@ -132,6 +146,9 @@ export interface DataCache {
    *  keyed by feature id. Populated when the user expands the Context
    *  Brief section or clicks Copy. */
   contextBriefs?: Record<string, ContextBrief>;
+  /** Cached `GET /api/projects/:id/file-tree` responses keyed by project id.
+   *  Populated lazily by `loadFileTree()`. Re-added after ADR-0016 removal. */
+  fileTrees?: Record<string, FileNode[]>;
 }
 
 /**
@@ -191,6 +208,9 @@ export interface FeatureDetailResponse extends Feature {
     summary: string;
     files: string[];
   }>;
+  /** Decisions linked to this feature, newest first. Added by the T1 patch
+   *  in `http.ts` — see `listDecisionsForFeature` for the projection. */
+  decisions: FeatureDecisionSummary[];
 }
 
 // ============================================================

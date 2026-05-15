@@ -63,3 +63,33 @@ export function writePersistedFlag(key: string, value: boolean): void {
     // intentional swallow — caller's UI flow shouldn't break on storage errors
   }
 }
+
+/**
+ * Read a persisted string. Returns `fallback` when the key is missing or
+ * storage is unavailable. Empty string is treated as missing — callers
+ * almost always want the fallback over a literal empty value.
+ */
+export function readPersistedString(key: string, fallback: string | null): string | null {
+  try {
+    const storage = getStorage();
+    if (!storage) return fallback;
+    const raw = storage.getItem(key);
+    return raw && raw.length > 0 ? raw : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+export function writePersistedString(key: string, value: string | null): void {
+  try {
+    const storage = getStorage();
+    if (!storage) return;
+    if (value === null || value.length === 0) {
+      storage.setItem(key, '');
+      return;
+    }
+    storage.setItem(key, value);
+  } catch {
+    // intentional swallow
+  }
+}

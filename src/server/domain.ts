@@ -22,7 +22,9 @@ import type {
   EditType,
   Feature,
   FeatureContext,
+  FeatureDecisionSummary,
   FeatureFile,
+  FileNode,
   FeatureStatus,
   LastSessionSummary,
   Project,
@@ -306,6 +308,33 @@ export function listDecisions(projectId: string): Decision[] {
     .prepare('SELECT * FROM decisions WHERE project_id = ? ORDER BY created_at DESC')
     .all(projectId) as any[];
   return rows.map(rowToDecision);
+}
+
+/**
+ * Decisions linked to `featureId`, newest first. Feeds the "관련 결정"
+ * surface in feature detail. NULL-feature_id ADRs are excluded by the WHERE
+ * clause. `context_excerpt` is bounded at 80 chars + `…` so the UI can
+ * render compact cards without re-slicing on the client.
+ */
+export function listDecisionsForFeature(featureId: string): FeatureDecisionSummary[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT id, title, context, created_at
+       FROM decisions
+       WHERE feature_id = ?
+       ORDER BY created_at DESC`,
+    )
+    .all(featureId) as Array<{ id: string; title: string; context: string | null; created_at: number }>;
+  return rows.map((r) => {
+    const ctx = (r.context ?? '').trim();
+    return {
+      id: r.id,
+      title: r.title,
+      context_excerpt: ctx.length === 0 ? '' : ctx.length <= 80 ? ctx : ctx.slice(0, 80) + '…',
+      created_at: r.created_at,
+    };
+  });
 }
 
 export function nextAdrId(projectId: string): string {
@@ -1347,6 +1376,73 @@ export function listFeatureFiles(featureId: string): FeatureFile[] {
     .all(featureId) as unknown as FeatureFile[];
 }
 
+/**
+ * Sprint 25 / T2 — feature_files joined with session-edit aggregates.
+ *
+ * For each linked file, attaches:
+ *   - `edit_session_count`: DISTINCT sessions in the project that touched
+ *     this file via `session_files`.
+ *   - `last_edited_session_id` / `last_edited_at`: pointer to the most
+ *     recent such session (ordered by `sessions.started_at` DESC).
+ *
+ * Single batch query — `feature_files.file_path` IN (…) joined to
+ * `session_files` ⨝ `sessions`, filtered by the feature's project. JS-side
+ * grouping captures the per-file rollup so we keep one SQL round-trip
+ * regardless of how many files are linked.
+ *
+ * Files with zero edits return `count = 0` and null pointers — the UI then
+ * suppresses the indicator.
+ */
+export function listFeatureFilesWithEditStats(featureId: string): FeatureFile[] {
+  const files = listFeatureFiles(featureId);
+  if (files.length === 0) return files;
+
+  const feature = getFeature(featureId);
+  if (!feature) return files;
+
+  const db = getDb();
+  const paths = files.map((f) => f.file_path);
+  const placeholders = paths.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT sf.file_path, sf.session_id, s.started_at
+       FROM session_files sf
+       JOIN sessions s ON s.id = sf.session_id
+       WHERE sf.file_path IN (${placeholders})
+         AND s.project_id = ?
+       ORDER BY s.started_at DESC`,
+    )
+    .all(...paths, feature.project_id) as Array<{
+    file_path: string;
+    session_id: string;
+    started_at: number;
+  }>;
+
+  // Group by file_path: first occurrence wins (rows are pre-sorted DESC by
+  // started_at, so it's the most recent session). PRIMARY KEY on
+  // session_files is (session_id, file_path) so each (session, file) pair
+  // shows at most once — counting rows = counting distinct sessions.
+  const stats = new Map<string, { last_id: string; last_at: number; count: number }>();
+  for (const r of rows) {
+    const cur = stats.get(r.file_path);
+    if (cur) {
+      cur.count += 1;
+    } else {
+      stats.set(r.file_path, { last_id: r.session_id, last_at: r.started_at, count: 1 });
+    }
+  }
+
+  return files.map((f) => {
+    const s = stats.get(f.file_path);
+    return {
+      ...f,
+      last_edited_session_id: s ? s.last_id : null,
+      last_edited_at: s ? s.last_at : null,
+      edit_session_count: s ? s.count : 0,
+    };
+  });
+}
+
 export function listSessionsForFile(filePath: string, projectId: string) {
   const db = getDb();
   return db
@@ -1523,11 +1619,51 @@ function latestEndedSessionFor(featureId: string): LastSessionSummary | null {
 // File tree
 // ============================================================
 
-// (Removed in ADR-0016: getFileTree, listFilesNeedingExplanation,
+// (Removed in ADR-0016: listFilesNeedingExplanation,
 // getFileExplanation, getFileContent, saveFileExplanation, clearFileExplanation,
 // plus their private helpers (prepareFileForExplanation, clampForExplain,
 // isLikelyBinary) and the FILE_EXPLAIN_ERRORS sentinel. Code Map / AI file
 // explanation workflow retired. file_explanations table dropped in 0005.)
+
+function buildFileTree(dirPath: string, relBase: string): FileNode[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const nodes: FileNode[] = [];
+  for (const entry of entries) {
+    const relPath = relBase ? `${relBase}/${entry.name}` : entry.name;
+    if (shouldIgnoreFile(relPath)) continue;
+
+    if (entry.isDirectory()) {
+      nodes.push({
+        name: entry.name,
+        path: relPath,
+        type: 'dir',
+        children: buildFileTree(path.join(dirPath, entry.name), relPath),
+      });
+    } else if (entry.isFile()) {
+      nodes.push({ name: entry.name, path: relPath, type: 'file' });
+    }
+  }
+
+  // dirs first, then files, each group sorted alphabetically
+  nodes.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  return nodes;
+}
+
+export function getFileTree(projectId: string): FileNode[] {
+  const project = getProject(projectId);
+  if (!project) return [];
+  return buildFileTree(project.root_path, '');
+}
 
 // ============================================================
 // Search (FTS5)

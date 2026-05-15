@@ -9,6 +9,7 @@
     "src/server/__tests__/**/*",
     "src/server/**/*.test.ts",
     "src/web/persist.ts",
+    "src/web/i18n.ts",
     "vitest.config.ts"
   ],
   "exclude": ["node_modules", "dist"]

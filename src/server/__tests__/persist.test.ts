@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { readPersistedFlag, writePersistedFlag } from '../../web/persist.js';
+import {
+  readPersistedFlag,
+  writePersistedFlag,
+  readPersistedString,
+  writePersistedString,
+} from '../../web/persist.js';
 
 // Pure helpers reach `globalThis.localStorage` at call time, so a tiny
 // Map-backed shim is enough to round-trip flags from Node — no jsdom needed.
@@ -115,5 +120,44 @@ describe('writePersistedFlag', () => {
     expect(() => writePersistedFlag('k', true)).not.toThrow();
     // And nothing got persisted.
     expect(store.has('k')).toBe(false);
+  });
+});
+
+describe('readPersistedString / writePersistedString', () => {
+  it('round-trips a non-empty string', () => {
+    writePersistedString('proj', 'vibemate');
+    expect(readPersistedString('proj', null)).toBe('vibemate');
+  });
+
+  it('returns the fallback when the key is missing', () => {
+    expect(readPersistedString('missing', 'default')).toBe('default');
+    expect(readPersistedString('missing', null)).toBeNull();
+  });
+
+  it('treats empty string as missing (returns fallback)', () => {
+    // Empty is what writePersistedString stores when value is null —
+    // readers should never see "" as a valid project id.
+    store.set('proj', '');
+    expect(readPersistedString('proj', 'fallback')).toBe('fallback');
+  });
+
+  it('writePersistedString(null) clears the slot', () => {
+    writePersistedString('proj', 'vibemate');
+    writePersistedString('proj', null);
+    expect(readPersistedString('proj', 'fallback')).toBe('fallback');
+  });
+
+  it('survives storage being absent (Node SSR)', () => {
+    delete (globalThis as StorageHost).localStorage;
+    expect(() => writePersistedString('proj', 'x')).not.toThrow();
+    expect(readPersistedString('proj', 'fallback')).toBe('fallback');
+  });
+
+  it('swallows getItem / setItem errors', () => {
+    throwOnGet = true;
+    expect(readPersistedString('proj', 'fallback')).toBe('fallback');
+    throwOnGet = false;
+    throwOnSet = true;
+    expect(() => writePersistedString('proj', 'x')).not.toThrow();
   });
 });
