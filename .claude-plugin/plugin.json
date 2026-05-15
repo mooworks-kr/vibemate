@@ -1,0 +1,25 @@
+{
+  "name": "vibemate",
+  "version": "0.1.0",
+  "description": "바이브 코딩 프로젝트 매니저 — 스펙 / 태스크 / 코드 / 결정 / 세션 히스토리를 한 SQLite DB 에 모으는 로컬 PM 툴",
+  "homepage": "https://github.com/mooworks-kr/vibemate",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mooworks-kr/vibemate.git"
+  },
+  "keywords": [
+    "project-management",
+    "mcp",
+    "claude-code",
+    "vibe-coding",
+    "sqlite",
+    "local-first"
+  ],
+  "license": "MIT",
+  "mcpServers": {
+    "vibemate": {
+      "command": "npx",
+      "args": ["-y", "vibemate", "mcp"]
+    }
+  }
+}

@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "바이브 코딩 프로젝트 매니저 — Claude Code와 연동되는 로컬 PM 툴",
   "type": "module",
+  "license": "MIT",
   "bin": {
     "pm": "./dist/server/cli.js",
     "vibemate": "./dist/server/cli.js"
