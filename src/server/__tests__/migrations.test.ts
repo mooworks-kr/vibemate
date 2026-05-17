@@ -17,13 +17,15 @@ describe('migrations runner — fresh DB', () => {
     const versions = rows.map((r) => r.version);
     // 0001_init + 0002_search_fts + 0003_imported_commits +
     // 0004_extracted_features + 0005_drop_file_explanations +
-    // 0006_documents. Bump as new migrations land.
+    // 0006_documents + 0007_documents_au_trigger_fix. Bump as new
+    // migrations land.
     expect(versions).toContain(1);
     expect(versions).toContain(2);
     expect(versions).toContain(3);
     expect(versions).toContain(4);
     expect(versions).toContain(5);
     expect(versions).toContain(6);
+    expect(versions).toContain(7);
   });
 
   it('creates the expected tables', () => {
@@ -90,6 +92,52 @@ describe('migrations runner — fresh DB', () => {
   });
 });
 
+describe('migrations runner — documents_au trigger (0007)', () => {
+  let t: ReturnType<typeof createTempDb>;
+  beforeEach(() => { t = createTempDb(); });
+  afterEach(() => { t.cleanup(); });
+
+  it('updates search_fts.project_id when documents.project_id is reassigned', () => {
+    // Seed two projects + one document under the first.
+    const now = Date.now();
+    const insertProject = t.db.prepare(
+      `INSERT INTO projects (id, name, root_path, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    insertProject.run('proj_src', 'Source', '/tmp/proj-src', now, now);
+    insertProject.run('proj_dst', 'Destination', '/tmp/proj-dst', now, now);
+    t.db
+      .prepare(
+        `INSERT INTO documents
+           (id, project_id, kind, title, content_md, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run('doc1', 'proj_src', 'other', 'Title', 'body', now, now);
+
+    const before = t.db
+      .prepare("SELECT project_id FROM search_fts WHERE kind='document' AND ref_id=?")
+      .get('doc1') as { project_id: string } | undefined;
+    expect(before?.project_id).toBe('proj_src');
+
+    // Reassign to another project — the 0006 trigger missed this because it
+    // was scoped to (title, content_md) only.
+    t.db
+      .prepare('UPDATE documents SET project_id = ? WHERE id = ?')
+      .run('proj_dst', 'doc1');
+
+    const after = t.db
+      .prepare("SELECT project_id FROM search_fts WHERE kind='document' AND ref_id=?")
+      .get('doc1') as { project_id: string } | undefined;
+    expect(after?.project_id).toBe('proj_dst');
+
+    // And exactly one FTS row remains for this document.
+    const count = t.db
+      .prepare("SELECT COUNT(*) AS n FROM search_fts WHERE kind='document' AND ref_id=?")
+      .get('doc1') as { n: number };
+    expect(count.n).toBe(1);
+  });
+});
+
 describe('migrations runner — idempotent', () => {
   let t: ReturnType<typeof createTempDb>;
   beforeEach(() => { t = createTempDb(); });
@@ -148,8 +196,8 @@ describe('migrations runner — legacy baseline', () => {
         .prepare('SELECT version FROM schema_migrations ORDER BY version')
         .all() as { version: number }[];
       const versions = rows.map((r) => r.version);
-      // Baseline marker for v1, plus newly-applied v2..v6.
-      expect(versions).toEqual([1, 2, 3, 4, 5, 6]);
+      // Baseline marker for v1, plus newly-applied v2..v7.
+      expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7]);
     } finally {
       closeDb();
       try { fs.rmSync(legacy.dir, { recursive: true, force: true }); } catch {}
