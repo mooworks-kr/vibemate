@@ -19,6 +19,11 @@ coverage/
 # migrate-claude-md backups
 *.bak
 
+# local dev sqlite (real DB lives in ~/.vibemate/)
+db.sqlite
+db.sqlite-shm
+db.sqlite-wal
+
 # local agent / tooling configs (per-user; .claude-plugin/ stays committed)
 .claude/
 .codex/
