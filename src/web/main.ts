@@ -12,6 +12,7 @@ import type {
   FeatureFile,
   FeatureStatus,
   Project,
+  ProjectDeletionImpact,
   ProjectOverview,
   SearchKind,
   SearchResult,
@@ -1749,6 +1750,21 @@ function renderProjectSwitcher(): void {
       el('div', { class: 'project-option-tagline', text: proj.tagline ?? '' }),
     ]);
     opt.appendChild(info);
+    // Sprint 28 (pax6): per-row kebab → "프로젝트 삭제" (destructive modal).
+    // stopPropagation keeps the row-level click (set-active-project) from
+    // also firing when the user clicks the kebab.
+    const kebab = el('button', {
+      class: 'project-option-kebab',
+      title: t('project.delete.kebab.title'),
+      'aria-label': t('project.delete.menu'),
+      text: '⋯',
+      onClick: (e: MouseEvent) => {
+        e.stopPropagation();
+        dd.classList.remove('open');
+        openProjectDeleteModal(proj.id, proj.name);
+      },
+    });
+    opt.appendChild(kebab);
     dd.appendChild(opt);
   });
 }
@@ -3503,6 +3519,287 @@ if (localeToggleEl) {
   // segmented control's initial paint.
   setActive(getLocale());
 }
+
+// =================================================
+// Project delete modal (Sprint 28, pax6)
+// =================================================
+// Standalone DOM (mirrors the search-palette pattern in this file): the
+// modal is created on first use, hidden in between, and built imperatively
+// so we don't need a templating layer. All state lives in this closure —
+// no `state` field — because nothing else in the app needs to read it.
+//
+// Flow:
+//   openProjectDeleteModal(id, name) →
+//     1. fetch GET /api/projects/:id/deletion-impact
+//     2. render impact list + name confirm input (+ force checkbox when
+//        active_sessions > 0)
+//     3. Delete button enabled only when typed === name
+//        AND (active_sessions === 0 OR force checkbox checked)
+//     4. DELETE /api/projects/:id?force=…
+//     5. on success: toast, drop from DATA.projects, switch active project
+//        if we just deleted the current one, render()
+const projectDeleteState: {
+  open: boolean;
+  projectId: string | null;
+  projectName: string | null;
+  impact: ProjectDeletionImpact | null;
+  loading: boolean;
+  error: string | null;
+  forceChecked: boolean;
+  typed: string;
+  submitting: boolean;
+} = {
+  open: false,
+  projectId: null,
+  projectName: null,
+  impact: null,
+  loading: false,
+  error: null,
+  forceChecked: false,
+  typed: '',
+  submitting: false,
+};
+
+const PROJECT_DELETE_IMPACT_KEYS: ReadonlyArray<keyof ProjectDeletionImpact> = [
+  'features',
+  'tasks',
+  'sessions',
+  'decisions',
+  'documents',
+  'feature_files',
+  'document_features',
+  'imported_commits',
+  'extracted_features',
+];
+
+function ensureProjectDeleteDom(): HTMLElement {
+  let overlay = document.getElementById('projectDeleteModal');
+  if (overlay) return overlay;
+  overlay = document.createElement('div');
+  overlay.id = 'projectDeleteModal';
+  overlay.className = 'destructive-modal-overlay';
+  overlay.style.display = 'none';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  // Click-on-backdrop closes; clicks inside the modal don't bubble.
+  overlay.addEventListener('click', (e: MouseEvent) => {
+    if (e.target === overlay) closeProjectDeleteModal();
+  });
+  document.body.appendChild(overlay);
+  return overlay;
+}
+
+function openProjectDeleteModal(projectId: string, projectName: string): void {
+  projectDeleteState.open = true;
+  projectDeleteState.projectId = projectId;
+  projectDeleteState.projectName = projectName;
+  projectDeleteState.impact = null;
+  projectDeleteState.loading = true;
+  projectDeleteState.error = null;
+  projectDeleteState.forceChecked = false;
+  projectDeleteState.typed = '';
+  projectDeleteState.submitting = false;
+
+  const overlay = ensureProjectDeleteDom();
+  overlay.style.display = 'flex';
+  renderProjectDeleteModal();
+
+  // Fire the impact fetch — render() shows a loading state until it lands.
+  fetchJSON<ProjectDeletionImpact>(`/api/projects/${encodeURIComponent(projectId)}/deletion-impact`)
+    .then((impact) => {
+      // Stale-response guard: a second open between fetch and resolve.
+      if (projectDeleteState.projectId !== projectId) return;
+      projectDeleteState.impact = impact;
+      projectDeleteState.loading = false;
+      renderProjectDeleteModal();
+    })
+    .catch((e: unknown) => {
+      if (projectDeleteState.projectId !== projectId) return;
+      projectDeleteState.loading = false;
+      projectDeleteState.error = e instanceof Error ? e.message : String(e);
+      renderProjectDeleteModal();
+    });
+}
+
+function closeProjectDeleteModal(): void {
+  projectDeleteState.open = false;
+  projectDeleteState.projectId = null;
+  projectDeleteState.projectName = null;
+  projectDeleteState.impact = null;
+  projectDeleteState.error = null;
+  const overlay = document.getElementById('projectDeleteModal');
+  if (overlay) overlay.style.display = 'none';
+}
+
+function projectDeleteCanSubmit(): boolean {
+  const s = projectDeleteState;
+  if (!s.projectName || s.loading || s.submitting) return false;
+  if (s.typed !== s.projectName) return false;
+  if (s.impact && s.impact.active_sessions > 0 && !s.forceChecked) return false;
+  return true;
+}
+
+async function submitProjectDelete(): Promise<void> {
+  if (!projectDeleteCanSubmit()) return;
+  const s = projectDeleteState;
+  const pid = s.projectId!;
+  const force = !!(s.impact && s.impact.active_sessions > 0 && s.forceChecked);
+  s.submitting = true;
+  renderProjectDeleteModal();
+
+  const url = `/api/projects/${encodeURIComponent(pid)}${force ? '?force=true' : ''}`;
+  const result = await mutate({
+    method: 'DELETE',
+    url,
+    successToast: t('toast.project.deleted'),
+  });
+  if (!result) {
+    // mutate() already toasted the error; allow the user to retry by
+    // reopening the modal. Just re-enable submit + show in the modal.
+    s.submitting = false;
+    s.error = t('error.network'); // best-effort hint; toast carries detail
+    renderProjectDeleteModal();
+    return;
+  }
+
+  // Local state cleanup. The cascade already removed everything on the
+  // server, but caches keyed by project_id need to forget the row too.
+  DATA.projects = DATA.projects.filter((p) => p.id !== pid);
+  delete DATA.features[pid];
+  delete DATA.decisions[pid];
+  if (DATA.sessions) delete DATA.sessions[pid];
+  if (DATA.overviews) delete DATA.overviews[pid];
+  if (DATA.documents) delete DATA.documents[pid];
+  if (DATA.fileTrees) delete DATA.fileTrees[pid];
+  state.loadedProjects.delete(pid);
+  // Workspace cross-project list is stale — drop it; the workspace tab
+  // re-fetches on next entry.
+  state.workspaceFeatures = null;
+
+  closeProjectDeleteModal();
+
+  // If the user just deleted the currently-active project, fall back to
+  // the first remaining project (or null if there are none).
+  if (state.currentProject === pid) {
+    const next = DATA.projects[0]?.id ?? null;
+    state.currentProject = next;
+    state.currentFeature = null;
+    writePersistedString('vibemate.currentProject', next ?? '');
+    if (next) {
+      await setActiveProject(next);
+      return;
+    }
+  }
+  render();
+}
+
+function renderProjectDeleteModal(): void {
+  const overlay = ensureProjectDeleteDom();
+  if (!projectDeleteState.open) {
+    overlay.style.display = 'none';
+    return;
+  }
+  overlay.innerHTML = '';
+
+  const modal = el('div', { class: 'destructive-modal' });
+  modal.addEventListener('click', (e: MouseEvent) => e.stopPropagation());
+
+  // Header
+  modal.appendChild(el('div', { class: 'destructive-modal-header' }, [
+    el('div', { class: 'destructive-modal-title', text: t('project.delete.modal.title') }),
+    el('div', {
+      class: 'destructive-modal-subtitle',
+      text: t('project.delete.modal.subtitle'),
+    }),
+  ]));
+
+  const body = el('div', { class: 'destructive-modal-body' });
+
+  if (projectDeleteState.loading) {
+    body.appendChild(el('div', { text: t('project.delete.modal.loading'), style: 'color: var(--text-3); padding: 12px 0;' }));
+  } else if (projectDeleteState.error) {
+    body.appendChild(el('div', {
+      text: projectDeleteState.error,
+      style: 'color: var(--warn-text, #b35e00); padding: 12px 0;',
+    }));
+  } else if (projectDeleteState.impact && projectDeleteState.projectName) {
+    const impact = projectDeleteState.impact;
+    body.appendChild(el('h4', { text: t('project.delete.modal.impact_heading') }));
+    const grid = el('div', { class: 'destructive-modal-impact' });
+    for (const k of PROJECT_DELETE_IMPACT_KEYS) {
+      grid.appendChild(el('span', { text: t(`project.delete.modal.impact.${k}`) }));
+      grid.appendChild(el('span', { class: 'num', text: String(impact[k]) }));
+    }
+    body.appendChild(grid);
+
+    if (impact.active_sessions > 0) {
+      const warn = el('div', { class: 'destructive-modal-warn' });
+      warn.appendChild(el('div', {
+        text: t('project.delete.modal.active_warn', { n: impact.active_sessions }),
+      }));
+      const lbl = el('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = projectDeleteState.forceChecked;
+      cb.addEventListener('change', () => {
+        projectDeleteState.forceChecked = cb.checked;
+        renderProjectDeleteModal();
+      });
+      lbl.appendChild(cb);
+      lbl.appendChild(document.createTextNode(' ' + t('project.delete.modal.force_label')));
+      warn.appendChild(lbl);
+      body.appendChild(warn);
+    }
+
+    // Type-to-confirm input. Label shows the literal project name so users
+    // can copy it into the field — same pattern GitHub uses for repo delete.
+    const confirmRow = el('div', { class: 'destructive-modal-confirm-row' });
+    const label = el('label', {
+      text: t('project.delete.modal.confirm_label', { name: projectDeleteState.projectName }),
+    });
+    confirmRow.appendChild(label);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = t('project.delete.modal.confirm_placeholder');
+    input.value = projectDeleteState.typed;
+    input.addEventListener('input', () => {
+      projectDeleteState.typed = input.value;
+      // Re-render only the action row so the input doesn't lose focus.
+      const btn = overlay.querySelector('[data-action="delete"]') as HTMLButtonElement | null;
+      if (btn) btn.disabled = !projectDeleteCanSubmit();
+    });
+    input.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.key === 'Enter' && projectDeleteCanSubmit()) submitProjectDelete();
+      else if (e.key === 'Escape') closeProjectDeleteModal();
+    });
+    confirmRow.appendChild(input);
+    body.appendChild(confirmRow);
+    queueMicrotask(() => input.focus());
+  }
+
+  modal.appendChild(body);
+
+  // Actions
+  const cancelBtn = el('button', {
+    text: t('project.delete.modal.cancel'),
+    onClick: () => closeProjectDeleteModal(),
+  });
+  const deleteBtn = el('button', {
+    class: 'danger',
+    text: t('project.delete.modal.delete'),
+    'data-action': 'delete',
+    onClick: () => submitProjectDelete(),
+  }) as HTMLButtonElement;
+  deleteBtn.disabled = !projectDeleteCanSubmit();
+  modal.appendChild(el('div', { class: 'destructive-modal-actions' }, [cancelBtn, deleteBtn]));
+
+  overlay.appendChild(modal);
+}
+
+// ESC closes (mirrors the search-palette pattern).
+document.addEventListener('keydown', (e: KeyboardEvent) => {
+  if (e.key === 'Escape' && projectDeleteState.open) closeProjectDeleteModal();
+});
 
 // Bootstrap: load project list, pick the first, fetch detail, render.
 (async () => {

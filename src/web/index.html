@@ -198,6 +198,146 @@
   }
   .project-option-name { font-weight: 500; font-size: 13.5px; }
   .project-option-tagline { font-size: 12px; color: var(--text-2); }
+  /* Sprint 28 (pax6): kebab trigger inside .project-option for "delete project" */
+  .project-option-kebab {
+    width: 24px; height: 24px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 4px;
+    color: var(--text-3);
+    cursor: pointer;
+    background: transparent;
+    border: none;
+    font-size: 16px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .project-option-kebab:hover { background: var(--bg-hover); color: var(--text); }
+
+  /* Sprint 28 (pax6): destructive-modal overlay (project delete confirm).
+     Same z-index tier as search-palette but a touch above so the modal wins
+     when both happen to be open. */
+  .destructive-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(31, 28, 23, 0.42);
+    z-index: 1200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .destructive-modal {
+    width: min(520px, 96vw);
+    max-height: 88vh;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .destructive-modal-header {
+    padding: 16px 18px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .destructive-modal-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .destructive-modal-subtitle {
+    font-size: 12px;
+    color: var(--text-3);
+    margin-top: 2px;
+  }
+  .destructive-modal-body {
+    padding: 12px 18px 4px;
+    overflow-y: auto;
+  }
+  .destructive-modal-body h4 {
+    margin: 8px 0 6px;
+    font-size: 12px;
+    color: var(--text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .destructive-modal-impact {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    row-gap: 4px;
+    column-gap: 12px;
+    font-size: 13px;
+    color: var(--text-2);
+    margin: 2px 0 10px;
+  }
+  .destructive-modal-impact .num {
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .destructive-modal-warn {
+    background: rgba(217, 119, 6, 0.08);
+    border: 1px solid var(--warn, #d97706);
+    color: var(--warn-text, #b35e00);
+    padding: 8px 10px;
+    border-radius: var(--radius);
+    font-size: 12.5px;
+    margin: 8px 0 4px;
+  }
+  .destructive-modal-warn label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+    cursor: pointer;
+  }
+  .destructive-modal-confirm-row {
+    margin: 8px 0 4px;
+  }
+  .destructive-modal-confirm-row label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-2);
+    margin-bottom: 4px;
+  }
+  .destructive-modal-confirm-row input[type="text"] {
+    width: 100%;
+    padding: 6px 8px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong, var(--border));
+    border-radius: 4px;
+    color: var(--text);
+    font: inherit;
+    box-sizing: border-box;
+  }
+  .destructive-modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    padding: 12px 18px 14px;
+    border-top: 1px solid var(--border);
+  }
+  .destructive-modal-actions button {
+    padding: 6px 14px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border-strong, var(--border));
+    background: var(--bg-elevated);
+    color: var(--text);
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+  }
+  .destructive-modal-actions button.danger {
+    background: #c0392b;
+    border-color: #a3322a;
+    color: #fff;
+  }
+  .destructive-modal-actions button.danger:disabled {
+    background: var(--bg-soft);
+    border-color: var(--border);
+    color: var(--text-3);
+    cursor: not-allowed;
+  }
 
   .global-search {
     flex: 1;

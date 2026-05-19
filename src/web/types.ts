@@ -20,6 +20,7 @@ import type {
   FeatureFile,
   FileNode,
   FeatureStatus,
+  ProjectDeletionImpact,
   ProjectOverview,
   ProjectStats,
   Project,
@@ -36,6 +37,8 @@ export type ProjectOverviewResponse = ProjectOverview;
 // Sprint 22 (3wtr) — re-export Document types so renderDocs and friends
 // don't have to reach across the boundary at every call site.
 export type { Document, DocumentKind };
+// Sprint 28 (pax6) — re-export project deletion impact for the destructive modal.
+export type { ProjectDeletionImpact };
 // Sprint 23 (h5uk) — re-export session detail shape for the sub-view cache.
 export type { SessionDetail };
 // Sprint 24 (ijze) — Context Brief response shape.

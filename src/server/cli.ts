@@ -5,7 +5,15 @@ import path from 'node:path';
 import { exec } from 'node:child_process';
 import * as domain from './domain.js';
 import { getDb } from './db.js';
-import { startDaemon, stopDaemon, daemonStatus } from './daemon.js';
+import {
+  startDaemon,
+  stopDaemon,
+  daemonStatus,
+  daemonStartedAtMs,
+  buildMtimeMs,
+  classifyStaleness,
+  PID_FILE,
+} from './daemon.js';
 import { startMcpServer } from './mcp.js';
 
 const program = new Command();
@@ -53,14 +61,48 @@ program
   });
 
 // ----------------------------------------------------------------
-// pm start | stop | status
+// pm start | stop | restart | status
 // ----------------------------------------------------------------
+// `YYYY-MM-DD HH:mm` formatter used by `pm status` to print daemon start
+// time / build mtime. Locale-independent (so test output / log output is
+// reproducible across machines) and minute-resolution since the staleness
+// hazard plays out over hours-to-days, not seconds.
+function formatTimestamp(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return [
+    d.getFullYear(),
+    '-',
+    pad(d.getMonth() + 1),
+    '-',
+    pad(d.getDate()),
+    ' ',
+    pad(d.getHours()),
+    ':',
+    pad(d.getMinutes()),
+  ].join('');
+}
+
 program
   .command('start')
-  .description('데몬 시작 (HTTP 서버 + 파일 감시)')
+  .description('데몬 시작 (HTTP 서버)')
   .option('-p, --port <port>', '포트', '7321')
   .action(async (opts) => {
     getDb();
+    // Sprint 29 (mh48): if a daemon is already running and the build is
+    // newer than the daemon, surface the stale hint here too. startDaemon()
+    // itself just logs "already running" and returns — without the extra
+    // line the user has no signal that they're still on the old binary.
+    const existing = daemonStatus();
+    if (existing.running) {
+      const verdict = classifyStaleness({
+        daemonStartedAt: daemonStartedAtMs(),
+        buildMtime: buildMtimeMs(),
+      });
+      if (verdict === 'stale') {
+        console.log('⚠ 옛 빌드를 실행 중. `pm restart` 로 새 빌드를 적용하세요.');
+      }
+    }
     const port = parseInt(opts.port, 10);
     await startDaemon(port);
     console.log(`대시보드: http://localhost:${port}`);
@@ -73,13 +115,80 @@ program
     stopDaemon();
   });
 
+// Sprint 29 (mh48): `pm restart` — `stop` then `start` in one shot. Waits
+// for the previous daemon's SIGTERM cleanup to (a) remove the PID file
+// AND (b) actually exit the process so the OS releases the bound port. If
+// we skipped (b) we'd race into EADDRINUSE because cleanup() unlinks the
+// PID before `process.exit()` closes the socket. Same long-running
+// semantics as `pm start` — this process becomes the new daemon.
+program
+  .command('restart')
+  .description('데몬 재시작 (stop + start)')
+  .option('-p, --port <port>', '포트', '7321')
+  .action(async (opts) => {
+    getDb();
+    // Capture the previous PID *before* sending SIGTERM so we can verify
+    // it actually exits, even after the PID file is gone.
+    const prevPid = fs.existsSync(PID_FILE)
+      ? Number(fs.readFileSync(PID_FILE, 'utf-8')) || null
+      : null;
+    stopDaemon();
+
+    // Two-phase wait: PID file vanishes (cleanup handler ran), then the
+    // old process is actually gone (port released). Cap at ~3s.
+    const deadline = Date.now() + 3000;
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    while (fs.existsSync(PID_FILE) && Date.now() < deadline) {
+      await sleep(50);
+    }
+    if (prevPid != null) {
+      while (Date.now() < deadline) {
+        try {
+          process.kill(prevPid, 0);
+          await sleep(50);
+        } catch {
+          break; // process gone — port should be free imminently
+        }
+      }
+      // Tiny grace pause so the kernel releases the TCP listening socket
+      // before we bind. Empirically <50ms on macOS / Linux.
+      await sleep(100);
+    }
+
+    const port = parseInt(opts.port, 10);
+    await startDaemon(port);
+    console.log(`대시보드: http://localhost:${port}`);
+  });
+
 program
   .command('status')
-  .description('데몬 상태 확인')
+  .description('데몬 상태 확인 (stale 빌드 감지 포함)')
   .action(() => {
     const s = daemonStatus();
-    if (s.running) console.log(`✓ 실행 중 (pid ${s.pid})`);
-    else console.log('✗ 실행 중이 아님');
+    if (!s.running) {
+      console.log('✗ 실행 중이 아님');
+      return;
+    }
+    console.log(`✓ 실행 중 (pid ${s.pid})`);
+
+    // Sprint 29 (mh48): pair daemon-start mtime with build mtime so users
+    // can spot the "data shape changed, daemon still on old code" hazard
+    // without grepping logs. classifyStaleness lives in daemon.ts (testable).
+    const startedAt = daemonStartedAtMs();
+    const buildMs = buildMtimeMs();
+    const verdict = classifyStaleness({ daemonStartedAt: startedAt, buildMtime: buildMs });
+
+    if (startedAt != null) console.log(`  기동: ${formatTimestamp(startedAt)}`);
+    if (buildMs != null) {
+      const tag = verdict === 'stale'
+        ? '⚠ stale — `pm restart` 권장'
+        : verdict === 'fresh' ? '✓ up-to-date' : '';
+      console.log(`  빌드: ${formatTimestamp(buildMs)}${tag ? '  ' + tag : ''}`);
+    } else {
+      // Dev mode (tsx watch handles reloads itself) — say so explicitly so
+      // users don't read the absence as "missing data".
+      console.log('  빌드: (dist 없음 — dev 모드 / pm dev)');
+    }
   });
 
 program
@@ -142,6 +251,82 @@ featureCmd
       const progressStr = total > 0 ? ` [${done}/${total} · ${progress}%]` : '';
       console.log(`  ${statusIcon} ${f.name}${progressStr}`);
       if (f.goal) console.log(`     ${f.goal}`);
+    }
+  });
+
+// ----------------------------------------------------------------
+// pm project ...
+// Project-level commands. Today: delete (Sprint 28 / pax6).
+// ----------------------------------------------------------------
+const projectCmd = program.command('project').description('프로젝트 관리');
+
+projectCmd
+  .command('delete <id>')
+  .description('프로젝트 삭제 (cascade: features/tasks/sessions/decisions/documents/매핑 자동 삭제)')
+  .option('--force', '활성 세션이 있어도 강제 삭제')
+  .option('--yes', '대화형 confirm 건너뛰기 (스크립트용)')
+  .action(async (id: string, opts: { force?: boolean; yes?: boolean }) => {
+    getDb();
+    const proj = domain.getProject(id);
+    if (!proj) {
+      console.error(`× 프로젝트를 찾을 수 없습니다: ${id}`);
+      process.exit(1);
+      return;
+    }
+
+    const impact = domain.getProjectDeletionImpact(id);
+    console.log(`프로젝트: ${proj.name} (${proj.id})`);
+    console.log(`  경로: ${proj.root_path}`);
+    console.log('');
+    console.log('함께 삭제될 항목:');
+    console.log(`  features:           ${impact.features}`);
+    console.log(`  tasks:              ${impact.tasks}`);
+    console.log(`  sessions:           ${impact.sessions}`);
+    console.log(`  decisions:          ${impact.decisions}`);
+    console.log(`  documents:          ${impact.documents}`);
+    console.log(`  feature_files:      ${impact.feature_files}`);
+    console.log(`  document_features:  ${impact.document_features}`);
+    console.log(`  imported_commits:   ${impact.imported_commits}`);
+    console.log(`  extracted_features: ${impact.extracted_features}`);
+    if (impact.active_sessions > 0) {
+      console.log('');
+      console.log(`⚠ 활성 세션 ${impact.active_sessions}건이 진행 중입니다.`);
+      if (!opts.force) {
+        console.log('  먼저 종료하거나 --force 로 강제 삭제하세요.');
+      } else {
+        console.log('  --force 지정됨: 강제 삭제합니다.');
+      }
+    }
+    console.log('');
+    console.log('백업이 필요하면 ~/.vibemate/db.sqlite 를 복사해두세요.');
+
+    if (!opts.yes) {
+      const prompt = `\n삭제하려면 프로젝트 이름을 정확히 입력하세요 ("${proj.name}"): `;
+      const readline = await import('node:readline/promises');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      let typed = '';
+      try {
+        typed = (await rl.question(prompt)).trim();
+      } finally {
+        rl.close();
+      }
+      if (typed !== proj.name) {
+        console.log('취소했습니다 (이름 불일치).');
+        return;
+      }
+    }
+
+    try {
+      const removed = domain.deleteProject(id, { force: opts.force });
+      if (!removed) {
+        console.error(`× 프로젝트를 찾을 수 없습니다: ${id}`);
+        process.exit(1);
+        return;
+      }
+      console.log(`✓ 삭제 완료: ${proj.name} (${proj.id})`);
+    } catch (err) {
+      console.error(`× ${(err as Error).message}`);
+      process.exit(1);
     }
   });
 

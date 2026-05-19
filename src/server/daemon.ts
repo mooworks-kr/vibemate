@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defaultDataDir } from './lib.js';
 import { startHttpServer } from './http.js';
 
@@ -8,7 +9,18 @@ import { startHttpServer } from './http.js';
 // is derived at endSession time via `git status --porcelain` instead — see
 // domain.ts:endSession.
 
-const PID_FILE = path.join(defaultDataDir(), 'daemon.pid');
+export const PID_FILE = path.join(defaultDataDir(), 'daemon.pid');
+
+// Sprint 29 (mh48): the file we stat to derive "current build mtime".
+// `http.js` was picked over a server-tree sum because (a) it's the file most
+// HTTP-route changes touch and (b) keeping the witness single-purpose makes
+// the staleness rule trivial to explain to users. Resolves both in prod
+// (`dist/server/http.js`, alongside this file) and in dev (`src/server/http.ts`
+// — the .js path here won't exist, which `buildMtimeMs()` reports as null).
+const HTTP_BUILD_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  'http.js',
+);
 
 export async function startDaemon(port: number = 7321): Promise<void> {
   fs.mkdirSync(path.dirname(PID_FILE), { recursive: true });
@@ -67,5 +79,72 @@ function isProcessAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+// ============================================================
+// Sprint 29 (mh48) — stale-build detection
+//
+// Hazard: a daemon launched from build N keeps running build N's code in
+// memory even after `npm run build` overwrites dist/. Until the user
+// restarts the process they see ghost 404s on new routes (the pax6 trigger
+// case: /api/projects/:id/deletion-impact landed in build N+1 but the live
+// daemon was still N). ADR-0026 picks explicit `pm restart` + a status
+// warning over auto-reload — auto-reload would drop in-flight requests
+// silently.
+//
+// Mechanism: compare `dist/server/http.js` mtime (the build clock) against
+// the PID file mtime (the daemon clock — the PID file is written exactly
+// once at startDaemon() and removed at cleanup, so its mtime is a faithful
+// proxy for daemon start time). Pure, ms-in-ms-out, so cli/tests can
+// exercise it without filesystem fixtures.
+// ============================================================
+
+export type StaleVerdict = 'fresh' | 'stale' | 'unknown';
+
+/**
+ * Pure verdict helper. Inputs are ms-since-epoch (or null when the witness
+ * file is missing, e.g. dev mode without a build).
+ *
+ *   stale   = build is newer than daemon (the typical "forgot to restart")
+ *   fresh   = daemon started after the last build (clean state)
+ *   unknown = at least one side has no witness (dev mode, daemon down)
+ *
+ * Equal mtimes are treated as fresh — re-running `npm run build` while the
+ * daemon is alive but inside the same second shouldn't nag (the artifact
+ * is identical at byte level in that window for typical TS rebuilds).
+ */
+export function classifyStaleness(opts: {
+  daemonStartedAt: number | null;
+  buildMtime: number | null;
+}): StaleVerdict {
+  if (opts.daemonStartedAt == null || opts.buildMtime == null) return 'unknown';
+  return opts.buildMtime > opts.daemonStartedAt ? 'stale' : 'fresh';
+}
+
+/**
+ * mtime of the daemon's PID file as ms-since-epoch, or null when the file
+ * is missing. Caller is responsible for checking that the daemon is
+ * actually alive (`daemonStatus().running`) — a stale PID with no process
+ * behind it would still surface a number here.
+ */
+export function daemonStartedAtMs(): number | null {
+  try {
+    return fs.statSync(PID_FILE).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * mtime of the build witness (`dist/server/http.js`), or null when it
+ * doesn't exist. In dev mode (tsx watch) the witness is absent — the
+ * status command treats that as "no build to be stale against".
+ */
+export function buildMtimeMs(): number | null {
+  try {
+    return fs.statSync(HTTP_BUILD_PATH).mtimeMs;
+  } catch {
+    return null;
   }
 }

@@ -289,6 +289,45 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     },
   );
 
+  // ----- Project deletion (Sprint 28, pax6) -----
+
+  // Pre-flight summary. Counterpart of GET /api/projects/:id/deletion-impact —
+  // returns the child-row counts so the agent can show "이 프로젝트를 지우면
+  // features N개, sessions M개 ... 가 함께 삭제됩니다" before calling
+  // `pm_delete_project`. Resolves CWD when project_id is omitted to mirror
+  // the rest of the MCP surface.
+  server.tool(
+    'pm_get_deletion_impact',
+    {
+      project_id: z.string().optional()
+        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+    },
+    async ({ project_id }) => {
+      const pid = resolveProject(project_id);
+      return ok(domain.getProjectDeletionImpact(pid));
+    },
+  );
+
+  // Hard delete + cascade. force=false (default) blocks when an active
+  // session (summary IS NULL AND ended_at IS NULL) is still attached;
+  // force=true is the escape hatch. Errors surface as MCP tool errors so
+  // Claude Code can relay the message back to the user verbatim.
+  server.tool(
+    'pm_delete_project',
+    {
+      project_id: z.string().optional()
+        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+      force: z.boolean().optional()
+        .describe('true면 활성 세션이 있어도 강제 삭제. 기본 false'),
+    },
+    async ({ project_id, force }) => {
+      const pid = resolveProject(project_id);
+      const removed = domain.deleteProject(pid, { force });
+      if (!removed) throw new Error(`Project not found: ${pid}`);
+      return ok({ ok: true, project_id: pid });
+    },
+  );
+
   // ----- File linking (manual override) -----
 
   server.tool(

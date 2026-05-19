@@ -295,6 +295,30 @@ export interface ProjectStats {
   decisions: number;
 }
 
+/**
+ * Sprint 28 (pax6) — `getProjectDeletionImpact` payload. Pre-flight summary
+ * for the destructive `DELETE /api/projects/:id` flow: the UI / CLI reads
+ * `active_sessions` to decide whether to prompt for `force`, and shows the
+ * other counts so the user can see exactly what cascades away.
+ *
+ * Active session = `sessions.summary IS NULL AND ended_at IS NULL`
+ * (the same shape `pm_session_start` leaves behind until `pm_session_end`).
+ * Cascade-only side-tables (`session_files`, `feature_files` via tasks, etc.)
+ * are surfaced through their JOIN parents — we don't double-count.
+ */
+export interface ProjectDeletionImpact {
+  features: number;
+  tasks: number;
+  sessions: number;
+  decisions: number;
+  documents: number;
+  feature_files: number;
+  document_features: number;
+  imported_commits: number;
+  extracted_features: number;
+  active_sessions: number;
+}
+
 // Sprint 20 (u3zu) — ADR-0018. Project Overview tab. Derived from existing
 // project / feature / session / decision data — no new model.
 //

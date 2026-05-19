@@ -44,6 +44,134 @@ describe('projects', () => {
   });
 });
 
+// Sprint 28 (pax6) — deletion impact + cascade.
+describe('getProjectDeletionImpact / deleteProject', () => {
+  it('counts every child row + active sessions', () => {
+    const proj = domain.createProject({ name: 'P-del', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: proj.id, name: '인증' });
+    domain.addTask(f.id, 'task A');
+    domain.addTask(f.id, 'task B');
+    domain.logDecision({ projectId: proj.id, title: 'ADR-1' });
+    const doc = domain.createDocument({ projectId: proj.id, kind: 'prd', title: 'PRD' });
+    domain.linkDocumentToFeature(doc.id, f.id);
+    domain.linkFile({ featureId: f.id, filePath: 'src/foo.ts' });
+
+    // One open session (active) + one closed.
+    const open = domain.startSession({ projectId: proj.id, featureId: f.id });
+    const closed = domain.startSession({ projectId: proj.id, featureId: f.id });
+    domain.endSession({ sessionId: closed.session_id, summary: 'wrap' });
+
+    const impact = domain.getProjectDeletionImpact(proj.id);
+    expect(impact.features).toBe(1);
+    expect(impact.tasks).toBe(2);
+    expect(impact.sessions).toBe(2);
+    expect(impact.decisions).toBe(1);
+    expect(impact.documents).toBe(1);
+    expect(impact.feature_files).toBe(1);
+    expect(impact.document_features).toBe(1);
+    expect(impact.imported_commits).toBe(0);
+    expect(impact.extracted_features).toBe(0);
+    expect(impact.active_sessions).toBe(1);
+    // Sanity: open session id is still around
+    expect(open.session_id).toBeTruthy();
+  });
+
+  it('returns all-zero counts on a fresh empty project', () => {
+    const proj = domain.createProject({ name: 'P-empty', rootPath: t.dir });
+    const impact = domain.getProjectDeletionImpact(proj.id);
+    expect(impact).toEqual({
+      features: 0,
+      tasks: 0,
+      sessions: 0,
+      decisions: 0,
+      documents: 0,
+      feature_files: 0,
+      document_features: 0,
+      imported_commits: 0,
+      extracted_features: 0,
+      active_sessions: 0,
+    });
+  });
+
+  it('cascade wipes features / tasks / sessions / decisions / documents and search_fts rows', () => {
+    const db = getDb();
+    const proj = domain.createProject({ name: 'P-cascade', rootPath: t.dir });
+    const f = domain.createFeature({ projectId: proj.id, name: '인증' });
+    domain.addTask(f.id, 'task A');
+    domain.logDecision({ projectId: proj.id, title: 'ADR' });
+    const doc = domain.createDocument({ projectId: proj.id, kind: 'prd', title: 'PRD' });
+    domain.linkDocumentToFeature(doc.id, f.id);
+    domain.linkFile({ featureId: f.id, filePath: 'src/a.ts' });
+    const s = domain.startSession({ projectId: proj.id, featureId: f.id });
+    domain.endSession({ sessionId: s.session_id, summary: 'first' });
+
+    const removed = domain.deleteProject(proj.id);
+    expect(removed).toBe(true);
+
+    // Direct rows gone.
+    expect(domain.getProject(proj.id)).toBeNull();
+    expect(domain.listFeatures(proj.id)).toHaveLength(0);
+    const tasks = db
+      .prepare('SELECT COUNT(*) AS n FROM tasks WHERE feature_id = ?')
+      .get(f.id) as { n: number };
+    expect(tasks.n).toBe(0);
+    const sessions = db
+      .prepare('SELECT COUNT(*) AS n FROM sessions WHERE project_id = ?')
+      .get(proj.id) as { n: number };
+    expect(sessions.n).toBe(0);
+    expect(domain.listDecisions(proj.id)).toHaveLength(0);
+    expect(domain.listDocuments(proj.id)).toHaveLength(0);
+    const ff = db
+      .prepare('SELECT COUNT(*) AS n FROM feature_files WHERE feature_id = ?')
+      .get(f.id) as { n: number };
+    expect(ff.n).toBe(0);
+    const df = db
+      .prepare('SELECT COUNT(*) AS n FROM document_features WHERE document_id = ?')
+      .get(doc.id) as { n: number };
+    expect(df.n).toBe(0);
+
+    // FTS5 rows — feature / decision / session / document should all be gone
+    // via the *_ad triggers from 0002 / 0006.
+    const fts = db
+      .prepare('SELECT COUNT(*) AS n FROM search_fts WHERE project_id = ?')
+      .get(proj.id) as { n: number };
+    expect(fts.n).toBe(0);
+  });
+
+  it('throws when an active session exists and force=false', () => {
+    const proj = domain.createProject({ name: 'P-active', rootPath: t.dir });
+    domain.startSession({ projectId: proj.id });
+    expect(() => domain.deleteProject(proj.id)).toThrow(/active session/i);
+    // Project still here.
+    expect(domain.getProject(proj.id)).not.toBeNull();
+  });
+
+  it('force=true bypasses the active-session guard', () => {
+    const proj = domain.createProject({ name: 'P-force', rootPath: t.dir });
+    domain.startSession({ projectId: proj.id });
+    const removed = domain.deleteProject(proj.id, { force: true });
+    expect(removed).toBe(true);
+    expect(domain.getProject(proj.id)).toBeNull();
+  });
+
+  it('returns false for unknown project id', () => {
+    expect(domain.deleteProject('nope-does-not-exist')).toBe(false);
+  });
+
+  it('does not affect sibling projects', () => {
+    const a = domain.createProject({ name: 'A', rootPath: t.dir + '/a' });
+    const b = domain.createProject({ name: 'B', rootPath: t.dir + '/b' });
+    domain.createFeature({ projectId: a.id, name: 'fa' });
+    domain.createFeature({ projectId: b.id, name: 'fb' });
+
+    domain.deleteProject(a.id);
+
+    expect(domain.getProject(a.id)).toBeNull();
+    expect(domain.getProject(b.id)).not.toBeNull();
+    expect(domain.listFeatures(b.id)).toHaveLength(1);
+  });
+});
+
 describe('features', () => {
   it('createFeature + listFeatures + updateFeature flow', () => {
     const proj = domain.createProject({ name: 'P1', rootPath: t.dir });

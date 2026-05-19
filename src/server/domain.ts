@@ -33,6 +33,7 @@ import type {
   ProjectOverviewDecision,
   ProjectOverviewNextTask,
   ProjectOverviewSession,
+  ProjectDeletionImpact,
   ProjectStats,
   SearchResult,
   Session,
@@ -138,6 +139,99 @@ export function getProjectStats(projectId: string): ProjectStats {
     sessions_this_week: sessionsThisWeek.n,
     decisions: decisionCount.n,
   };
+}
+
+/**
+ * Sprint 28 (pax6) — pre-flight summary for `DELETE /api/projects/:id`.
+ * Counts every direct child of the project plus the active-session signal
+ * so the CLI / web modal can render an honest "this is what cascades"
+ * confirmation. See `ProjectDeletionImpact` (types.ts) for field semantics.
+ *
+ * Active session policy (also enforced in `deleteProject`):
+ *   `sessions.summary IS NULL AND sessions.ended_at IS NULL`
+ * — matches the pm_session_start → pm_session_end window.
+ */
+export function getProjectDeletionImpact(projectId: string): ProjectDeletionImpact {
+  const db = getDb();
+  const scalar = (sql: string, param: string): number => {
+    const row = db.prepare(sql).get(param) as { n: number } | undefined;
+    return row?.n ?? 0;
+  };
+
+  return {
+    features: scalar('SELECT COUNT(*) AS n FROM features WHERE project_id = ?', projectId),
+    // Tasks belong to features; join through to keep the count project-scoped.
+    tasks: scalar(
+      `SELECT COUNT(*) AS n FROM tasks t
+       JOIN features f ON f.id = t.feature_id WHERE f.project_id = ?`,
+      projectId,
+    ),
+    sessions: scalar('SELECT COUNT(*) AS n FROM sessions WHERE project_id = ?', projectId),
+    decisions: scalar('SELECT COUNT(*) AS n FROM decisions WHERE project_id = ?', projectId),
+    documents: scalar('SELECT COUNT(*) AS n FROM documents WHERE project_id = ?', projectId),
+    feature_files: scalar(
+      `SELECT COUNT(*) AS n FROM feature_files ff
+       JOIN features f ON f.id = ff.feature_id WHERE f.project_id = ?`,
+      projectId,
+    ),
+    document_features: scalar(
+      `SELECT COUNT(*) AS n FROM document_features df
+       JOIN documents d ON d.id = df.document_id WHERE d.project_id = ?`,
+      projectId,
+    ),
+    imported_commits: scalar(
+      'SELECT COUNT(*) AS n FROM imported_commits WHERE project_id = ?',
+      projectId,
+    ),
+    extracted_features: scalar(
+      'SELECT COUNT(*) AS n FROM extracted_features WHERE project_id = ?',
+      projectId,
+    ),
+    active_sessions: scalar(
+      `SELECT COUNT(*) AS n FROM sessions
+       WHERE project_id = ? AND summary IS NULL AND ended_at IS NULL`,
+      projectId,
+    ),
+  };
+}
+
+/**
+ * Sprint 28 (pax6) — hard delete a project + all cascaded children.
+ *
+ * Schema-side cascade (ON DELETE CASCADE from 0001) handles features /
+ * tasks / sessions / session_files / decisions / documents / feature_files /
+ * document_features / imported_commits / extracted_features in one shot;
+ * FTS5 triggers (features_ad / decisions_ad / sessions_ad / documents_ad)
+ * remove the corresponding search_fts rows on the way down.
+ *
+ * Safety: active session = `summary IS NULL AND ended_at IS NULL`. With
+ * `force=false` (default) we throw rather than silently deleting work in
+ * progress; `force=true` is the escape hatch for the user who knowingly
+ * wants to wipe a half-open session.
+ *
+ * Returns `true` when a row was actually removed, `false` for unknown id
+ * (mirrors deleteDecision / deleteDocument convention).
+ */
+export function deleteProject(
+  id: string,
+  opts: { force?: boolean } = {},
+): boolean {
+  const db = getDb();
+  if (!opts.force) {
+    const active = (db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM sessions
+         WHERE project_id = ? AND summary IS NULL AND ended_at IS NULL`,
+      )
+      .get(id) as { n: number }).n;
+    if (active > 0) {
+      throw new Error(
+        `Project has ${active} active session(s); end them first or pass force=true`,
+      );
+    }
+  }
+  const result = db.prepare('DELETE FROM projects WHERE id = ?').run(id);
+  return result.changes > 0;
 }
 
 // ============================================================

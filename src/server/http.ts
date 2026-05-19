@@ -123,6 +123,37 @@ export function createApp() {
     return c.json({ ...project, stats: domain.getProjectStats(id) });
   });
 
+  // Sprint 28 (pax6) — pre-flight summary the UI / CLI calls before showing
+  // the destructive confirm. Returns 404 if the project is already gone so
+  // the client can recover (e.g. close the modal + refetch the list).
+  app.get('/api/projects/:id/deletion-impact', (c) => {
+    const id = c.req.param('id');
+    if (!domain.getProject(id)) {
+      return c.json({ error: `Project not found: ${id}` }, 404);
+    }
+    return c.json(domain.getProjectDeletionImpact(id));
+  });
+
+  // Sprint 28 (pax6) — hard delete + cascade. `?force=true` bypasses the
+  // active-session guard; the server still does the guard check first so
+  // a client that forgets the param can't accidentally delete in-progress
+  // sessions. 409 surfaces the guard failure so the UI can show the
+  // "활성 세션이 있습니다" branch.
+  app.delete('/api/projects/:id', (c) => {
+    const id = c.req.param('id');
+    if (!domain.getProject(id)) {
+      return c.json({ error: `Project not found: ${id}` }, 404);
+    }
+    const force = c.req.query('force') === 'true';
+    try {
+      const removed = domain.deleteProject(id, { force });
+      if (!removed) return c.json({ error: `Project not found: ${id}` }, 404);
+      return c.json({ ok: true });
+    } catch (e) {
+      return c.json({ error: (e as Error).message }, 409);
+    }
+  });
+
   // Sprint 20 (u3zu): aggregate "Project Overview" — first screen when
   // entering a project. See domain.getProjectOverview / types.ProjectOverview.
   // Follows the same single-endpoint pattern as Sprint 15's workspace view.
