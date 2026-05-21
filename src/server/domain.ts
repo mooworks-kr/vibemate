@@ -1334,6 +1334,13 @@ export function endSession(args: {
    *  import-history-derived sessions).
    */
   notes?: string;
+  /** Sprint 30 (wkq6, ADR-0027): pre-derived working-tree changes. When
+   *  set, we skip the server-side `git status --porcelain` and record
+   *  these rows verbatim. Used by remote-mode MCP — the daemon can't see
+   *  the laptop's working tree, so the laptop wrapper runs deriveSessionFiles
+   *  locally and passes the result. Local-mode callers omit this and let
+   *  the daemon derive (current Sprint 21 behavior). */
+  files?: Array<{ path: string; edit_type: EditType }>;
 }): { ok: true; files_touched: string[] } {
   const db = getDb();
   const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(args.sessionId) as any;
@@ -1356,17 +1363,25 @@ export function endSession(args: {
   );
 
   // Sprint 21 (ADR-0019): derive working-tree changes at end-of-session.
-  // The project's root_path is the cwd for the git invocation. Any rows
-  // already in session_files (e.g. legacy data from the watcher era, or
-  // from `pm import-history`) are preserved — `recordSessionFile` is
-  // idempotent and keeps the stronger edit_type rank.
-  const project = db
-    .prepare('SELECT root_path FROM projects WHERE id = ?')
-    .get(session.project_id) as { root_path: string } | undefined;
-  if (project) {
-    const derived = deriveSessionFiles(project.root_path);
-    for (const f of derived) {
+  // Sprint 30 (ADR-0027): when the caller supplied `files` (remote-mode
+  // MCP, where the daemon can't see the laptop's tree), skip the local
+  // derive and record those rows directly. Either way, existing rows
+  // (e.g. legacy data from the watcher era or `pm import-history`) are
+  // preserved — `recordSessionFile` is idempotent and keeps the stronger
+  // edit_type rank.
+  if (args.files !== undefined) {
+    for (const f of args.files) {
       recordSessionFile(args.sessionId, f.path, f.edit_type);
+    }
+  } else {
+    const project = db
+      .prepare('SELECT root_path FROM projects WHERE id = ?')
+      .get(session.project_id) as { root_path: string } | undefined;
+    if (project) {
+      const derived = deriveSessionFiles(project.root_path);
+      for (const f of derived) {
+        recordSessionFile(args.sessionId, f.path, f.edit_type);
+      }
     }
   }
 

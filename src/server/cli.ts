@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { exec } from 'node:child_process';
@@ -15,6 +16,7 @@ import {
   PID_FILE,
 } from './daemon.js';
 import { startMcpServer } from './mcp.js';
+import { loadConfig, saveConfig, getConfigPath } from './config.js';
 
 const program = new Command();
 program
@@ -212,7 +214,15 @@ program
   .description('MCP 서버 시작 (Claude Code가 호출)')
   .option('--project <id>', '명시적 프로젝트 ID')
   .action(async (opts) => {
-    getDb();
+    // Sprint 30 (wkq6 / ADR-0027): remote mode (config.remote.url set)
+    // proxies everything to a remote daemon — no local SQLite needed.
+    // Skipping getDb() avoids creating an empty ~/.vibemate/db.sqlite on
+    // a laptop that's purely a client. Local mode still gets the DB so
+    // domain.ts queries work.
+    const config = loadConfig();
+    if (config.remote.url == null) {
+      getDb();
+    }
     await startMcpServer({ projectId: opts.project });
   });
 
@@ -251,6 +261,132 @@ featureCmd
       const progressStr = total > 0 ? ` [${done}/${total} · ${progress}%]` : '';
       console.log(`  ${statusIcon} ${f.name}${progressStr}`);
       if (f.goal) console.log(`     ${f.goal}`);
+    }
+  });
+
+// ----------------------------------------------------------------
+// pm token | pm server | pm remote — Sprint 30 (wkq6, ADR-0027).
+// Manage ~/.vibemate/config.json. None of these touch the DB.
+// ----------------------------------------------------------------
+
+const tokenCmd = program.command('token').description('인증 토큰 관리 (서버 측)');
+
+tokenCmd
+  .command('create')
+  .description('새 토큰 발급 → config.server.token 저장')
+  .action(() => {
+    // 32 bytes hex = 64-char string. Plenty of entropy for a single-user
+    // Bearer token; we don't need a database row per token in Phase 1.
+    const token = crypto.randomBytes(32).toString('hex');
+    saveConfig({ server: { token } });
+    console.log('✓ 새 토큰을 발급했습니다.');
+    console.log(`  ${token}`);
+    console.log('');
+    console.log('이 토큰을 클라이언트(laptop)에 복사하세요:');
+    console.log(`  pm remote login <url> ${token}`);
+    console.log('');
+    console.log('데몬이 실행 중이면 `pm restart` 로 새 토큰을 적용하세요.');
+  });
+
+tokenCmd
+  .command('show')
+  .description('현재 저장된 토큰 출력')
+  .action(() => {
+    const cfg = loadConfig();
+    if (!cfg.server.token) {
+      console.log('토큰이 설정되어 있지 않습니다. (인증 비활성)');
+      console.log('발급하려면: pm token create');
+      return;
+    }
+    console.log(cfg.server.token);
+  });
+
+tokenCmd
+  .command('clear')
+  .description('토큰 제거 → 인증 비활성')
+  .action(() => {
+    saveConfig({ server: { token: null } });
+    console.log('✓ 토큰을 제거했습니다. (인증 비활성)');
+    console.log('데몬이 실행 중이면 `pm restart` 로 적용하세요.');
+  });
+
+const serverCmd = program.command('server').description('서버 측 설정');
+
+serverCmd
+  .command('bind <host>')
+  .description('데몬 bind 주소 변경 (기본 127.0.0.1, 외부 허용은 0.0.0.0)')
+  .action((host: string) => {
+    saveConfig({ server: { host } });
+    console.log(`✓ bind host 를 ${host} 로 변경했습니다.`);
+    if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
+      console.log('⚠ loopback 이 아닌 주소입니다. 인증 토큰(`pm token create`) 을 권장합니다.');
+    }
+    console.log('데몬이 실행 중이면 `pm restart` 로 적용하세요.');
+  });
+
+serverCmd
+  .command('show')
+  .description('현재 서버 설정 출력')
+  .action(() => {
+    const cfg = loadConfig();
+    console.log(`bind:  ${cfg.server.host}`);
+    console.log(`token: ${cfg.server.token ? '(설정됨)' : '(없음 — 인증 비활성)'}`);
+    console.log(`file:  ${getConfigPath()}`);
+  });
+
+const remoteCmd = program.command('remote').description('원격 데몬 클라이언트 설정 (laptop)');
+
+remoteCmd
+  .command('login <url> [token]')
+  .description('원격 데몬 URL/토큰 저장 (laptop 의 MCP 가 이 주소로 위임)')
+  .action((url: string, token?: string) => {
+    // Normalize: strip trailing slash so passthrough URL construction stays
+    // predictable ('${url}/api/mcp/${tool}' won't double-slash).
+    const normalized = url.replace(/\/$/, '');
+    saveConfig({ remote: { url: normalized, token: token ?? null } });
+    console.log(`✓ remote 설정 저장: ${normalized}`);
+    if (!token) {
+      console.log('⚠ 토큰 없이 저장되었습니다. 서버가 토큰을 요구하면 401 이 납니다.');
+    }
+    console.log('Claude Code 를 재시작하면 MCP 가 원격 모드로 동작합니다.');
+  });
+
+remoteCmd
+  .command('logout')
+  .description('remote 설정 제거 → MCP 가 로컬 모드로 복귀')
+  .action(() => {
+    saveConfig({ remote: { url: null, token: null } });
+    console.log('✓ remote 설정을 제거했습니다. (로컬 모드)');
+  });
+
+remoteCmd
+  .command('status')
+  .description('현재 remote 설정 + ping 결과 출력')
+  .action(async () => {
+    const cfg = loadConfig();
+    if (!cfg.remote.url) {
+      console.log('remote 설정 없음 — MCP 는 로컬 모드입니다.');
+      return;
+    }
+    console.log(`url:   ${cfg.remote.url}`);
+    console.log(`token: ${cfg.remote.token ? '(설정됨)' : '(없음)'}`);
+
+    // Ping `/api/status` so the user gets a clear up/down + auth signal.
+    // 200 = OK, 401 = token mismatch, anything else = unreachable.
+    const url = cfg.remote.url.replace(/\/$/, '') + '/api/status';
+    const headers: Record<string, string> = {};
+    if (cfg.remote.token) headers.Authorization = `Bearer ${cfg.remote.token}`;
+    try {
+      const res = await fetch(url, { headers });
+      if (res.status === 200) {
+        console.log('ping:  ✓ 200 OK');
+      } else if (res.status === 401) {
+        console.log('ping:  ✗ 401 Unauthorized — 토큰을 확인하세요');
+      } else {
+        console.log(`ping:  ⚠ HTTP ${res.status}`);
+      }
+    } catch (e) {
+      console.log(`ping:  ✗ 연결 실패 — ${(e as Error).message}`);
     }
   });
 

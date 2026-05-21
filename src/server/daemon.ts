@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultDataDir } from './lib.js';
 import { startHttpServer } from './http.js';
+import { loadConfig } from './config.js';
 
 // Sprint 21 (zxl3, ADR-0019): chokidar file watcher retired. The daemon's
 // sole job is now the HTTP server + PID-file housekeeping. `session_files`
@@ -37,7 +38,15 @@ export async function startDaemon(port: number = 7321): Promise<void> {
 
   fs.writeFileSync(PID_FILE, String(process.pid));
 
-  startHttpServer(port);
+  // Sprint 30 (wkq6 / ADR-0027): pull bind host + auth token from
+  // ~/.vibemate/config.json. Defaults (127.0.0.1, no token) preserve the
+  // pre-Sprint-30 behavior for users who never touch the file.
+  const config = loadConfig();
+  startHttpServer({
+    port,
+    hostname: config.server.host,
+    authToken: config.server.token,
+  });
 
   const cleanup = (): void => {
     console.log('[vibemate] shutting down…');

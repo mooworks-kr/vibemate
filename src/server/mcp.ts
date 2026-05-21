@@ -2,18 +2,100 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import * as domain from './domain.js';
+import { loadConfig } from './config.js';
+import type { EditType } from './types.js';
 
 /**
  * MCP server. Spawned by Claude Code via stdio.
- * Project context is resolved by matching CWD against registered projects.
+ *
+ * Two modes (Sprint 30 / wkq6 / ADR-0027):
+ *   * **local** — handlers call `domain.*` directly against the local DB.
+ *     This is the original behavior.
+ *   * **remote** — handlers forward to `config.remote.url` via the
+ *     `POST /api/mcp/:tool` passthrough endpoint, so a laptop session can
+ *     read/write the home daemon's DB. Activated when `config.remote.url`
+ *     is set. `pm_session_end` gets a small local pre-derive (git status)
+ *     so the daemon still records the right working-tree changes.
+ *
+ * Tools are built into a `Record<name, { schema, handler }>` map (see
+ * `buildToolHandlers`) so:
+ *   1. The MCP SDK iterator registers them all via `server.tool` in one loop
+ *   2. The HTTP passthrough route reuses the same map for `/api/mcp/:tool`
+ * Adding a new tool only requires touching the registry — passthrough is
+ * automatic.
  */
-export async function startMcpServer(opts: { projectId?: string }): Promise<void> {
-  const server = new McpServer({
-    name: 'vibemate',
-    version: '0.1.0',
-  });
 
-  // Helper: resolve current project. Prefer explicit arg, fall back to CWD match.
+// ============================================================
+// Tool types + registry
+// ============================================================
+
+/** MCP SDK response shape. Multiple content items allowed (text + JSON
+ *  side-channel for tools like pm_list_workspace_features).
+ *  Open index signature matches the SDK's loose-extra-fields contract — without
+ *  it, `server.tool(name, schema, handler)` would reject our handlers. */
+export interface McpResult {
+  content: Array<{ type: 'text'; text: string }>;
+  isError?: boolean;
+  [k: string]: unknown;
+}
+
+export type ToolHandler = (args: any) => Promise<McpResult>;
+
+export interface ToolDef {
+  /** zod raw shape — passed to `server.tool` and used by the HTTP
+   *  passthrough route to parse incoming JSON bodies. */
+  schema: z.ZodRawShape;
+  handler: ToolHandler;
+}
+
+export type ToolRegistry = Record<string, ToolDef>;
+
+// ============================================================
+// Shared shapes (reused across multiple tools)
+// ============================================================
+
+const DOCUMENT_KIND_ENUM = z.enum([
+  'prd', 'planning', 'architecture', 'retro', 'feature_spec', 'other',
+]);
+
+const EDIT_TYPE_ENUM = z.enum(['created', 'modified', 'read']);
+
+// ============================================================
+// Helpers
+// ============================================================
+
+function okResult(data: unknown): McpResult {
+  return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+}
+
+function textResult(text: string): McpResult {
+  return { content: [{ type: 'text', text }] };
+}
+
+// Sprint 22 (3wtr) — HTML-entity decoder for `pm_search`. The HTTP search
+// response is HTML-escaped + wrapped in literal `<mark>` tags for the web
+// UI; the LLM consumer wants real angle brackets in user content while
+// keeping the marker tags intact so it can see what matched.
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+// ============================================================
+// Local-mode tool registry (handlers hit domain.* directly)
+// ============================================================
+
+export interface BuildToolsOpts {
+  /** Default project_id used when a tool's `project_id` arg is omitted.
+   *  Falls back to CWD match (`domain.getProjectByRoot`). */
+  projectId?: string;
+}
+
+export function buildToolHandlers(opts: BuildToolsOpts = {}): ToolRegistry {
   function resolveProject(explicit?: string): string {
     if (explicit) {
       const p = domain.getProject(explicit);
@@ -27,642 +109,567 @@ export async function startMcpServer(opts: { projectId?: string }): Promise<void
     return p.id;
   }
 
-  const ok = (data: unknown) => ({
-    content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-  });
+  return {
+    // ----- Session lifecycle -----
 
-  // ----- Session lifecycle -----
+    pm_session_start: {
+      schema: {
+        project_id: z.string().optional().describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+        feature_id: z.string().optional().describe('이 세션에서 작업할 기능 ID'),
+      },
+      handler: async ({ project_id, feature_id }) => {
+        const pid = resolveProject(project_id);
+        return okResult(domain.startSession({ projectId: pid, featureId: feature_id }));
+      },
+    },
 
-  server.tool(
-    'pm_session_start',
-    {
-      project_id: z.string().optional().describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
-      feature_id: z.string().optional().describe('이 세션에서 작업할 기능 ID'),
-    },
-    async ({ project_id, feature_id }) => {
-      const pid = resolveProject(project_id);
-      return ok(domain.startSession({ projectId: pid, featureId: feature_id }));
-    },
-  );
-
-  server.tool(
-    'pm_session_end',
-    {
-      session_id: z.string().describe('session_start에서 받은 ID'),
-      summary: z.string().describe('세션 한 줄 요약 (한국어 권장)'),
-      primary_feature_id: z.string().optional().describe('이 세션에서 주로 작업한 기능'),
-      // Sprint 23 (h5uk / ADR-0020): structured Markdown notes
-      // (`## 완료 / ## 남은 일 / ## 결정`). The first 200 chars become the
-      // next session's `last_session.notes_excerpt`. See claudeMdTemplate v4.
-      notes: z.string().optional().describe('구조화된 Markdown 메모 (## 완료 / ## 남은 일 / ## 결정). 다음 세션 시작 시 last_session.notes_excerpt 로 노출됨.'),
-    },
-    async ({ session_id, summary, primary_feature_id, notes }) => {
-      return ok(
-        domain.endSession({
+    pm_session_end: {
+      schema: {
+        session_id: z.string().describe('session_start에서 받은 ID'),
+        summary: z.string().describe('세션 한 줄 요약 (한국어 권장)'),
+        primary_feature_id: z.string().optional().describe('이 세션에서 주로 작업한 기능'),
+        // Sprint 23 (h5uk / ADR-0020).
+        notes: z.string().optional().describe('구조화된 Markdown 메모 (## 완료 / ## 남은 일 / ## 결정). 다음 세션 시작 시 last_session.notes_excerpt 로 노출됨.'),
+        // Sprint 30 (wkq6 / ADR-0027): explicit files override for
+        // remote-mode MCP. When the laptop wrapper supplies this, the
+        // daemon skips its own `git status` (which would see the wrong
+        // working tree). Local-mode callers usually omit it.
+        files: z.array(z.object({
+          path: z.string(),
+          edit_type: EDIT_TYPE_ENUM,
+        })).optional().describe('원격 모드에서 laptop 의 git status 결과. 생략 시 server-side derive.'),
+      },
+      handler: async ({ session_id, summary, primary_feature_id, notes, files }) => {
+        return okResult(domain.endSession({
           sessionId: session_id,
           summary,
           primaryFeatureId: primary_feature_id,
           notes,
-        }),
-      );
+          files,
+        }));
+      },
     },
-  );
 
-  server.tool(
-    'pm_set_active_feature',
-    {
-      session_id: z.string(),
-      feature_id: z.string(),
+    pm_set_active_feature: {
+      schema: {
+        session_id: z.string(),
+        feature_id: z.string(),
+      },
+      handler: async ({ session_id, feature_id }) => {
+        return okResult(domain.setActiveFeature(session_id, feature_id));
+      },
     },
-    // ADR-0017: response includes `feature` (FeatureContext) + `spec_md` so
-    // switching features mid-session hands Claude Code the same scope/non-scope
-    // payload it would have gotten from pm_get_context({feature_id}). Old
-    // callers that only checked `.ok` are unaffected — purely additive.
-    async ({ session_id, feature_id }) => {
-      return ok(domain.setActiveFeature(session_id, feature_id));
-    },
-  );
 
-  // ----- Context (called at session start) -----
+    // ----- Context -----
 
-  server.tool(
-    'pm_get_context',
-    {
-      project_id: z.string().optional(),
-      feature_id: z.string().optional(),
+    pm_get_context: {
+      schema: {
+        project_id: z.string().optional(),
+        feature_id: z.string().optional(),
+      },
+      handler: async ({ project_id, feature_id }) => {
+        const pid = resolveProject(project_id);
+        return okResult(domain.getContext(pid, undefined, feature_id));
+      },
     },
-    async ({ project_id, feature_id }) => {
-      const pid = resolveProject(project_id);
-      return ok(domain.getContext(pid, undefined, feature_id));
-    },
-  );
 
-  // Sprint 24 (ijze) — AI Context Pack. Builds the Markdown blob a user
-  // pastes into a fresh agent session. Kept separate from `pm_get_context`
-  // (which stays a lightweight session-start payload) because the brief is
-  // larger and on-demand; bundling it into every getContext call would
-  // bloat the always-on hot path.
-  server.tool(
-    'pm_get_context_brief',
-    {
-      feature_id: z.string().describe('Context Brief 를 생성할 feature ID'),
+    pm_get_context_brief: {
+      schema: {
+        feature_id: z.string().describe('Context Brief 를 생성할 feature ID'),
+      },
+      handler: async ({ feature_id }) => {
+        const brief = domain.getContextBrief(feature_id);
+        // Surface just the markdown blob — the user pastes that. Structured
+        // sections stay on the HTTP response for the UI.
+        return textResult(brief.markdown);
+      },
     },
-    async ({ feature_id }) => {
-      const brief = domain.getContextBrief(feature_id);
-      // Surface just the markdown blob to the model — that's the payload
-      // the user wants to copy/paste. Structured sections stay on the
-      // HTTP response for the UI.
-      return {
-        content: [{ type: 'text' as const, text: brief.markdown }],
-      };
-    },
-  );
 
-  // Sprint 23 (h5uk): single-session detail with files + prev/next nav.
-  // Lets Claude Code re-read a specific session's structured notes (per
-  // claudeMdTemplate v4 — `## 완료 / ## 남은 일 / ## 결정`) on demand.
-  server.tool(
-    'pm_get_session_detail',
-    {
-      session_id: z.string(),
+    pm_get_session_detail: {
+      schema: { session_id: z.string() },
+      handler: async ({ session_id }) => okResult(domain.getSessionDetail(session_id)),
     },
-    async ({ session_id }) => {
-      return ok(domain.getSessionDetail(session_id));
-    },
-  );
 
-  // Sprint 20 (u3zu): same payload as `GET /api/projects/:id/overview`.
-  // Sibling to pm_get_context: getContext is the *session-time* view
-  // (active feature + spec_md for Claude Code to read), Overview is the
-  // *cross-feature* view (status / recent activity, for human review).
-  server.tool(
-    'pm_get_project_overview',
-    {
-      project_id: z.string().optional(),
+    pm_get_project_overview: {
+      schema: { project_id: z.string().optional() },
+      handler: async ({ project_id }) => {
+        const pid = resolveProject(project_id);
+        return okResult(domain.getProjectOverview(pid));
+      },
     },
-    async ({ project_id }) => {
-      const pid = resolveProject(project_id);
-      return ok(domain.getProjectOverview(pid));
-    },
-  );
 
-  // ----- Features -----
+    // ----- Features -----
 
-  server.tool(
-    'pm_create_feature',
-    {
-      project_id: z.string().optional(),
-      name: z.string().describe('기능 이름. 한국어 OK'),
-      goal: z.string().optional().describe('1-2줄 목표 요약'),
-      spec_md: z.string().optional().describe('전체 스펙 마크다운'),
-      // Mirror HTTP createFeatureSchema — let callers create a feature
-      // already in_progress / done without a follow-up update_feature call.
-      status: z.enum(['todo', 'in_progress', 'done', 'archived']).optional()
-        .describe('초기 상태. 미지정 시 todo'),
+    pm_create_feature: {
+      schema: {
+        project_id: z.string().optional(),
+        name: z.string().describe('기능 이름. 한국어 OK'),
+        goal: z.string().optional().describe('1-2줄 목표 요약'),
+        spec_md: z.string().optional().describe('전체 스펙 마크다운'),
+        status: z.enum(['todo', 'in_progress', 'done', 'archived']).optional()
+          .describe('초기 상태. 미지정 시 todo'),
+      },
+      handler: async ({ project_id, name, goal, spec_md, status }) => {
+        const pid = resolveProject(project_id);
+        const f = domain.createFeature({ projectId: pid, name, goal, spec_md, status });
+        return okResult({ feature_id: f.id, name: f.name });
+      },
     },
-    async ({ project_id, name, goal, spec_md, status }) => {
-      const pid = resolveProject(project_id);
-      const f = domain.createFeature({ projectId: pid, name, goal, spec_md, status });
-      return ok({ feature_id: f.id, name: f.name });
-    },
-  );
 
-  server.tool(
-    'pm_update_feature',
-    {
-      feature_id: z.string(),
-      name: z.string().optional(),
-      goal: z.string().optional(),
-      spec_md: z.string().optional(),
-      status: z.enum(['todo', 'in_progress', 'done', 'archived']).optional(),
-      priority: z.number().optional(),
+    pm_update_feature: {
+      schema: {
+        feature_id: z.string(),
+        name: z.string().optional(),
+        goal: z.string().optional(),
+        spec_md: z.string().optional(),
+        status: z.enum(['todo', 'in_progress', 'done', 'archived']).optional(),
+        priority: z.number().optional(),
+      },
+      handler: async ({ feature_id, ...patch }) => {
+        const updated = domain.updateFeature(feature_id, patch);
+        if (!updated) throw new Error(`Feature not found: ${feature_id}`);
+        return okResult({ ok: true, feature: updated });
+      },
     },
-    async ({ feature_id, ...patch }) => {
-      const updated = domain.updateFeature(feature_id, patch);
-      if (!updated) throw new Error(`Feature not found: ${feature_id}`);
-      return ok({ ok: true, feature: updated });
-    },
-  );
 
-  // ----- Tasks -----
+    // ----- Tasks -----
 
-  server.tool(
-    'pm_add_task',
-    {
-      feature_id: z.string(),
-      name: z.string(),
+    pm_add_task: {
+      schema: { feature_id: z.string(), name: z.string() },
+      handler: async ({ feature_id, name }) => {
+        const t = domain.addTask(feature_id, name);
+        return okResult({ task_id: t.id, name: t.name });
+      },
     },
-    async ({ feature_id, name }) => {
-      const t = domain.addTask(feature_id, name);
-      return ok({ task_id: t.id, name: t.name });
-    },
-  );
 
-  server.tool(
-    'pm_update_task',
-    {
-      task_id: z.number(),
-      name: z.string().optional(),
-      status: z.enum(['todo', 'in_progress', 'done']).optional(),
-      notes: z.string().optional(),
-      // Mirror HTTP updateTaskSchema. Domain's updateTask already accepts
-      // `position` — this just exposes it through MCP.
-      position: z.number().optional().describe('정렬 순서 (낮을수록 위)'),
+    pm_update_task: {
+      schema: {
+        task_id: z.number(),
+        name: z.string().optional(),
+        status: z.enum(['todo', 'in_progress', 'done']).optional(),
+        notes: z.string().optional(),
+        position: z.number().optional().describe('정렬 순서 (낮을수록 위)'),
+      },
+      handler: async ({ task_id, ...patch }) => {
+        const updated = domain.updateTask(task_id, patch);
+        if (!updated) throw new Error(`Task not found: ${task_id}`);
+        return okResult({ ok: true, task: updated });
+      },
     },
-    async ({ task_id, ...patch }) => {
-      const updated = domain.updateTask(task_id, patch);
-      if (!updated) throw new Error(`Task not found: ${task_id}`);
-      return ok({ ok: true, task: updated });
-    },
-  );
 
-  server.tool(
-    'pm_delete_task',
-    {
-      task_id: z.number(),
+    pm_delete_task: {
+      schema: { task_id: z.number() },
+      handler: async ({ task_id }) => {
+        const removed = domain.deleteTask(task_id);
+        if (!removed) throw new Error(`Task not found: ${task_id}`);
+        return okResult({ ok: true });
+      },
     },
-    async ({ task_id }) => {
-      const removed = domain.deleteTask(task_id);
-      if (!removed) throw new Error(`Task not found: ${task_id}`);
-      return ok({ ok: true });
-    },
-  );
 
-  // ----- Decisions (ADRs) -----
+    // ----- Decisions (ADRs) -----
 
-  server.tool(
-    'pm_log_decision',
-    {
-      project_id: z.string().optional(),
-      feature_id: z.string().optional(),
-      title: z.string().describe('결정 한 줄 제목'),
-      // All ADR body fields optional — matches the HTTP schema (line ~50 of
-      // http.ts). A one-line ADR (just `title`) is a valid use case: capture
-      // the decision now, fill in detail later via update.
-      context: z.string().optional().describe('왜 이 결정이 필요했는지'),
-      decision: z.string().optional().describe('어떻게 결정했는지'),
-      alternatives: z.string().optional().describe('고려한 대안들'),
-      consequences: z.string().optional().describe('이 결정의 영향'),
+    pm_log_decision: {
+      schema: {
+        project_id: z.string().optional(),
+        feature_id: z.string().optional(),
+        title: z.string().describe('결정 한 줄 제목'),
+        context: z.string().optional().describe('왜 이 결정이 필요했는지'),
+        decision: z.string().optional().describe('어떻게 결정했는지'),
+        alternatives: z.string().optional().describe('고려한 대안들'),
+        consequences: z.string().optional().describe('이 결정의 영향'),
+      },
+      handler: async ({ project_id, feature_id, title, context, decision, alternatives, consequences }) => {
+        const pid = resolveProject(project_id);
+        const adr = domain.logDecision({
+          projectId: pid,
+          featureId: feature_id,
+          title,
+          context,
+          decision,
+          alternatives,
+          consequences,
+        });
+        return okResult({ adr_id: adr.id, title: adr.title });
+      },
     },
-    async ({ project_id, feature_id, title, context, decision, alternatives, consequences }) => {
-      const pid = resolveProject(project_id);
-      const adr = domain.logDecision({
-        projectId: pid,
-        featureId: feature_id,
-        title,
-        context,
-        decision,
-        alternatives,
-        consequences,
-      });
-      return ok({ adr_id: adr.id, title: adr.title });
-    },
-  );
 
-  server.tool(
-    'pm_update_decision',
-    {
-      decision_id: z.string(),
-      title: z.string().optional(),
-      context: z.string().optional(),
-      decision: z.string().optional(),
-      alternatives: z.string().optional(),
-      consequences: z.string().optional(),
-      feature_id: z.string().nullable().optional(),
+    pm_update_decision: {
+      schema: {
+        decision_id: z.string(),
+        title: z.string().optional(),
+        context: z.string().optional(),
+        decision: z.string().optional(),
+        alternatives: z.string().optional(),
+        consequences: z.string().optional(),
+        feature_id: z.string().nullable().optional(),
+      },
+      handler: async ({ decision_id, ...patch }) => {
+        const updated = domain.updateDecision(decision_id, patch);
+        if (!updated) throw new Error(`Decision not found: ${decision_id}`);
+        return okResult({ ok: true, decision: updated });
+      },
     },
-    async ({ decision_id, ...patch }) => {
-      const updated = domain.updateDecision(decision_id, patch);
-      if (!updated) throw new Error(`Decision not found: ${decision_id}`);
-      return ok({ ok: true, decision: updated });
+
+    pm_delete_decision: {
+      schema: { decision_id: z.string() },
+      handler: async ({ decision_id }) => {
+        const removed = domain.deleteDecision(decision_id);
+        if (!removed) throw new Error(`Decision not found: ${decision_id}`);
+        return okResult({ ok: true });
+      },
     },
-  );
 
-  server.tool(
-    'pm_delete_decision',
-    {
-      decision_id: z.string(),
+    // ----- Project deletion (Sprint 28, pax6) -----
+
+    pm_get_deletion_impact: {
+      schema: {
+        project_id: z.string().optional().describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+      },
+      handler: async ({ project_id }) => {
+        const pid = resolveProject(project_id);
+        return okResult(domain.getProjectDeletionImpact(pid));
+      },
     },
-    async ({ decision_id }) => {
-      const removed = domain.deleteDecision(decision_id);
-      if (!removed) throw new Error(`Decision not found: ${decision_id}`);
-      return ok({ ok: true });
+
+    pm_delete_project: {
+      schema: {
+        project_id: z.string().optional()
+          .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+        force: z.boolean().optional()
+          .describe('true면 활성 세션이 있어도 강제 삭제. 기본 false'),
+      },
+      handler: async ({ project_id, force }) => {
+        const pid = resolveProject(project_id);
+        const removed = domain.deleteProject(pid, { force });
+        if (!removed) throw new Error(`Project not found: ${pid}`);
+        return okResult({ ok: true, project_id: pid });
+      },
     },
-  );
 
-  // ----- Project deletion (Sprint 28, pax6) -----
+    // ----- File linking -----
 
-  // Pre-flight summary. Counterpart of GET /api/projects/:id/deletion-impact —
-  // returns the child-row counts so the agent can show "이 프로젝트를 지우면
-  // features N개, sessions M개 ... 가 함께 삭제됩니다" before calling
-  // `pm_delete_project`. Resolves CWD when project_id is omitted to mirror
-  // the rest of the MCP surface.
-  server.tool(
-    'pm_get_deletion_impact',
-    {
-      project_id: z.string().optional()
-        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+    pm_link_file: {
+      schema: {
+        feature_id: z.string(),
+        file_path: z.string().describe('프로젝트 root 기준 상대 경로'),
+        description: z.string().optional(),
+      },
+      handler: async ({ feature_id, file_path, description }) => {
+        const link = domain.linkFile({ featureId: feature_id, filePath: file_path, description });
+        return okResult({ ok: true, link });
+      },
     },
-    async ({ project_id }) => {
-      const pid = resolveProject(project_id);
-      return ok(domain.getProjectDeletionImpact(pid));
+
+    pm_unlink_file: {
+      schema: { feature_id: z.string(), file_path: z.string() },
+      handler: async ({ feature_id, file_path }) => {
+        domain.unlinkFile(feature_id, file_path);
+        return okResult({ ok: true });
+      },
     },
-  );
 
-  // Hard delete + cascade. force=false (default) blocks when an active
-  // session (summary IS NULL AND ended_at IS NULL) is still attached;
-  // force=true is the escape hatch. Errors surface as MCP tool errors so
-  // Claude Code can relay the message back to the user verbatim.
-  server.tool(
-    'pm_delete_project',
-    {
-      project_id: z.string().optional()
-        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
-      force: z.boolean().optional()
-        .describe('true면 활성 세션이 있어도 강제 삭제. 기본 false'),
-    },
-    async ({ project_id, force }) => {
-      const pid = resolveProject(project_id);
-      const removed = domain.deleteProject(pid, { force });
-      if (!removed) throw new Error(`Project not found: ${pid}`);
-      return ok({ ok: true, project_id: pid });
-    },
-  );
+    // ----- Workspace -----
 
-  // ----- File linking (manual override) -----
-
-  server.tool(
-    'pm_link_file',
-    {
-      feature_id: z.string(),
-      file_path: z.string().describe('프로젝트 root 기준 상대 경로'),
-      description: z.string().optional(),
-    },
-    async ({ feature_id, file_path, description }) => {
-      const link = domain.linkFile({ featureId: feature_id, filePath: file_path, description });
-      return ok({ ok: true, link });
-    },
-  );
-
-  server.tool(
-    'pm_unlink_file',
-    {
-      feature_id: z.string(),
-      file_path: z.string(),
-    },
-    async ({ feature_id, file_path }) => {
-      domain.unlinkFile(feature_id, file_path);
-      return ok({ ok: true });
-    },
-  );
-
-  // (Removed in ADR-0016: pm_get_file_content / pm_save_file_explanation /
-  // pm_clear_file_explanation lived here. Code Map feature retired.)
-
-  // ----- Workspace (cross-project active-features view) -----
-
-  server.tool(
-    'pm_list_workspace_features',
-    {
-      statuses: z.array(z.enum(['todo', 'in_progress', 'done', 'archived'])).optional()
-        .describe("포함할 feature status. 기본 ['in_progress']."),
-      limit: z.number().optional()
-        .describe('최대 결과 수 (기본 50, 최대 200)'),
-    },
-    async ({ statuses, limit }) => {
-      const rows = domain.listWorkspaceFeatures({ statuses, limit });
-      if (rows.length === 0) {
-        return {
-          content: [{ type: 'text' as const, text: '진행 중인 기능이 없습니다.' }],
-        };
-      }
-      const formatted = rows
-        .map((r) => {
-          const when = r.last_activity_at
-            ? new Date(r.last_activity_at).toISOString()
-            : '활동 없음';
-          return `[${r.project_name}] ${r.feature_name}  (${r.tasks_done}/${r.tasks_todo + r.tasks_done} · ${r.progress}% · ${when})`;
-        })
-        .join('\n');
-      return {
-        content: [
-          { type: 'text' as const, text: `${rows.length}건:\n\n${formatted}` },
-          { type: 'text' as const, text: JSON.stringify(rows, null, 2) },
-        ],
-      };
-    },
-  );
-
-  // ----- Conventional-commit feature extraction -----
-
-  server.tool(
-    'pm_extract_features_from_commits',
-    {
-      project_id: z.string().optional()
-        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
-      types: z.array(z.string()).optional()
-        .describe('추출할 commit type 화이트리스트 (conventional 모드, 기본: feat/fix/docs/style/refactor/test/chore/perf/build/ci/revert)'),
-      min_count: z.number().optional()
-        .describe('그룹당 최소 commit 수 (기본 2)'),
-      include_untyped: z.boolean().optional()
-        .describe('scope 없는 commit도 type 단위로 묶기 (conventional 모드, 기본 false)'),
-      pattern: z.string().optional()
-        .describe('사용자 정의 regex (group 1 또는 named <scope>로 scope 캡처). 지정 시 conventional 모드 무시.'),
-      pattern_type: z.string().optional()
-        .describe("사용자 정의 모드의 signature prefix. 기본 'custom'"),
-      dry_run: z.boolean().optional()
-        .describe('true면 카운트만 반환, INSERT 없음. 기본 false'),
-    },
-    async ({ project_id, types, min_count, include_untyped, pattern, pattern_type, dry_run }) => {
-      const pid = resolveProject(project_id);
-      const result = domain.extractFeaturesFromCommits(pid, {
-        allowTypes: types,
-        minCount: min_count,
-        includeUntyped: include_untyped,
-        customPattern: pattern,
-        customPatternType: pattern_type,
-        dryRun: dry_run,
-      });
-
-      const qualifying = result.groups.filter((g) => g.outcome !== 'under-threshold');
-      const headline = dry_run
-        ? `${qualifying.length}개 그룹 자격 (dry-run, DB 변경 없음)`
-        : `신규 ${result.created} / 합치기 ${result.merged} / 스킵 ${result.skipped} / 백필 ${result.sessionsBackfilled} sessions`;
-
-      const lines = [headline];
-      for (const g of qualifying.slice(0, 20)) {
-        const tag = g.outcome === 'created' ? '+'
-          : g.outcome === 'merged' ? '~'
-          : g.outcome === 'skipped' ? '·'
-          : g.outcome === 'dry-run' ? '?'
-          : ' ';
-        lines.push(`  ${tag} ${g.signature}  (${g.commitCount}건${g.featureId ? ` → ${g.featureId}` : ''})`);
-      }
-      if (qualifying.length > 20) lines.push(`  … +${qualifying.length - 20}개`);
-
-      return {
-        content: [
-          { type: 'text' as const, text: lines.join('\n') },
-          { type: 'text' as const, text: JSON.stringify(result, null, 2) },
-        ],
-      };
-    },
-  );
-
-  // ----- Git history import -----
-
-  server.tool(
-    'pm_import_git_history',
-    {
-      project_id: z.string().optional()
-        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
-      since: z.string().optional()
-        .describe("git --since 값 (ISO 날짜 또는 'N weeks ago'). 미지정 시 전체 history"),
-      limit: z.number().optional()
-        .describe('최대 커밋 수 (기본 1000). 큰 repo 보호용 cap'),
-      dry_run: z.boolean().optional()
-        .describe('true면 신규/스킵 카운트만 반환, 실제 INSERT 안 함. 기본 false'),
-    },
-    async ({ project_id, since, limit, dry_run }) => {
-      const pid = resolveProject(project_id);
-      const result = await domain.importGitHistory(pid, {
-        since,
-        limit,
-        dryRun: dry_run,
-      });
-      // Compose a short human-readable summary alongside the structured
-      // counts. Claude Code reads the text; the JSON is for any caller that
-      // wants to programmatically chain on it.
-      const lines = [
-        `총 ${result.total}건 / 신규 ${result.newCount}건 / 스킵 ${result.skippedCount}건` +
-          (dry_run ? ' (dry-run, DB 변경 없음)' : ''),
-      ];
-      if (result.errors.length > 0) {
-        lines.push(`실패 ${result.errors.length}건:`);
-        for (const e of result.errors.slice(0, 5)) {
-          lines.push(`  ${e.hash.slice(0, 8)}: ${e.reason}`);
-        }
-        if (result.errors.length > 5) lines.push(`  … +${result.errors.length - 5}건`);
-      }
-      return {
-        content: [
-          { type: 'text' as const, text: lines.join('\n') },
-          { type: 'text' as const, text: JSON.stringify(result, null, 2) },
-        ],
-      };
-    },
-  );
-
-  // (Removed in ADR-0016: pm_list_files_needing_explanation. Code Map retired.)
-
-  // ----- Documents (Sprint 22, 3wtr — Spec Hub) -----
-
-  const DOCUMENT_KIND_ENUM = z.enum([
-    'prd', 'planning', 'architecture', 'retro', 'feature_spec', 'other',
-  ]);
-
-  server.tool(
-    'pm_create_document',
-    {
-      project_id: z.string().optional().describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
-      kind: DOCUMENT_KIND_ENUM.describe('문서 종류 (prd / planning / architecture / retro / feature_spec / other)'),
-      title: z.string().describe('문서 제목'),
-      content_md: z.string().optional().describe('Markdown 본문'),
-      feature_id: z.string().optional().describe('지정 시 생성 직후 해당 feature 와 link'),
-    },
-    async ({ project_id, kind, title, content_md, feature_id }) => {
-      const pid = resolveProject(project_id);
-      const doc = domain.createDocument({ projectId: pid, kind, title, content_md });
-      if (feature_id) {
-        domain.linkDocumentToFeature(doc.id, feature_id);
-      }
-      return ok({ document_id: doc.id, title: doc.title, kind: doc.kind });
-    },
-  );
-
-  server.tool(
-    'pm_update_document',
-    {
-      document_id: z.string(),
-      kind: DOCUMENT_KIND_ENUM.optional(),
-      title: z.string().optional(),
-      content_md: z.string().optional(),
-    },
-    async ({ document_id, ...patch }) => {
-      const updated = domain.updateDocument(document_id, patch);
-      if (!updated) throw new Error(`Document not found: ${document_id}`);
-      return ok({ ok: true, document: updated });
-    },
-  );
-
-  server.tool(
-    'pm_delete_document',
-    {
-      document_id: z.string(),
-    },
-    async ({ document_id }) => {
-      const removed = domain.deleteDocument(document_id);
-      if (!removed) throw new Error(`Document not found: ${document_id}`);
-      return ok({ ok: true });
-    },
-  );
-
-  server.tool(
-    'pm_list_documents',
-    {
-      project_id: z.string().optional(),
-      kind: DOCUMENT_KIND_ENUM.optional().describe('지정 시 해당 종류만'),
-      feature_id: z.string().optional().describe('지정 시 그 feature 에 linked 된 문서만 반환'),
-      limit: z.number().optional().describe('기본 100, 최대 500'),
-    },
-    async ({ project_id, kind, feature_id, limit }) => {
-      // `feature_id` is the more specific filter — when present, walk the
-      // junction table directly and ignore the kind/limit narrow (the result
-      // is already bounded by how many features the user manually linked).
-      if (feature_id) {
-        return ok(domain.listDocumentsForFeature(feature_id));
-      }
-      const pid = resolveProject(project_id);
-      return ok(domain.listDocuments(pid, { kind, limit }));
-    },
-  );
-
-  server.tool(
-    'pm_link_document_to_feature',
-    {
-      document_id: z.string(),
-      feature_id: z.string(),
-    },
-    async ({ document_id, feature_id }) => {
-      domain.linkDocumentToFeature(document_id, feature_id);
-      return ok({ ok: true });
-    },
-  );
-
-  server.tool(
-    'pm_unlink_document_from_feature',
-    {
-      document_id: z.string(),
-      feature_id: z.string(),
-    },
-    async ({ document_id, feature_id }) => {
-      const removed = domain.unlinkDocumentFromFeature(document_id, feature_id);
-      return ok({ ok: removed });
-    },
-  );
-
-  // ----- Search (FTS5 across features/decisions/sessions/files) -----
-
-  // The HTTP search response is HTML-escaped (`&lt;` etc.) plus literal
-  // `<mark>...</mark>` highlighting tags. For an LLM consumer we want the
-  // opposite: real angle brackets in user content, while keeping the marker
-  // tags intact so the model can see what matched. Decoding the few common
-  // entities in place is good enough — Claude reads the result, not a browser.
-  const decodeEntities = (s: string): string =>
-    s
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&amp;/g, '&');
-
-  const KIND_LABEL_MCP: Record<string, string> = {
-    feature: 'feature',
-    decision: 'decision',
-    document: 'document',
-    session: 'session',
-    file: 'file',
-  };
-
-  server.tool(
-    'pm_search',
-    {
-      project_id: z
-        .string()
-        .optional()
-        .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
-      query: z.string().describe('검색어 (한국어/영문 모두 지원, prefix 매칭)'),
-      limit: z
-        .number()
-        .optional()
-        .describe('최대 결과 수 (기본 20, 최대 100). 도메인에서 자동 clamp'),
-    },
-    async ({ project_id, query, limit }) => {
-      const pid = resolveProject(project_id);
-      const results = domain.searchProject(pid, query, limit ?? 20);
-
-      if (results.length === 0) {
+    pm_list_workspace_features: {
+      schema: {
+        statuses: z.array(z.enum(['todo', 'in_progress', 'done', 'archived'])).optional()
+          .describe("포함할 feature status. 기본 ['in_progress']."),
+        limit: z.number().optional().describe('최대 결과 수 (기본 50, 최대 200)'),
+      },
+      handler: async ({ statuses, limit }) => {
+        const rows = domain.listWorkspaceFeatures({ statuses, limit });
+        if (rows.length === 0) return textResult('진행 중인 기능이 없습니다.');
+        const formatted = rows
+          .map((r) => {
+            const when = r.last_activity_at
+              ? new Date(r.last_activity_at).toISOString()
+              : '활동 없음';
+            return `[${r.project_name}] ${r.feature_name}  (${r.tasks_done}/${r.tasks_todo + r.tasks_done} · ${r.progress}% · ${when})`;
+          })
+          .join('\n');
         return {
           content: [
-            {
-              type: 'text' as const,
-              text: '검색 결과가 없습니다.',
-            },
+            { type: 'text', text: `${rows.length}건:\n\n${formatted}` },
+            { type: 'text', text: JSON.stringify(rows, null, 2) },
           ],
         };
-      }
-
-      // Format each row as: "[kind] title (id: ref_id)\n  snippet\n"
-      const formatted = results
-        .map((r) => {
-          const kind = KIND_LABEL_MCP[r.kind] ?? r.kind;
-          const title = decodeEntities(r.title);
-          const snippet = decodeEntities(r.snippet);
-          return `[${kind}] ${title} (id: ${r.ref_id})\n  ${snippet}`;
-        })
-        .join('\n\n');
-
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: `${results.length}건 매칭:\n\n${formatted}`,
-          },
-        ],
-      };
+      },
     },
-  );
+
+    // ----- Conventional-commit feature extraction -----
+
+    pm_extract_features_from_commits: {
+      schema: {
+        project_id: z.string().optional()
+          .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+        types: z.array(z.string()).optional()
+          .describe('추출할 commit type 화이트리스트 (conventional 모드, 기본: feat/fix/docs/style/refactor/test/chore/perf/build/ci/revert)'),
+        min_count: z.number().optional().describe('그룹당 최소 commit 수 (기본 2)'),
+        include_untyped: z.boolean().optional()
+          .describe('scope 없는 commit도 type 단위로 묶기 (conventional 모드, 기본 false)'),
+        pattern: z.string().optional()
+          .describe('사용자 정의 regex (group 1 또는 named <scope>로 scope 캡처). 지정 시 conventional 모드 무시.'),
+        pattern_type: z.string().optional()
+          .describe("사용자 정의 모드의 signature prefix. 기본 'custom'"),
+        dry_run: z.boolean().optional().describe('true면 카운트만 반환, INSERT 없음. 기본 false'),
+      },
+      handler: async ({ project_id, types, min_count, include_untyped, pattern, pattern_type, dry_run }) => {
+        const pid = resolveProject(project_id);
+        const result = domain.extractFeaturesFromCommits(pid, {
+          allowTypes: types,
+          minCount: min_count,
+          includeUntyped: include_untyped,
+          customPattern: pattern,
+          customPatternType: pattern_type,
+          dryRun: dry_run,
+        });
+        const qualifying = result.groups.filter((g) => g.outcome !== 'under-threshold');
+        const headline = dry_run
+          ? `${qualifying.length}개 그룹 자격 (dry-run, DB 변경 없음)`
+          : `신규 ${result.created} / 합치기 ${result.merged} / 스킵 ${result.skipped} / 백필 ${result.sessionsBackfilled} sessions`;
+        const lines = [headline];
+        for (const g of qualifying.slice(0, 20)) {
+          const tag = g.outcome === 'created' ? '+'
+            : g.outcome === 'merged' ? '~'
+            : g.outcome === 'skipped' ? '·'
+            : g.outcome === 'dry-run' ? '?'
+            : ' ';
+          lines.push(`  ${tag} ${g.signature}  (${g.commitCount}건${g.featureId ? ` → ${g.featureId}` : ''})`);
+        }
+        if (qualifying.length > 20) lines.push(`  … +${qualifying.length - 20}개`);
+        return {
+          content: [
+            { type: 'text', text: lines.join('\n') },
+            { type: 'text', text: JSON.stringify(result, null, 2) },
+          ],
+        };
+      },
+    },
+
+    // ----- Git history import -----
+
+    pm_import_git_history: {
+      schema: {
+        project_id: z.string().optional()
+          .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+        since: z.string().optional()
+          .describe("git --since 값 (ISO 날짜 또는 'N weeks ago'). 미지정 시 전체 history"),
+        limit: z.number().optional().describe('최대 커밋 수 (기본 1000). 큰 repo 보호용 cap'),
+        dry_run: z.boolean().optional()
+          .describe('true면 신규/스킵 카운트만 반환, 실제 INSERT 안 함. 기본 false'),
+      },
+      handler: async ({ project_id, since, limit, dry_run }) => {
+        const pid = resolveProject(project_id);
+        const result = await domain.importGitHistory(pid, { since, limit, dryRun: dry_run });
+        const lines = [
+          `총 ${result.total}건 / 신규 ${result.newCount}건 / 스킵 ${result.skippedCount}건` +
+            (dry_run ? ' (dry-run, DB 변경 없음)' : ''),
+        ];
+        if (result.errors.length > 0) {
+          lines.push(`실패 ${result.errors.length}건:`);
+          for (const e of result.errors.slice(0, 5)) {
+            lines.push(`  ${e.hash.slice(0, 8)}: ${e.reason}`);
+          }
+          if (result.errors.length > 5) lines.push(`  … +${result.errors.length - 5}건`);
+        }
+        return {
+          content: [
+            { type: 'text', text: lines.join('\n') },
+            { type: 'text', text: JSON.stringify(result, null, 2) },
+          ],
+        };
+      },
+    },
+
+    // ----- Documents (Sprint 22, 3wtr — Spec Hub) -----
+
+    pm_create_document: {
+      schema: {
+        project_id: z.string().optional().describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+        kind: DOCUMENT_KIND_ENUM.describe('문서 종류 (prd / planning / architecture / retro / feature_spec / other)'),
+        title: z.string().describe('문서 제목'),
+        content_md: z.string().optional().describe('Markdown 본문'),
+        feature_id: z.string().optional().describe('지정 시 생성 직후 해당 feature 와 link'),
+      },
+      handler: async ({ project_id, kind, title, content_md, feature_id }) => {
+        const pid = resolveProject(project_id);
+        const doc = domain.createDocument({ projectId: pid, kind, title, content_md });
+        if (feature_id) domain.linkDocumentToFeature(doc.id, feature_id);
+        return okResult({ document_id: doc.id, title: doc.title, kind: doc.kind });
+      },
+    },
+
+    pm_update_document: {
+      schema: {
+        document_id: z.string(),
+        kind: DOCUMENT_KIND_ENUM.optional(),
+        title: z.string().optional(),
+        content_md: z.string().optional(),
+      },
+      handler: async ({ document_id, ...patch }) => {
+        const updated = domain.updateDocument(document_id, patch);
+        if (!updated) throw new Error(`Document not found: ${document_id}`);
+        return okResult({ ok: true, document: updated });
+      },
+    },
+
+    pm_delete_document: {
+      schema: { document_id: z.string() },
+      handler: async ({ document_id }) => {
+        const removed = domain.deleteDocument(document_id);
+        if (!removed) throw new Error(`Document not found: ${document_id}`);
+        return okResult({ ok: true });
+      },
+    },
+
+    pm_list_documents: {
+      schema: {
+        project_id: z.string().optional(),
+        kind: DOCUMENT_KIND_ENUM.optional().describe('지정 시 해당 종류만'),
+        feature_id: z.string().optional().describe('지정 시 그 feature 에 linked 된 문서만 반환'),
+        limit: z.number().optional().describe('기본 100, 최대 500'),
+      },
+      handler: async ({ project_id, kind, feature_id, limit }) => {
+        if (feature_id) return okResult(domain.listDocumentsForFeature(feature_id));
+        const pid = resolveProject(project_id);
+        return okResult(domain.listDocuments(pid, { kind, limit }));
+      },
+    },
+
+    pm_link_document_to_feature: {
+      schema: { document_id: z.string(), feature_id: z.string() },
+      handler: async ({ document_id, feature_id }) => {
+        domain.linkDocumentToFeature(document_id, feature_id);
+        return okResult({ ok: true });
+      },
+    },
+
+    pm_unlink_document_from_feature: {
+      schema: { document_id: z.string(), feature_id: z.string() },
+      handler: async ({ document_id, feature_id }) => {
+        const removed = domain.unlinkDocumentFromFeature(document_id, feature_id);
+        return okResult({ ok: removed });
+      },
+    },
+
+    // ----- Search -----
+
+    pm_search: {
+      schema: {
+        project_id: z.string().optional()
+          .describe('프로젝트 ID. 생략하면 현재 디렉토리에서 추론'),
+        query: z.string().describe('검색어 (한국어/영문 모두 지원, prefix 매칭)'),
+        limit: z.number().optional()
+          .describe('최대 결과 수 (기본 20, 최대 100). 도메인에서 자동 clamp'),
+      },
+      handler: async ({ project_id, query, limit }) => {
+        const pid = resolveProject(project_id);
+        const results = domain.searchProject(pid, query, limit ?? 20);
+        if (results.length === 0) return textResult('검색 결과가 없습니다.');
+        const formatted = results
+          .map((r) => `[${r.kind}] ${decodeEntities(r.title)} (id: ${r.ref_id})\n  ${decodeEntities(r.snippet)}`)
+          .join('\n\n');
+        return textResult(`${results.length}건 매칭:\n\n${formatted}`);
+      },
+    },
+  };
+}
+
+// ============================================================
+// Remote-mode tool registry (each handler forwards to a remote daemon)
+// ============================================================
+
+interface RemoteOpts {
+  url: string;
+  token: string | null;
+}
+
+/**
+ * Build a registry whose handlers forward each call to the home daemon
+ * via `POST /api/mcp/:tool`. We reuse `localRegistry`'s schemas so the
+ * SDK still sees the same arg shapes — only the body changes from
+ * "domain.*" to "fetch + JSON".
+ *
+ * Special-case: `pm_session_end` runs `domain.deriveSessionFiles` on the
+ * local cwd and injects the result into args.files. Without this the
+ * daemon would derive against its own working tree (typically `~`), which
+ * has nothing to do with what the user was editing on the laptop. Local
+ * pre-derive uses the same Sprint 21 mapping as the daemon would.
+ */
+function buildRemoteHandlers(
+  localRegistry: ToolRegistry,
+  remote: RemoteOpts,
+): ToolRegistry {
+  const out: ToolRegistry = {};
+  for (const [name, def] of Object.entries(localRegistry)) {
+    out[name] = {
+      schema: def.schema,
+      handler: async (rawArgs: any) => {
+        let args = rawArgs;
+        // ADR-0027 §5: laptop pre-derives working-tree changes for the
+        // daemon. Only fires when the caller didn't already provide files.
+        if (name === 'pm_session_end' && (args == null || args.files === undefined)) {
+          let files: Array<{ path: string; edit_type: EditType }> = [];
+          try {
+            files = domain.deriveSessionFiles(process.cwd());
+          } catch {
+            // Non-git cwd / git missing — same graceful fallback as Sprint 21.
+          }
+          args = { ...(args ?? {}), files };
+        }
+        return await fetchRemote(remote, name, args);
+      },
+    };
+  }
+  return out;
+}
+
+async function fetchRemote(remote: RemoteOpts, toolName: string, args: unknown): Promise<McpResult> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (remote.token) headers.Authorization = `Bearer ${remote.token}`;
+  const url = remote.url.replace(/\/$/, '') + '/api/mcp/' + encodeURIComponent(toolName);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(args ?? {}),
+    });
+  } catch (e) {
+    throw new Error(`remote fetch failed (${url}): ${(e as Error).message}`);
+  }
+  if (!res.ok) {
+    let detail = '';
+    try { detail = ((await res.json()) as { error?: string }).error ?? ''; } catch { /* not JSON */ }
+    throw new Error(`remote ${toolName} → HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
+  }
+  const body = await res.json() as McpResult;
+  return body;
+}
+
+// ============================================================
+// Server bootstrap
+// ============================================================
+
+export async function startMcpServer(opts: { projectId?: string }): Promise<void> {
+  const server = new McpServer({ name: 'vibemate', version: '0.1.0' });
+
+  // Decide local vs remote BEFORE building handlers. Local-mode handlers
+  // import domain.ts which queries the DB; remote-mode handlers don't, so
+  // the laptop never needs a SQLite file.
+  const config = loadConfig();
+  const registry = config.remote.url
+    ? buildRemoteHandlers(buildToolHandlers(opts), {
+        url: config.remote.url,
+        token: config.remote.token,
+      })
+    : buildToolHandlers(opts);
+
+  for (const [name, def] of Object.entries(registry)) {
+    server.tool(name, def.schema, def.handler);
+  }
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  // McpServer keeps the process alive via stdio
+  // McpServer keeps the process alive via stdio.
 }

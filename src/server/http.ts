@@ -9,6 +9,8 @@ import { z } from 'zod';
 import * as domain from './domain.js';
 import type { FeatureStatus } from './types.js';
 import { relativeTime } from './lib.js';
+import { buildToolHandlers, type ToolRegistry } from './mcp.js';
+import { loadConfig, saveConfig } from './config.js';
 
 // Body schemas. Wire format mirrors the domain layer field names — clients can
 // take a GET response and round-trip it through a PATCH unchanged.
@@ -87,6 +89,20 @@ const documentFeatureLinkSchema = z.object({
   feature_id: z.string().min(1),
 }).strict();
 
+// Sprint 31 (v5ln / ADR-0028) — settings panel body schemas. Both
+// endpoints accept `null` explicitly (PUT /api/config/remote uses null
+// to mean "exit remote mode"); zod's `.nullable()` lets the handler
+// distinguish null from "key missing entirely" without contortions.
+const remotePatchSchema = z.object({
+  url: z.string().url().nullable(),
+  token: z.string().min(1).nullable(),
+}).strict();
+
+const testRemoteSchema = z.object({
+  url: z.string().url(),
+  token: z.string().nullable().optional(),
+}).strict();
+
 function formatZodError(err: z.ZodError): string {
   return err.errors.map((e) => `${e.path.join('.') || '<root>'}: ${e.message}`).join('; ');
 }
@@ -98,11 +114,176 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const WEB_BUILD_DIR = path.resolve(PROJECT_ROOT, 'dist', 'web');
 
-export function createApp() {
+export interface CreateAppOpts {
+  /** Sprint 30 (wkq6 / ADR-0027) — when set, all `/api/*` requests must
+   *  carry `Authorization: Bearer <authToken>`. null/undefined leaves
+   *  auth disabled (loopback-friendly default). Static `/` and `/assets/*`
+   *  are always exempt — the web UI is loopback-only in Phase 1. */
+  authToken?: string | null;
+  /** Sprint 30 (wkq6) — MCP tool registry the `/api/mcp/:tool`
+   *  passthrough route dispatches against. Defaults to `buildToolHandlers()`;
+   *  tests inject a stub. Keeping it injectable also means a Phase-2 daemon
+   *  could publish a restricted subset (e.g. read-only). */
+  mcpRegistry?: ToolRegistry;
+  /** Sprint 31 (v5ln / ADR-0028) — override path for the config file
+   *  the GET/PUT /api/config endpoints read/write. Tests pass a tmp path
+   *  to keep the developer's ~/.vibemate/config.json untouched. Default
+   *  is `getConfigPath()` from config.ts. */
+  configPath?: string;
+  /** Sprint 31 (v5ln) — injectable fetch for `POST /api/config/test-remote`.
+   *  The endpoint calls the user-supplied URL server-side so the browser
+   *  doesn't have to navigate cross-origin (and so tailnet-only URLs that
+   *  the browser can't reach still test). Tests swap this for a stub. */
+  fetchImpl?: typeof fetch;
+}
+
+// Sprint 31 (v5ln / ADR-0028): wire shape for GET /api/config. Returns
+// every config field EXCEPT raw token bytes — the UI only needs to know
+// whether a token exists, never what it is. The token-stripping happens
+// here so callers can't accidentally leak it.
+interface SanitizedConfig {
+  server: { host: string; hasToken: boolean };
+  remote: { url: string | null; hasToken: boolean };
+}
+
+function sanitizeConfig(cfg: { server: { host: string; token: string | null }; remote: { url: string | null; token: string | null } }): SanitizedConfig {
+  return {
+    server: { host: cfg.server.host, hasToken: !!cfg.server.token },
+    remote: { url: cfg.remote.url, hasToken: !!cfg.remote.token },
+  };
+}
+
+export function createApp(opts: CreateAppOpts = {}) {
   const app = new Hono();
   app.use('*', cors());
 
+  // Sprint 30 (wkq6 / ADR-0027) — bearer auth, opt-in via config.server.token.
+  // Order matters: this runs before any route handler so a missing /
+  // wrong token short-circuits with 401. Static files (`/`, `/assets/*`)
+  // are out of the `/api/*` prefix and naturally bypass.
+  const authToken = opts.authToken ?? null;
+  if (authToken) {
+    app.use('/api/*', async (c, next) => {
+      const auth = c.req.header('Authorization') ?? '';
+      const expected = `Bearer ${authToken}`;
+      if (auth !== expected) {
+        return c.json({ error: 'Unauthorized' }, 401);
+      }
+      await next();
+    });
+  }
+
   app.get('/api/status', (c) => c.json({ name: 'vibemate', version: '0.1.0', status: 'ok' }));
+
+  // Sprint 30 (wkq6 / ADR-0027) — MCP passthrough. Single route dispatches
+  // against the tool registry built by mcp.ts; new tools auto-route here
+  // without an HTTP-side patch. Schema is validated per-call so a malformed
+  // body lands as a 400, not a 500.
+  const mcpRegistry = opts.mcpRegistry ?? buildToolHandlers();
+  app.post('/api/mcp/:tool', async (c) => {
+    const toolName = c.req.param('tool');
+    const def = mcpRegistry[toolName];
+    if (!def) return c.json({ error: `Unknown MCP tool: ${toolName}` }, 404);
+    let raw: unknown;
+    try {
+      // Empty body is fine — many tools take all-optional args.
+      const text = await c.req.text();
+      raw = text.length > 0 ? JSON.parse(text) : {};
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+    const parsed = z.object(def.schema).safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: formatZodError(parsed.error) }, 400);
+    }
+    try {
+      const result = await def.handler(parsed.data);
+      return c.json(result);
+    } catch (e) {
+      return c.json({ error: (e as Error).message }, 500);
+    }
+  });
+
+  // ----- Config (Sprint 31, v5ln / ADR-0028) -----
+  //
+  // Settings panel for the web UI: read the current mode + write the
+  // remote section + dry-run a candidate (url, token) pair against the
+  // remote /api/status. None of these routes ever return the raw token
+  // bytes — UI only sees `hasToken: boolean`. The auth middleware above
+  // already covers them because they live under /api/*.
+  const configPath = opts.configPath;
+  const fetchImpl = opts.fetchImpl ?? fetch;
+
+  app.get('/api/config', (c) => {
+    const cfg = configPath !== undefined ? loadConfig(configPath) : loadConfig();
+    return c.json(sanitizeConfig(cfg));
+  });
+
+  // PUT /api/config/remote — set or clear the remote pair atomically.
+  //   { url: "...", token: "..." }       → enter remote mode
+  //   { url: null,  token: null }        → exit remote mode
+  // Anything else (one side null, missing keys, wrong types) is 400. We
+  // do NOT accept partial updates: setting just `url` without `token` is
+  // almost always a mistake and would leave the laptop unable to auth.
+  app.put('/api/config/remote', async (c) => {
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+    const parsed = remotePatchSchema.safeParse(raw);
+    if (!parsed.success) return c.json({ error: formatZodError(parsed.error) }, 400);
+    const { url, token } = parsed.data;
+    // Both-or-neither — reject `url` without `token` or vice versa.
+    const bothPresent = typeof url === 'string' && typeof token === 'string';
+    const bothNull = url === null && token === null;
+    if (!bothPresent && !bothNull) {
+      return c.json({ error: 'url and token must both be strings or both be null' }, 400);
+    }
+    const next = configPath !== undefined
+      ? saveConfig({ remote: { url, token } }, configPath)
+      : saveConfig({ remote: { url, token } });
+    return c.json(sanitizeConfig(next));
+  });
+
+  // POST /api/config/test-remote — dry-run a candidate (url, token) pair
+  // by hitting the remote `/api/status` with Bearer auth and reporting
+  // status / latency / error. We do NOT save anything here — that's the
+  // UI's job after the user confirms. Why server-side fetch instead of
+  // having the browser do it: Tailscale URLs typically aren't routable
+  // from the user's other-host browser, and CORS would block them even
+  // if they were. The local daemon has direct network reach.
+  app.post('/api/config/test-remote', async (c) => {
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+    const parsed = testRemoteSchema.safeParse(raw);
+    if (!parsed.success) return c.json({ error: formatZodError(parsed.error) }, 400);
+    const { url, token } = parsed.data;
+    const target = url.replace(/\/$/, '') + '/api/status';
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const t0 = Date.now();
+    try {
+      const res = await fetchImpl(target, { headers });
+      const latency = Date.now() - t0;
+      return c.json({
+        ok: res.status === 200,
+        status: res.status,
+        latency_ms: latency,
+      });
+    } catch (e) {
+      return c.json({
+        ok: false,
+        status: null,
+        error: (e as Error).message,
+      });
+    }
+  });
 
   // ----- Projects -----
 
@@ -602,9 +783,25 @@ export function createApp() {
   return app;
 }
 
-export function startHttpServer(port: number = 7321): void {
-  const app = createApp();
-  serve({ fetch: app.fetch, port }, (info) => {
-    console.log(`[vibemate] HTTP server listening on http://localhost:${info.port}`);
+/**
+ * Spin up the HTTP daemon. Sprint 30 (wkq6) — `host` + `authToken` are now
+ * optional knobs read from `~/.vibemate/config.json` by daemon.ts. Leaving
+ * everything at defaults keeps the loopback / no-auth behavior unchanged.
+ */
+export function startHttpServer(opts: {
+  port?: number;
+  hostname?: string;
+  authToken?: string | null;
+} = {}): void {
+  const port = opts.port ?? 7321;
+  const hostname = opts.hostname ?? '127.0.0.1';
+  const app = createApp({ authToken: opts.authToken ?? null });
+  serve({ fetch: app.fetch, port, hostname }, (info) => {
+    // info.address is the resolved bind address (e.g. '::1' / '0.0.0.0').
+    // Log it so users can see "I bound to LAN" without grepping config.
+    const where = info.address === '127.0.0.1' || info.address === '::1'
+      ? 'localhost'
+      : info.address;
+    console.log(`[vibemate] HTTP server listening on http://${where}:${info.port}`);
   });
 }
