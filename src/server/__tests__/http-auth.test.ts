@@ -64,3 +64,45 @@ describe('HTTP auth — token configured', () => {
     expect(res.status).toBe(200);
   });
 });
+
+describe('HTTP auth — loopback bypass', () => {
+  // When the daemon binds 0.0.0.0 (LAN-accessible) the token gates remote
+  // callers. Same-machine callers (pm CLI, local browser) hit the loopback
+  // interface and should be exempt — the OS already isolates the listener
+  // there, and requiring an Authorization header on every `pm status` call
+  // would be friction without security gain.
+  const TOKEN = 'test-token-deadbeef';
+
+  // `getConnInfo` (from @hono/node-server) reads `c.env.incoming.socket.*`.
+  // `app.request(url, init, env)` lets us inject a minimal stand-in so the
+  // middleware sees a specific remote address without spinning up serve().
+  const envFor = (remoteAddress: string): { incoming: { socket: { remoteAddress: string } } } => ({
+    incoming: { socket: { remoteAddress } },
+  });
+
+  it.each([
+    ['127.0.0.1', 'IPv4 loopback'],
+    ['::1', 'IPv6 loopback'],
+    ['::ffff:127.0.0.1', 'IPv4-mapped IPv6 loopback'],
+  ])('skips the bearer check for %s (%s)', async (addr) => {
+    const app = createApp({ authToken: TOKEN });
+    const res = await app.request('/api/status', {}, envFor(addr));
+    expect(res.status).toBe(200);
+  });
+
+  it('still requires Bearer for non-loopback addresses', async () => {
+    const app = createApp({ authToken: TOKEN });
+    const res = await app.request('/api/status', {}, envFor('192.168.0.42'));
+    expect(res.status).toBe(401);
+  });
+
+  it('accepts a valid Bearer token from a non-loopback caller', async () => {
+    const app = createApp({ authToken: TOKEN });
+    const res = await app.request(
+      '/api/status',
+      { headers: { Authorization: `Bearer ${TOKEN}` } },
+      envFor('192.168.0.42'),
+    );
+    expect(res.status).toBe(200);
+  });
+});

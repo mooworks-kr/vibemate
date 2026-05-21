@@ -1,6 +1,7 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { serve } from '@hono/node-server';
+import { getConnInfo } from '@hono/node-server/conninfo';
 import { serveStatic } from '@hono/node-server/serve-static';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -153,6 +154,22 @@ function sanitizeConfig(cfg: { server: { host: string; token: string | null }; r
   };
 }
 
+// True when the request's remote socket address is the loopback interface.
+// Used by the auth middleware to skip the bearer check for same-machine
+// callers. Wrapped in try/catch because `getConnInfo` reads `c.env.incoming`
+// which only exists when the request is served through @hono/node-server's
+// `serve()` adapter — in-process callers (`app.request()` in tests) have an
+// empty env and would throw. Unknown remote → return false → keep enforcing
+// auth (fail-closed).
+function isLoopbackRequest(c: Context): boolean {
+  try {
+    const addr = getConnInfo(c).remote.address ?? '';
+    return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+  } catch {
+    return false;
+  }
+}
+
 export function createApp(opts: CreateAppOpts = {}) {
   const app = new Hono();
   app.use('*', cors());
@@ -161,9 +178,21 @@ export function createApp(opts: CreateAppOpts = {}) {
   // Order matters: this runs before any route handler so a missing /
   // wrong token short-circuits with 401. Static files (`/`, `/assets/*`)
   // are out of the `/api/*` prefix and naturally bypass.
+  //
+  // Loopback bypass: when the request originates from the same machine
+  // (127.0.0.1 / ::1 / ::ffff:127.0.0.1), skip the bearer check. The token
+  // exists to gate non-loopback binds (0.0.0.0 → LAN); on loopback the OS
+  // already isolates the listener to local processes, so requiring a header
+  // for a `pm` CLI call would be friction without security gain. Unknown
+  // remote (e.g. in-process app.request() in tests) falls back to requiring
+  // auth — safer default.
   const authToken = opts.authToken ?? null;
   if (authToken) {
     app.use('/api/*', async (c, next) => {
+      if (isLoopbackRequest(c)) {
+        await next();
+        return;
+      }
       const auth = c.req.header('Authorization') ?? '';
       const expected = `Bearer ${authToken}`;
       if (auth !== expected) {
