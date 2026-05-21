@@ -125,8 +125,59 @@ const state: AppState = {
 // =================================================
 // API helpers
 // =================================================
-async function fetchJSON<T = unknown>(url: string): Promise<T> {
-  const res = await fetch(url);
+
+// Bearer token plumbing for remote-LAN browsers. The daemon's auth middleware
+// requires `Authorization: Bearer <token>` on /api/* when config.server.token
+// is set; this UI used to send no header and 401 on every call. We stash the
+// token in localStorage, attach it to every fetch, and on 401 prompt the user
+// to (re-)enter it and retry once.
+const AUTH_TOKEN_KEY = 'vibemate.authToken';
+function getAuthToken(): string | null {
+  try { return localStorage.getItem(AUTH_TOKEN_KEY) || null; } catch { return null; }
+}
+function setAuthToken(token: string | null): void {
+  try {
+    if (token) localStorage.setItem(AUTH_TOKEN_KEY, token);
+    else localStorage.removeItem(AUTH_TOKEN_KEY);
+  } catch { /* private mode / quota — best-effort */ }
+}
+function authHeaders(): Record<string, string> {
+  const t = getAuthToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+// Returns the new token on success, null if the user cancelled. Caller decides
+// whether to retry. Kept synchronous-feeling with window.prompt to avoid a
+// modal-management dance for what is essentially a one-time-per-browser step.
+function promptForToken(): string | null {
+  const raw = window.prompt(
+    'vibemate API 토큰을 입력하세요.\n서버에서 `pm token show` 로 확인할 수 있습니다.',
+    getAuthToken() ?? '',
+  );
+  if (raw == null) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) { setAuthToken(null); return null; }
+  setAuthToken(trimmed);
+  return trimmed;
+}
+function mergeHeaders(base: HeadersInit | undefined, extra: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (base) {
+    if (base instanceof Headers) base.forEach((v, k) => { out[k] = v; });
+    else if (Array.isArray(base)) for (const [k, v] of base) out[k] = v;
+    else Object.assign(out, base);
+  }
+  Object.assign(out, extra);
+  return out;
+}
+
+async function fetchJSON<T = unknown>(url: string, init: RequestInit = {}): Promise<T> {
+  const doFetch = (): Promise<Response> =>
+    fetch(url, { ...init, headers: mergeHeaders(init.headers, authHeaders()) });
+  let res = await doFetch();
+  if (res.status === 401) {
+    setAuthToken(null);
+    if (promptForToken()) res = await doFetch();
+  }
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
   return res.json() as Promise<T>;
 }
@@ -200,15 +251,23 @@ async function mutate<T = any>(opts: {
 }): Promise<T | null> {
   if (opts.confirm && !window.confirm(opts.confirm)) return null;
 
+  const baseHeaders: Record<string, string> = {};
   const init: RequestInit = { method: opts.method };
   if (opts.body !== undefined) {
-    init.headers = { 'Content-Type': 'application/json' };
+    baseHeaders['Content-Type'] = 'application/json';
     init.body = JSON.stringify(opts.body);
   }
 
+  const doFetch = (): Promise<Response> =>
+    fetch(opts.url, { ...init, headers: { ...baseHeaders, ...authHeaders() } });
+
   let res: Response;
   try {
-    res = await fetch(opts.url, init);
+    res = await doFetch();
+    if (res.status === 401) {
+      setAuthToken(null);
+      if (promptForToken()) res = await doFetch();
+    }
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : t('error.network');
     showToast(msg, 'error');
@@ -2657,7 +2716,7 @@ async function testRemoteUI(url: string, token: string): Promise<void> {
   try {
     const res = await fetch('/api/config/test-remote', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ url, token }),
     });
     if (!res.ok) {
@@ -3513,7 +3572,13 @@ async function doSearch(q: string): Promise<void> {
   searchAbortController = new AbortController();
   const url = `/api/projects/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(q)}`;
   try {
-    const res = await fetch(url, { signal: searchAbortController.signal });
+    let res = await fetch(url, { signal: searchAbortController.signal, headers: authHeaders() });
+    if (res.status === 401) {
+      setAuthToken(null);
+      if (promptForToken()) {
+        res = await fetch(url, { signal: searchAbortController.signal, headers: authHeaders() });
+      }
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const results = await res.json();
     // Drop stale responses: if the user kept typing, `query` no longer matches.
