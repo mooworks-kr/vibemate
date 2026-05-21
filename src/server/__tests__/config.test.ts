@@ -26,10 +26,9 @@ afterEach(() => {
 });
 
 describe('defaultConfig', () => {
-  it('returns 127.0.0.1 bind + null token + no remote', () => {
+  it('returns 127.0.0.1 bind + null token', () => {
     expect(defaultConfig()).toEqual<Config>({
       server: { host: '127.0.0.1', token: null },
-      remote: { url: null, token: null },
     });
   });
 
@@ -58,7 +57,19 @@ describe('loadConfig', () => {
     const loaded = loadConfig(cfgPath);
     expect(loaded.server.host).toBe('0.0.0.0');
     expect(loaded.server.token).toBeNull();
-    expect(loaded.remote).toEqual({ url: null, token: null });
+  });
+
+  it('silently drops legacy `remote.*` fields from older config files', () => {
+    // Pre-removal users may still have the field on disk. mergeConfig
+    // should ignore it rather than blow up.
+    fs.writeFileSync(cfgPath, JSON.stringify({
+      server: { host: '0.0.0.0' },
+      remote: { url: 'http://x:7321', token: 'legacy' },
+    }));
+    const loaded = loadConfig(cfgPath);
+    expect(loaded).toEqual<Config>({
+      server: { host: '0.0.0.0', token: null },
+    });
   });
 });
 
@@ -66,22 +77,19 @@ describe('saveConfig', () => {
   it('roundtrips the full config', () => {
     const written = saveConfig({
       server: { host: '0.0.0.0', token: 'abc123' },
-      remote: { url: 'http://192.168.1.10:7321', token: 'xyz789' },
     }, cfgPath);
     expect(written).toEqual({
       server: { host: '0.0.0.0', token: 'abc123' },
-      remote: { url: 'http://192.168.1.10:7321', token: 'xyz789' },
     });
     expect(loadConfig(cfgPath)).toEqual(written);
   });
 
   it('partial patch leaves untouched fields alone', () => {
     saveConfig({ server: { token: 'first' } }, cfgPath);
-    // Only change remote.url — server.token should survive.
-    const after = saveConfig({ remote: { url: 'http://x:7321' } }, cfgPath);
+    // Only change host — server.token should survive.
+    const after = saveConfig({ server: { host: '0.0.0.0' } }, cfgPath);
     expect(after.server.token).toBe('first');
-    expect(after.remote.url).toBe('http://x:7321');
-    expect(after.remote.token).toBeNull();
+    expect(after.server.host).toBe('0.0.0.0');
   });
 
   it('explicit null clears a previously-set token (pm token clear path)', () => {

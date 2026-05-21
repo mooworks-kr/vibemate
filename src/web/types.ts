@@ -226,28 +226,7 @@ export interface FeatureDetailResponse extends Feature {
 // so any stale reference would fail typecheck.
 // Sprint 22 (3wtr): 'docs' added — Spec Hub. Slot after 'overview' so the
 // project's "what?" tab comes before "what to build?".
-export type Tab = 'workspace' | 'overview' | 'docs' | 'features' | 'decisions' | 'sessions' | 'settings';
-
-// Sprint 31 (v5ln / ADR-0028): wire shape of `GET /api/config`. Mirror
-// of the server's `SanitizedConfig` — the raw token never crosses the
-// network boundary, so the client only ever sees `hasToken`. Keeping
-// the shape declared here (rather than re-exported from ../server/types)
-// makes it explicit that the field set differs from the on-disk Config.
-export interface SanitizedConfig {
-  server: { host: string; hasToken: boolean };
-  remote: { url: string | null; hasToken: boolean };
-}
-
-// Sprint 31 (v5ln): `POST /api/config/test-remote` reply shape. `status`
-// is the upstream HTTP code (or null when the connection failed before
-// we got a response); `latency_ms` is server-measured wall time; `error`
-// is the JS-side error message on a non-HTTP failure.
-export interface TestRemoteResult {
-  ok: boolean;
-  status: number | null;
-  latency_ms?: number;
-  error?: string;
-}
+export type Tab = 'workspace' | 'overview' | 'docs' | 'features' | 'decisions' | 'sessions';
 
 /**
  * Mirror of the server's `WorkspaceFeature` row (types.ts on the server).
@@ -336,17 +315,6 @@ export interface AppState {
    *  feature detail. A Set rather than a single id so users can keep
    *  several expanded if they switch between features in one session. */
   expandedContextBriefs: Set<string>;
-
-  // Settings panel (Sprint 31, v5ln) -------------------------------------
-  /** Last-loaded sanitized config. null while the first GET /api/config
-   *  is in flight; populated thereafter and re-fetched after each PUT. */
-  config: SanitizedConfig | null;
-  /** Inflight indicator for the URL/token "테스트" button. Disables
-   *  test/save so the user doesn't double-fire. */
-  testingRemote: boolean;
-  /** Last test-remote payload — surface inline next to the form. null
-   *  before first test, or after the form is cleared. */
-  lastRemoteTest: TestRemoteResult | null;
 }
 
 // ============================================================

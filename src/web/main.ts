@@ -38,12 +38,10 @@ import type {
   ProjectListEntry,
   ProjectListItem,
   RawSessionResponse,
-  SanitizedConfig,
   SearchState,
   SessionSummaryRow,
   Tab,
   TaskRow,
-  TestRemoteResult,
   WorkspaceFeatureRow,
 } from './types';
 import { readPersistedFlag, writePersistedFlag, readPersistedString, writePersistedString } from './persist.js';
@@ -113,11 +111,6 @@ const state: AppState = {
 
   // Context Brief expand state — Sprint 24 (ijze)
   expandedContextBriefs: new Set<string>(),
-
-  // Settings panel — Sprint 31 (v5ln)
-  config: null,
-  testingRemote: false,
-  lastRemoteTest: null,
 };
 
 // (Removed in ADR-0016: FILE_DETAIL cache + fdKey helper. Code Map retired.)
@@ -126,58 +119,8 @@ const state: AppState = {
 // API helpers
 // =================================================
 
-// Bearer token plumbing for remote-LAN browsers. The daemon's auth middleware
-// requires `Authorization: Bearer <token>` on /api/* when config.server.token
-// is set; this UI used to send no header and 401 on every call. We stash the
-// token in localStorage, attach it to every fetch, and on 401 prompt the user
-// to (re-)enter it and retry once.
-const AUTH_TOKEN_KEY = 'vibemate.authToken';
-function getAuthToken(): string | null {
-  try { return localStorage.getItem(AUTH_TOKEN_KEY) || null; } catch { return null; }
-}
-function setAuthToken(token: string | null): void {
-  try {
-    if (token) localStorage.setItem(AUTH_TOKEN_KEY, token);
-    else localStorage.removeItem(AUTH_TOKEN_KEY);
-  } catch { /* private mode / quota — best-effort */ }
-}
-function authHeaders(): Record<string, string> {
-  const t = getAuthToken();
-  return t ? { Authorization: `Bearer ${t}` } : {};
-}
-// Returns the new token on success, null if the user cancelled. Caller decides
-// whether to retry. Kept synchronous-feeling with window.prompt to avoid a
-// modal-management dance for what is essentially a one-time-per-browser step.
-function promptForToken(): string | null {
-  const raw = window.prompt(
-    'vibemate API 토큰을 입력하세요.\n서버에서 `pm token show` 로 확인할 수 있습니다.',
-    getAuthToken() ?? '',
-  );
-  if (raw == null) return null;
-  const trimmed = raw.trim();
-  if (!trimmed) { setAuthToken(null); return null; }
-  setAuthToken(trimmed);
-  return trimmed;
-}
-function mergeHeaders(base: HeadersInit | undefined, extra: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (base) {
-    if (base instanceof Headers) base.forEach((v, k) => { out[k] = v; });
-    else if (Array.isArray(base)) for (const [k, v] of base) out[k] = v;
-    else Object.assign(out, base);
-  }
-  Object.assign(out, extra);
-  return out;
-}
-
 async function fetchJSON<T = unknown>(url: string, init: RequestInit = {}): Promise<T> {
-  const doFetch = (): Promise<Response> =>
-    fetch(url, { ...init, headers: mergeHeaders(init.headers, authHeaders()) });
-  let res = await doFetch();
-  if (res.status === 401) {
-    setAuthToken(null);
-    if (promptForToken()) res = await doFetch();
-  }
+  const res = await fetch(url, init);
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
   return res.json() as Promise<T>;
 }
@@ -251,23 +194,16 @@ async function mutate<T = any>(opts: {
 }): Promise<T | null> {
   if (opts.confirm && !window.confirm(opts.confirm)) return null;
 
-  const baseHeaders: Record<string, string> = {};
-  const init: RequestInit = { method: opts.method };
+  const headers: Record<string, string> = {};
+  const init: RequestInit = { method: opts.method, headers };
   if (opts.body !== undefined) {
-    baseHeaders['Content-Type'] = 'application/json';
+    headers['Content-Type'] = 'application/json';
     init.body = JSON.stringify(opts.body);
   }
 
-  const doFetch = (): Promise<Response> =>
-    fetch(opts.url, { ...init, headers: { ...baseHeaders, ...authHeaders() } });
-
   let res: Response;
   try {
-    res = await doFetch();
-    if (res.status === 401) {
-      setAuthToken(null);
-      if (promptForToken()) res = await doFetch();
-    }
+    res = await fetch(opts.url, init);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : t('error.network');
     showToast(msg, 'error');
@@ -1847,7 +1783,7 @@ document.addEventListener('click', () => $('#projectDropdown')!.classList.remove
 // =================================================
 // Sprint 26 / T2: tab ids only — labels go through `t('tab.<id>')` so the
 // segmented header reflects the current locale on every render.
-const TAB_IDS: ReadonlyArray<Tab> = ['workspace', 'overview', 'docs', 'features', 'decisions', 'sessions', 'settings'];
+const TAB_IDS: ReadonlyArray<Tab> = ['workspace', 'overview', 'docs', 'features', 'decisions', 'sessions'];
 function renderTabs(): void {
   const tabs = $('#tabs')!;
   tabs.innerHTML = '';
@@ -2686,310 +2622,6 @@ function renderDecisions(): void {
 }
 
 // =================================================
-// Main: Settings (Sprint 31, v5ln / ADR-0028)
-// =================================================
-//
-// Single-page settings panel: current mode banner + remote vibemate
-// form + restart-required note. Backed by three endpoints from this
-// sprint:
-//   GET  /api/config              → SanitizedConfig (token masked)
-//   PUT  /api/config/remote       → atomic set/clear (both-or-neither)
-//   POST /api/config/test-remote  → server-side dry-run ping (bypasses CORS)
-//
-// State lives on the shared `state` singleton (config / testingRemote /
-// lastRemoteTest) so a tab-switch back into Settings keeps the most
-// recent test result on screen.
-
-async function loadSettingsConfig(): Promise<void> {
-  try {
-    const cfg = await fetchJSON<SanitizedConfig>('/api/config');
-    state.config = cfg;
-  } catch (e) {
-    showError((e as Error).message);
-  }
-}
-
-async function testRemoteUI(url: string, token: string): Promise<void> {
-  state.testingRemote = true;
-  state.lastRemoteTest = null;
-  render();
-  try {
-    const res = await fetch('/api/config/test-remote', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ url, token }),
-    });
-    if (!res.ok) {
-      // Surface 400 / 401 (local-auth) etc. as a soft "connection failed"
-      // — the form-level error is fine because the structured payload
-      // doesn't exist on a non-2xx local response.
-      const detail = await res.json().catch(() => ({})) as { error?: string };
-      state.lastRemoteTest = { ok: false, status: null, error: detail.error ?? `HTTP ${res.status}` };
-    } else {
-      state.lastRemoteTest = await res.json() as TestRemoteResult;
-    }
-  } catch (e) {
-    state.lastRemoteTest = { ok: false, status: null, error: (e as Error).message };
-  } finally {
-    state.testingRemote = false;
-    render();
-  }
-}
-
-async function saveRemoteUI(url: string | null, token: string | null): Promise<void> {
-  const updated = await mutate<SanitizedConfig>({
-    method: 'PUT',
-    url: '/api/config/remote',
-    body: { url, token },
-    successToast: url === null
-      ? t('settings.remote.disconnected_toast')
-      : t('settings.remote.saved_toast'),
-  });
-  if (!updated) return;
-  state.config = updated;
-  state.lastRemoteTest = null;
-  render();
-}
-
-function renderSettings(): void {
-  const main = $('#main')!;
-  main.innerHTML = '';
-
-  // Lazy fire — first entry kicks off the fetch. Subsequent tab visits
-  // reuse the cached config until a mutation invalidates it.
-  if (state.config === null) {
-    loadSettingsConfig().then(() => render());
-    main.appendChild(el('div', { class: 'empty-state' }, [
-      el('div', { class: 'empty-state-title', text: t('settings.title') }),
-      el('div', { class: 'empty-state-text', text: t('project.list.loading') }),
-    ]));
-    return;
-  }
-
-  const cfg = state.config;
-
-  // Header
-  main.appendChild(el('div', { class: 'page-header' }, [
-    el('div', { class: 'breadcrumb', text: t('settings.title') }),
-    el('h1', { class: 'page-title', text: t('settings.title') }),
-    el('p', { class: 'page-tagline', text: t('settings.tagline') }),
-  ]));
-
-  // Current-mode banner. Color-coded via the same tokens used elsewhere
-  // (accent for healthy/local, info for remote — neither is destructive).
-  const inRemote = !!cfg.remote.url;
-  const banner = el('div');
-  banner.style.cssText = [
-    'padding: 12px 14px',
-    'border-radius: var(--radius)',
-    'border: 1px solid ' + (inRemote ? 'var(--info, #5a6acf)' : 'var(--accent, #2f8a4a)'),
-    'background: ' + (inRemote ? 'rgba(90, 106, 207, 0.08)' : 'rgba(47, 138, 74, 0.08)'),
-    'margin-bottom: 18px',
-    'display: flex',
-    'align-items: center',
-    'gap: 10px',
-    'flex-wrap: wrap',
-  ].join('; ');
-
-  if (inRemote) {
-    banner.appendChild(el('span', {
-      text: t('settings.mode.remote', { url: cfg.remote.url! }),
-      style: 'flex: 1',
-    }));
-    // Open the home web UI in a new tab. Sprint 31 deliberately does not
-    // proxy data through the local daemon — Phase 3 work. Direct link is
-    // the honest stand-in.
-    const linkAnchor = document.createElement('a');
-    linkAnchor.href = cfg.remote.url!;
-    linkAnchor.target = '_blank';
-    linkAnchor.rel = 'noopener noreferrer';
-    linkAnchor.textContent = t('settings.mode.remote.open_link');
-    linkAnchor.style.cssText = 'color: var(--info, #5a6acf); text-decoration: none; font-size: 13px; font-weight: 500;';
-    banner.appendChild(linkAnchor);
-  } else {
-    banner.appendChild(el('span', { text: t('settings.mode.local') }));
-  }
-  main.appendChild(banner);
-
-  // Remote form
-  const formSection = el('section');
-  formSection.style.cssText = [
-    'padding: 16px 18px',
-    'border: 1px solid var(--border)',
-    'border-radius: var(--radius)',
-    'background: var(--bg-elevated)',
-    'margin-bottom: 18px',
-  ].join('; ');
-  formSection.appendChild(el('h3', {
-    text: t('settings.remote.heading'),
-    style: 'margin: 0 0 12px; font-size: 14px; font-weight: 600;',
-  }));
-
-  // Pre-fill URL with the currently-saved value (so "edit then save"
-  // round-trips cleanly). Token is never pre-filled — that's the whole
-  // point of `hasToken` instead of `token`.
-  const urlInput = document.createElement('input');
-  urlInput.type = 'text';
-  urlInput.placeholder = t('settings.remote.url_placeholder');
-  urlInput.value = cfg.remote.url ?? '';
-  urlInput.style.cssText = settingsInputStyle();
-
-  const tokenInput = document.createElement('input');
-  tokenInput.type = 'password';
-  tokenInput.placeholder = t('settings.remote.token_placeholder');
-  tokenInput.autocomplete = 'new-password';
-  tokenInput.style.cssText = settingsInputStyle();
-
-  const urlRow = el('div');
-  urlRow.style.cssText = 'margin-bottom: 10px;';
-  urlRow.appendChild(el('label', {
-    text: t('settings.remote.url_label'),
-    style: 'display: block; font-size: 12px; color: var(--text-2); margin-bottom: 4px;',
-  }));
-  urlRow.appendChild(urlInput);
-  formSection.appendChild(urlRow);
-
-  const tokenRow = el('div');
-  tokenRow.style.cssText = 'margin-bottom: 12px;';
-  tokenRow.appendChild(el('label', {
-    text: t('settings.remote.token_label'),
-    style: 'display: block; font-size: 12px; color: var(--text-2); margin-bottom: 4px;',
-  }));
-  tokenRow.appendChild(tokenInput);
-  if (cfg.remote.hasToken) {
-    tokenRow.appendChild(el('div', {
-      text: t('settings.remote.token_hidden_hint'),
-      style: 'font-size: 11px; color: var(--text-3); margin-top: 4px;',
-    }));
-  }
-  formSection.appendChild(tokenRow);
-
-  // Action row: 테스트 / 저장 / (해제, if currently remote)
-  const actionRow = el('div');
-  actionRow.style.cssText = 'display: flex; gap: 8px; flex-wrap: wrap; align-items: center;';
-
-  const testBtn = el('button', {
-    text: state.testingRemote ? t('settings.remote.test_running') : t('settings.remote.test_button'),
-    onClick: () => {
-      const url = urlInput.value.trim();
-      const token = tokenInput.value.trim();
-      if (!url || !token) {
-        showError(t('settings.validate.both_required'));
-        return;
-      }
-      testRemoteUI(url, token);
-    },
-  }) as HTMLButtonElement;
-  testBtn.disabled = state.testingRemote;
-  testBtn.style.cssText = settingsButtonStyle({ variant: 'secondary' });
-  actionRow.appendChild(testBtn);
-
-  const saveBtn = el('button', {
-    text: t('settings.remote.save_button'),
-    onClick: () => {
-      const url = urlInput.value.trim();
-      const token = tokenInput.value.trim();
-      if (!url || !token) {
-        showError(t('settings.validate.both_required'));
-        return;
-      }
-      saveRemoteUI(url, token);
-    },
-  }) as HTMLButtonElement;
-  saveBtn.disabled = state.testingRemote;
-  saveBtn.style.cssText = settingsButtonStyle({ variant: 'primary' });
-  actionRow.appendChild(saveBtn);
-
-  if (inRemote) {
-    const disconnectBtn = el('button', {
-      text: t('settings.remote.disconnect_button'),
-      onClick: () => saveRemoteUI(null, null),
-    });
-    disconnectBtn.style.cssText = settingsButtonStyle({ variant: 'danger' });
-    actionRow.appendChild(disconnectBtn);
-  }
-
-  formSection.appendChild(actionRow);
-
-  // Inline test result. Renders one of four states based on the response
-  // shape from POST /api/config/test-remote. Pure render — no further
-  // mutations from here.
-  if (state.lastRemoteTest) {
-    const r = state.lastRemoteTest;
-    let text: string;
-    let color: string;
-    if (r.ok && r.status === 200) {
-      text = t('settings.remote.test_success', {
-        status: r.status,
-        latency: r.latency_ms ?? '?',
-      });
-      color = 'var(--accent, #2f8a4a)';
-    } else if (r.status === 401) {
-      text = t('settings.remote.test_unauthorized');
-      color = 'var(--warn-text, #b35e00)';
-    } else if (r.status == null) {
-      text = t('settings.remote.test_failed', { error: r.error ?? 'unknown' });
-      color = 'var(--warn-text, #b35e00)';
-    } else {
-      text = t('settings.remote.test_other', { status: r.status });
-      color = 'var(--warn-text, #b35e00)';
-    }
-    formSection.appendChild(el('div', {
-      text,
-      style: `margin-top: 10px; font-size: 12.5px; color: ${color};`,
-    }));
-  }
-
-  main.appendChild(formSection);
-
-  // Restart-required note. Info-toned so the user doesn't read it as a
-  // failure — change took, just hasn't propagated to the running MCP yet.
-  const note = el('div');
-  note.style.cssText = [
-    'padding: 10px 12px',
-    'border-radius: var(--radius)',
-    'border: 1px solid var(--info, #5a6acf)',
-    'background: rgba(90, 106, 207, 0.08)',
-    'color: var(--text-2)',
-    'font-size: 12.5px',
-  ].join('; ');
-  note.textContent = t('settings.note.restart_required');
-  main.appendChild(note);
-}
-
-function settingsInputStyle(): string {
-  return [
-    'width: 100%',
-    'padding: 7px 10px',
-    'background: var(--bg)',
-    'border: 1px solid var(--border)',
-    'border-radius: 4px',
-    'color: var(--text)',
-    'font: inherit',
-    'font-size: 13px',
-    'box-sizing: border-box',
-  ].join('; ');
-}
-
-function settingsButtonStyle(opts: { variant: 'primary' | 'secondary' | 'danger' }): string {
-  const base = [
-    'padding: 6px 14px',
-    'border-radius: var(--radius)',
-    'font: inherit',
-    'font-size: 13px',
-    'cursor: pointer',
-  ];
-  if (opts.variant === 'primary') {
-    base.push('background: var(--accent, #2f8a4a)', 'border: 1px solid var(--accent, #2f8a4a)', 'color: #fff');
-  } else if (opts.variant === 'danger') {
-    base.push('background: transparent', 'border: 1px solid var(--warn, #b08300)', 'color: var(--warn-text, #b35e00)');
-  } else {
-    base.push('background: var(--bg-elevated)', 'border: 1px solid var(--border-strong, var(--border))', 'color: var(--text)');
-  }
-  return base.join('; ');
-}
-
-// =================================================
 // Main: Sessions
 // =================================================
 function renderSessions(): void {
@@ -3367,13 +2999,6 @@ function render() {
     ]));
     return;
   }
-  // Settings panel is project-independent (Sprint 31 / v5ln): a brand-new
-  // user landing on a no-project install should still be able to switch
-  // into remote mode. Dispatch it BEFORE the empty-state guard.
-  if (state.currentTab === 'settings') {
-    renderSettings();
-    return;
-  }
   if (DATA.projects.length === 0) {
     $('#main')!.innerHTML = '';
     $('#main')!.appendChild(el('div', { class: 'empty-state' }, [
@@ -3572,13 +3197,7 @@ async function doSearch(q: string): Promise<void> {
   searchAbortController = new AbortController();
   const url = `/api/projects/${encodeURIComponent(projectId)}/search?q=${encodeURIComponent(q)}`;
   try {
-    let res = await fetch(url, { signal: searchAbortController.signal, headers: authHeaders() });
-    if (res.status === 401) {
-      setAuthToken(null);
-      if (promptForToken()) {
-        res = await fetch(url, { signal: searchAbortController.signal, headers: authHeaders() });
-      }
-    }
+    const res = await fetch(url, { signal: searchAbortController.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const results = await res.json();
     // Drop stale responses: if the user kept typing, `query` no longer matches.

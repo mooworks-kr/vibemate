@@ -2,20 +2,11 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import * as domain from './domain.js';
-import { loadConfig } from './config.js';
-import type { EditType } from './types.js';
 
 /**
  * MCP server. Spawned by Claude Code via stdio.
  *
- * Two modes (Sprint 30 / wkq6 / ADR-0027):
- *   * **local** — handlers call `domain.*` directly against the local DB.
- *     This is the original behavior.
- *   * **remote** — handlers forward to `config.remote.url` via the
- *     `POST /api/mcp/:tool` passthrough endpoint, so a laptop session can
- *     read/write the home daemon's DB. Activated when `config.remote.url`
- *     is set. `pm_session_end` gets a small local pre-derive (git status)
- *     so the daemon still records the right working-tree changes.
+ * Handlers call `domain.*` directly against the local DB.
  *
  * Tools are built into a `Record<name, { schema, handler }>` map (see
  * `buildToolHandlers`) so:
@@ -57,8 +48,6 @@ export type ToolRegistry = Record<string, ToolDef>;
 const DOCUMENT_KIND_ENUM = z.enum([
   'prd', 'planning', 'architecture', 'retro', 'feature_spec', 'other',
 ]);
-
-const EDIT_TYPE_ENUM = z.enum(['created', 'modified', 'read']);
 
 // ============================================================
 // Helpers
@@ -130,22 +119,13 @@ export function buildToolHandlers(opts: BuildToolsOpts = {}): ToolRegistry {
         primary_feature_id: z.string().optional().describe('이 세션에서 주로 작업한 기능'),
         // Sprint 23 (h5uk / ADR-0020).
         notes: z.string().optional().describe('구조화된 Markdown 메모 (## 완료 / ## 남은 일 / ## 결정). 다음 세션 시작 시 last_session.notes_excerpt 로 노출됨.'),
-        // Sprint 30 (wkq6 / ADR-0027): explicit files override for
-        // remote-mode MCP. When the laptop wrapper supplies this, the
-        // daemon skips its own `git status` (which would see the wrong
-        // working tree). Local-mode callers usually omit it.
-        files: z.array(z.object({
-          path: z.string(),
-          edit_type: EDIT_TYPE_ENUM,
-        })).optional().describe('원격 모드에서 laptop 의 git status 결과. 생략 시 server-side derive.'),
       },
-      handler: async ({ session_id, summary, primary_feature_id, notes, files }) => {
+      handler: async ({ session_id, summary, primary_feature_id, notes }) => {
         return okResult(domain.endSession({
           sessionId: session_id,
           summary,
           primaryFeatureId: primary_feature_id,
           notes,
-          files,
         }));
       },
     },
@@ -576,95 +556,13 @@ export function buildToolHandlers(opts: BuildToolsOpts = {}): ToolRegistry {
 }
 
 // ============================================================
-// Remote-mode tool registry (each handler forwards to a remote daemon)
-// ============================================================
-
-interface RemoteOpts {
-  url: string;
-  token: string | null;
-}
-
-/**
- * Build a registry whose handlers forward each call to the home daemon
- * via `POST /api/mcp/:tool`. We reuse `localRegistry`'s schemas so the
- * SDK still sees the same arg shapes — only the body changes from
- * "domain.*" to "fetch + JSON".
- *
- * Special-case: `pm_session_end` runs `domain.deriveSessionFiles` on the
- * local cwd and injects the result into args.files. Without this the
- * daemon would derive against its own working tree (typically `~`), which
- * has nothing to do with what the user was editing on the laptop. Local
- * pre-derive uses the same Sprint 21 mapping as the daemon would.
- */
-function buildRemoteHandlers(
-  localRegistry: ToolRegistry,
-  remote: RemoteOpts,
-): ToolRegistry {
-  const out: ToolRegistry = {};
-  for (const [name, def] of Object.entries(localRegistry)) {
-    out[name] = {
-      schema: def.schema,
-      handler: async (rawArgs: any) => {
-        let args = rawArgs;
-        // ADR-0027 §5: laptop pre-derives working-tree changes for the
-        // daemon. Only fires when the caller didn't already provide files.
-        if (name === 'pm_session_end' && (args == null || args.files === undefined)) {
-          let files: Array<{ path: string; edit_type: EditType }> = [];
-          try {
-            files = domain.deriveSessionFiles(process.cwd());
-          } catch {
-            // Non-git cwd / git missing — same graceful fallback as Sprint 21.
-          }
-          args = { ...(args ?? {}), files };
-        }
-        return await fetchRemote(remote, name, args);
-      },
-    };
-  }
-  return out;
-}
-
-async function fetchRemote(remote: RemoteOpts, toolName: string, args: unknown): Promise<McpResult> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (remote.token) headers.Authorization = `Bearer ${remote.token}`;
-  const url = remote.url.replace(/\/$/, '') + '/api/mcp/' + encodeURIComponent(toolName);
-  let res: Response;
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(args ?? {}),
-    });
-  } catch (e) {
-    throw new Error(`remote fetch failed (${url}): ${(e as Error).message}`);
-  }
-  if (!res.ok) {
-    let detail = '';
-    try { detail = ((await res.json()) as { error?: string }).error ?? ''; } catch { /* not JSON */ }
-    throw new Error(`remote ${toolName} → HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
-  }
-  const body = await res.json() as McpResult;
-  return body;
-}
-
-// ============================================================
 // Server bootstrap
 // ============================================================
 
 export async function startMcpServer(opts: { projectId?: string }): Promise<void> {
   const server = new McpServer({ name: 'vibemate', version: '0.1.0' });
 
-  // Decide local vs remote BEFORE building handlers. Local-mode handlers
-  // import domain.ts which queries the DB; remote-mode handlers don't, so
-  // the laptop never needs a SQLite file.
-  const config = loadConfig();
-  const registry = config.remote.url
-    ? buildRemoteHandlers(buildToolHandlers(opts), {
-        url: config.remote.url,
-        token: config.remote.token,
-      })
-    : buildToolHandlers(opts);
-
+  const registry = buildToolHandlers(opts);
   for (const [name, def] of Object.entries(registry)) {
     server.tool(name, def.schema, def.handler);
   }

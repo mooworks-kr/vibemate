@@ -86,34 +86,4 @@ describe('HTTP MCP passthrough — POST /api/mcp/:tool', () => {
     const body = await res.json() as { error: string };
     expect(body.error).toMatch(/Unknown project/);
   });
-
-  it('respects pm_session_end files override (ADR-0027 §5)', async () => {
-    // Remote-mode wrapper passes pre-derived files in. Verify they land in
-    // session_files verbatim — otherwise the daemon would silently fall back
-    // to its own git-status derive, defeating the remote-mode hand-off.
-    const app = createApp();
-    const proj = domain.createProject({ name: 'P-files', rootPath: t.dir });
-    const f = domain.createFeature({ projectId: proj.id, name: 'feat' });
-    const sess = domain.startSession({ projectId: proj.id, featureId: f.id });
-
-    const res = await app.request('/api/mcp/pm_session_end', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id: sess.session_id,
-        summary: 'remote test',
-        files: [
-          { path: 'src/foo.ts', edit_type: 'modified' },
-          { path: 'src/bar.ts', edit_type: 'created' },
-        ],
-      }),
-    });
-    expect(res.status).toBe(200);
-
-    // Sanity: the supplied files are stored.
-    const detail = domain.getSessionDetail(sess.session_id);
-    const paths = new Set(detail.files.map((x) => x.file_path));
-    expect(paths.has('src/foo.ts')).toBe(true);
-    expect(paths.has('src/bar.ts')).toBe(true);
-  });
 });
